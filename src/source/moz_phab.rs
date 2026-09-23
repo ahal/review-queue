@@ -31,11 +31,23 @@
 //! {constraints:{phids:[...]}}` call over every distinct author in the page, rather than showing
 //! raw PHIDs in `rq list`/`rq path`.
 //!
+//! Every per-revision Conduit lookup after the initial queue fetch is batched across *all*
+//! actionable revisions rather than issued once per revision - a queue of N revisions used to cost
+//! roughly `N + N * stack_depth` extra calls (one `diffusion.repository.search` per revision, plus
+//! a `edge.search`/`differential.revision.search` pair per stack hop per revision), which is easy
+//! to trip Phabricator's rate limit on. Now:
+//! - Repos: one `diffusion.repository.search {constraints:{phids:[...]}}` over every distinct
+//!   `repositoryPHID` among actionable revisions (`repo_refs_for`).
+//! - Stacks: `resolve_stacks` walks every actionable revision's parent chain in lockstep, one
+//!   `edge.search` + `differential.revision.search` pair *per depth level* covering every stack
+//!   still in flight, instead of per revision. A 20-revision queue with 3-deep stacks now costs
+//!   ~1 (repos) + 3*2 (stack levels) calls instead of ~20 + 20*(1+2*3).
+//!
 //! `version` is the comma-joined *`dateModified`* of every revision in the stack (walked via
 //! `edge.search`, same as before), not diff ids - `moz-phab` re-resolves the live diff/base
 //! itself on every invocation regardless of what we pass it, so this only needs to answer "has
 //! anything about this stack changed since we last synced," and `dateModified` answers that with
-//! zero extra Conduit calls beyond the stack walk we're already doing (`resolve_stack`'s own
+//! zero extra Conduit calls beyond the stack walk we're already doing (`resolve_stacks`' own
 //! `differential.revision.search` calls already return it).
 //!
 //! # Checkout
@@ -178,10 +190,96 @@ impl MozPhabSource {
         Ok(out)
     }
 
-    /// Bottom-to-top chain of open revisions ending at `revision_id`, stopping at (and excluding)
-    /// the first closed ancestor - its content is already part of the base. Used only for
-    /// `version` tracking now; `moz-phab patch` does its own, more capable stack walk for the
-    /// actual checkout.
+    /// Batch stack resolution: walks every seed's parent chain in lockstep, one `edge.search` +
+    /// `differential.revision.search` pair *per depth level* covering every stack still in
+    /// flight, rather than one pair per stack. See the module docs for why this matters (it's
+    /// what keeps `fetch_queue`'s Conduit call count independent of queue size). Each seed is
+    /// keyed by its own `revision_id` in the returned map. Stops each chain at (and excludes) its
+    /// first closed ancestor - its content is already part of the base. Used only for `version`
+    /// tracking now; `moz-phab patch` does its own, more capable stack walk for the actual
+    /// checkout.
+    async fn resolve_stacks(
+        &self,
+        seeds: Vec<StackMember>,
+    ) -> Result<HashMap<u64, Vec<StackMember>>> {
+        let mut chains: HashMap<u64, Vec<StackMember>> = HashMap::new();
+        let mut current_phid: HashMap<u64, String> = HashMap::new();
+        for seed in seeds {
+            current_phid.insert(seed.revision_id, seed.revision_phid.clone());
+            chains.insert(seed.revision_id, vec![seed]);
+        }
+
+        for _ in 0..50 {
+            // safety valve against an unexpected cycle
+            if current_phid.is_empty() {
+                break;
+            }
+            let phids: Vec<String> = current_phid
+                .values()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let edges: Vec<EdgeItem> = self
+                .search_all(
+                    "edge.search",
+                    json!({"sourcePHIDs": phids, "types": ["revision.parent"]}),
+                )
+                .await?;
+            let mut parent_of: HashMap<String, String> = HashMap::new();
+            for edge in edges {
+                parent_of
+                    .entry(edge.source_phid)
+                    .or_insert(edge.destination_phid);
+            }
+
+            let parent_phids: Vec<String> = current_phid
+                .values()
+                .filter_map(|phid| parent_of.get(phid).cloned())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let parents: HashMap<String, RevisionItem> = if parent_phids.is_empty() {
+                HashMap::new()
+            } else {
+                self.search_all::<RevisionItem>(
+                    "differential.revision.search",
+                    json!({"constraints": {"phids": parent_phids}}),
+                )
+                .await?
+                .into_iter()
+                .map(|r| (r.phid.clone(), r))
+                .collect()
+            };
+
+            let mut next_current = HashMap::new();
+            for (revision_id, phid) in current_phid {
+                let Some(parent_phid) = parent_of.get(&phid) else {
+                    continue; // no parent edge; this stack is done
+                };
+                let Some(parent) = parents.get(parent_phid) else {
+                    continue; // parent vanished; stop here
+                };
+                if is_closed(&parent.fields.status.value) {
+                    continue; // landed/abandoned ancestor already part of the base
+                }
+                chains.get_mut(&revision_id).unwrap().push(StackMember {
+                    revision_id: parent.id,
+                    revision_phid: parent.phid.clone(),
+                    date_modified: parent.fields.date_modified.unwrap_or(0),
+                });
+                next_current.insert(revision_id, parent.phid.clone());
+            }
+            current_phid = next_current;
+        }
+
+        for chain in chains.values_mut() {
+            chain.reverse();
+        }
+        Ok(chains)
+    }
+
+    #[cfg(test)]
     async fn resolve_stack(&self, revision_id: u64) -> Result<Vec<StackMember>> {
         let start: Vec<RevisionItem> = self
             .search_all(
@@ -193,48 +291,13 @@ impl MozPhabSource {
             .into_iter()
             .next()
             .with_context(|| format!("revision D{revision_id} not found"))?;
-
-        let mut chain = vec![StackMember {
+        let seed = StackMember {
             revision_id: start.id,
-            revision_phid: start.phid.clone(),
+            revision_phid: start.phid,
             date_modified: start.fields.date_modified.unwrap_or(0),
-        }];
-        let mut current_phid = start.phid;
-        loop {
-            let edges: Vec<EdgeItem> = self
-                .search_all(
-                    "edge.search",
-                    json!({"sourcePHIDs": [current_phid], "types": ["revision.parent"]}),
-                )
-                .await?;
-            let Some(parent_phid) = edges.into_iter().next().map(|e| e.destination_phid) else {
-                break;
-            };
-
-            let parents: Vec<RevisionItem> = self
-                .search_all(
-                    "differential.revision.search",
-                    json!({"constraints": {"phids": [parent_phid]}}),
-                )
-                .await?;
-            let Some(parent) = parents.into_iter().next() else {
-                break;
-            };
-            if is_closed(&parent.fields.status.value) {
-                break;
-            }
-            chain.push(StackMember {
-                revision_id: parent.id,
-                revision_phid: parent.phid.clone(),
-                date_modified: parent.fields.date_modified.unwrap_or(0),
-            });
-            current_phid = parent.phid;
-            if chain.len() > 50 {
-                break; // safety valve against an unexpected cycle
-            }
-        }
-        chain.reverse();
-        Ok(chain)
+        };
+        let mut chains = self.resolve_stacks(vec![seed]).await?;
+        Ok(chains.remove(&revision_id).unwrap_or_default())
     }
 
     /// Resolve author PHIDs to usernames for display (`rq list`/`rq path` show `moz-phab`-style
@@ -253,37 +316,42 @@ impl MozPhabSource {
             .collect())
     }
 
-    async fn repo_ref_for(&self, repository_phid: &str) -> Result<RepoRef> {
+    /// One batched `diffusion.repository.search {constraints:{phids:[...]}}` over every distinct
+    /// repo among the given phids, keyed by repo phid in the result - mirrors `resolve_usernames`.
+    async fn repo_refs_for(&self, repository_phids: &[String]) -> Result<HashMap<String, RepoRef>> {
+        if repository_phids.is_empty() {
+            return Ok(HashMap::new());
+        }
         let repos: Vec<RepoItem> = self
             .search_all(
                 "diffusion.repository.search",
-                json!({"constraints": {"phids": [repository_phid]}, "attachments": {"uris": true}}),
+                json!({"constraints": {"phids": repository_phids}, "attachments": {"uris": true}}),
             )
             .await?;
-        let repo = repos
-            .into_iter()
-            .next()
-            .with_context(|| format!("repository {repository_phid} not found"))?;
-        let urls: Vec<String> = repo
-            .attachments
-            .and_then(|a| a.uris)
-            .map(|u| {
-                u.uris
-                    .into_iter()
-                    .map(|item| item.fields.uri.effective)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if urls.is_empty() {
-            bail!("repository {repository_phid} has no URIs");
+        let mut out = HashMap::new();
+        for repo in repos {
+            let urls: Vec<String> = repo
+                .attachments
+                .and_then(|a| a.uris)
+                .map(|u| {
+                    u.uris
+                        .into_iter()
+                        .map(|item| item.fields.uri.effective)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if urls.is_empty() {
+                bail!("repository {} has no URIs", repo.phid);
+            }
+            out.insert(
+                repo.phid.clone(),
+                RepoRef {
+                    urls,
+                    display_name: repo.fields.short_name.unwrap_or(repo.phid),
+                },
+            );
         }
-        Ok(RepoRef {
-            urls,
-            display_name: repo
-                .fields
-                .short_name
-                .unwrap_or_else(|| repository_phid.to_string()),
-        })
+        Ok(out)
     }
 
     /// Look up the revision's repo and write `.git/.arcconfig` in the canonical repo so
@@ -378,18 +446,44 @@ impl ReviewSource for MozPhabSource {
             .collect();
         let usernames = self.resolve_usernames(&author_phids).await?;
 
-        let mut reviews = Vec::new();
+        // Filter down to actionable revisions before doing any per-revision Conduit lookups, then
+        // batch those lookups (repos, stacks) across all of them at once - see the module docs.
+        let mut candidates = Vec::new();
         for rev in revisions {
             let Some(kind) = bucket_revision(&my_phid, &mine_phids, &group_names, &rev) else {
                 continue;
             };
-
-            let Some(repository_phid) = &rev.fields.repository_phid else {
+            let Some(repository_phid) = rev.fields.repository_phid.clone() else {
                 continue; // no repo attached; nothing for us to check out
             };
-            let repo = self.repo_ref_for(repository_phid).await?;
+            candidates.push((rev, kind, repository_phid));
+        }
 
-            let stack = self.resolve_stack(rev.id).await?;
+        let repo_phids: Vec<String> = candidates
+            .iter()
+            .map(|(_, _, phid)| phid.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let repos = self.repo_refs_for(&repo_phids).await?;
+
+        let seeds: Vec<StackMember> = candidates
+            .iter()
+            .map(|(rev, _, _)| StackMember {
+                revision_id: rev.id,
+                revision_phid: rev.phid.clone(),
+                date_modified: rev.fields.date_modified.unwrap_or(0),
+            })
+            .collect();
+        let mut stacks = self.resolve_stacks(seeds).await?;
+
+        let mut reviews = Vec::new();
+        for (rev, kind, repository_phid) in candidates {
+            let repo = repos
+                .get(&repository_phid)
+                .cloned()
+                .with_context(|| format!("repository {repository_phid} not found"))?;
+            let stack = stacks.remove(&rev.id).unwrap_or_default();
             let version = stack
                 .iter()
                 .map(|m| m.date_modified.to_string())
@@ -702,12 +796,15 @@ struct ReviewerEntry {
 
 #[derive(Deserialize)]
 struct EdgeItem {
+    #[serde(rename = "sourcePHID")]
+    source_phid: String,
     #[serde(rename = "destinationPHID")]
     destination_phid: String,
 }
 
 #[derive(Deserialize)]
 struct RepoItem {
+    phid: String,
     fields: RepoFields,
     attachments: Option<RepoAttachments>,
 }
@@ -993,7 +1090,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/edge.search"))
             .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[
-                json!({"destinationPHID": "PHID-DREV-1"}),
+                json!({"sourcePHID": "PHID-DREV-2", "destinationPHID": "PHID-DREV-1"}),
             ])))
             .mount(&server)
             .await;
@@ -1044,16 +1141,7 @@ mod tests {
             })])))
             .mount(&server)
             .await;
-        // resolve_stack: look up D1 by id, no parent edge.
-        Mock::given(method("POST"))
-            .and(path("/api/differential.revision.search"))
-            .and(body_string_contains("constraints%5Bids%5D%5B0%5D=1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[json!({
-                "id": 1, "phid": "PHID-DREV-1",
-                "fields": {"title": "Fix the thing", "authorPHID": "PHID-USER-other", "status": {"value": "needs-review"}, "repositoryPHID": "PHID-REPO-1", "dateModified": 1700000000},
-            })])))
-            .mount(&server)
-            .await;
+        // resolve_stacks: no parent edge for D1's stack.
         Mock::given(method("POST"))
             .and(path("/api/edge.search"))
             .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[])))
@@ -1062,7 +1150,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/diffusion.repository.search"))
             .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[json!({
-                "fields": {"shortName": "proj", "callsign": "PROJ"},
+                "phid": "PHID-REPO-1", "fields": {"shortName": "proj", "callsign": "PROJ"},
                 "attachments": {"uris": {"uris": [{"fields": {"uri": {"effective": "https://phab.example.com/source/proj.git"}}}]}},
             })])))
             .mount(&server)
@@ -1094,6 +1182,81 @@ mod tests {
         );
     }
 
+    /// Regression guard for the N+1 pattern that used to trip Phabricator's rate limit: two
+    /// actionable revisions sharing a repo and each with a one-level-deep stack must resolve with
+    /// exactly one `diffusion.repository.search` and one `edge.search` call between them, not one
+    /// each. `.expect(1)` fails the test (on `MockServer` teardown) if either is called twice.
+    #[tokio::test]
+    async fn fetch_queue_batches_repo_and_stack_lookups_across_revisions() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/user.whoami"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(call_response(json!({"phid": ME, "userName": "ahal"}))),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/project.search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/differential.revision.search"))
+            .and(body_string_contains("queryKey=active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[
+                json!({
+                    "id": 1, "phid": "PHID-DREV-1",
+                    "fields": {"title": "D1", "authorPHID": "PHID-USER-other", "status": {"value": "needs-review"}, "repositoryPHID": "PHID-REPO-1", "dateModified": 1},
+                    "attachments": {"reviewers": {"reviewers": [{"reviewerPHID": ME, "status": "added"}]}},
+                }),
+                json!({
+                    "id": 2, "phid": "PHID-DREV-2",
+                    "fields": {"title": "D2", "authorPHID": "PHID-USER-other", "status": {"value": "needs-review"}, "repositoryPHID": "PHID-REPO-1", "dateModified": 2},
+                    "attachments": {"reviewers": {"reviewers": [{"reviewerPHID": ME, "status": "added"}]}},
+                }),
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/edge.search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/diffusion.repository.search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[json!({
+                "phid": "PHID-REPO-1", "fields": {"shortName": "proj", "callsign": "PROJ"},
+                "attachments": {"uris": {"uris": [{"fields": {"uri": {"effective": "https://phab.example.com/source/proj.git"}}}]}},
+            })])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/user.search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[
+                json!({"phid": "PHID-USER-other", "fields": {"username": "alice"}}),
+            ])))
+            .mount(&server)
+            .await;
+
+        let src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
+        let mut reviews = src.fetch_queue().await.unwrap();
+        reviews.sort_by(|a, b| a.key.id.cmp(&b.key.id));
+
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(reviews[0].key, ReviewKey::new("moz", "D1"));
+        assert_eq!(reviews[1].key, ReviewKey::new("moz", "D2"));
+        for r in &reviews {
+            assert_eq!(
+                r.repo.urls,
+                vec!["https://phab.example.com/source/proj.git".to_string()]
+            );
+        }
+    }
+
     #[tokio::test]
     async fn checkout_spec_writes_arcconfig_and_builds_moz_phab_command() {
         let server = MockServer::start().await;
@@ -1109,7 +1272,7 @@ mod tests {
             .and(path("/api/diffusion.repository.search"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(search_response(&[json!({
-                    "fields": {"shortName": "proj", "callsign": "PROJ"},
+                    "phid": "PHID-REPO-1", "fields": {"shortName": "proj", "callsign": "PROJ"},
                 })])),
             )
             .mount(&server)
@@ -1179,7 +1342,7 @@ mod tests {
             .and(path("/api/diffusion.repository.search"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(search_response(&[json!({
-                    "fields": {"shortName": "proj", "callsign": null},
+                    "phid": "PHID-REPO-1", "fields": {"shortName": "proj", "callsign": null},
                 })])),
             )
             .mount(&server)
