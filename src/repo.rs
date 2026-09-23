@@ -1,7 +1,7 @@
 //! Canonical repo resolution: every review repo maps to exactly one canonical local repo, which
 //! `sync`/`prune` never delete - only the worktrees/workspaces created from it. A canonical repo
 //! is either user-owned (an explicit `[[repo]]` config entry pointing at an existing checkout)
-//! or tool-managed (cloned once under `Paths::repo_cache_dir()` and recorded in `repos.json`).
+//! or tool-managed (cloned once under `Paths::repo_source_dir()` and recorded in `repos.json`).
 //!
 //! Lookup order: config `[[repo]]`, then the `repos.json` registry, then clone a new one (always
 //! plain git - only a pre-existing user-owned checkout can be jj) and register it.
@@ -22,6 +22,9 @@ use crate::state::State;
 pub struct CanonicalRepo {
     pub path: PathBuf,
     pub vcs: VcsKind,
+    /// Identifies this repo's directory under `Paths::repos_dir()` - its normalized URL. Stable
+    /// across aliases (origin vs mirror) so a review's workspace always lands in the same place.
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,7 +74,7 @@ pub struct RepoStore {
     registry_path: PathBuf,
     registry: Registry,
     config_repos: Vec<RepoConfig>,
-    cache_dir: PathBuf,
+    repos_dir: PathBuf,
 }
 
 impl RepoStore {
@@ -80,7 +83,7 @@ impl RepoStore {
             registry_path: paths.repos_file(),
             registry: Registry::load(&paths.repos_file())?,
             config_repos: config.repos.clone(),
-            cache_dir: paths.repo_cache_dir(),
+            repos_dir: paths.repos_dir(),
         })
     }
 
@@ -94,9 +97,14 @@ impl RepoStore {
             let rc_normalized: Vec<String> = rc.urls.iter().map(|u| normalize_url(u)).collect();
             if normalized.iter().any(|n| rc_normalized.contains(n)) {
                 let vcs = rc.vcs.unwrap_or_else(|| detect_vcs(&rc.path));
+                let name = rc_normalized
+                    .into_iter()
+                    .next()
+                    .context("`[[repo]]` entry has no urls")?;
                 return Ok(CanonicalRepo {
                     path: rc.path.clone(),
                     vcs,
+                    name,
                 });
             }
         }
@@ -108,6 +116,7 @@ impl RepoStore {
                 return Ok(CanonicalRepo {
                     path: entry.path.clone(),
                     vcs: VcsKind::Git,
+                    name: n.clone(),
                 });
             }
         }
@@ -116,7 +125,8 @@ impl RepoStore {
             .urls
             .first()
             .context("review's repo has no candidate URLs to clone")?;
-        let dest = self.cache_dir.join(normalize_url(url));
+        let name = normalize_url(url);
+        let dest = self.repos_dir.join(&name).join("source");
         if dest.exists() {
             // Self-heal a registry that fell out of sync with the filesystem - e.g. a prior run
             // cloned this but was interrupted before it could save `repos.json`. Trust an
@@ -131,7 +141,7 @@ impl RepoStore {
         }
 
         self.registry.repos.insert(
-            normalize_url(url),
+            name.clone(),
             RegistryEntry {
                 path: dest.clone(),
                 origin_url: url.clone(),
@@ -141,6 +151,7 @@ impl RepoStore {
         Ok(CanonicalRepo {
             path: dest,
             vcs: VcsKind::Git,
+            name,
         })
     }
 
@@ -318,7 +329,7 @@ mod tests {
     fn paths_in(tmp: &Path) -> Paths {
         Paths::discover()
             .unwrap()
-            .with_overrides(Some(tmp.join("data")), Some(tmp.join("cache")))
+            .with_overrides(Some(tmp.join("data")))
     }
 
     fn repo_ref(urls: &[&str]) -> RepoRef {
@@ -351,7 +362,7 @@ mod tests {
         assert_eq!(canon.path, owned);
         assert_eq!(canon.vcs, VcsKind::Git);
         assert!(
-            !tmp.path().join("cache").exists(),
+            !tmp.path().join("data").join("repos").exists(),
             "should not have cloned anything"
         );
     }
@@ -456,7 +467,7 @@ mod tests {
 
         // Simulate the interrupted-prior-run scenario directly: clone to the exact path
         // `resolve()` would use, but never register it.
-        let dest = paths.repo_cache_dir().join(normalize_url(&url));
+        let dest = paths.repo_source_dir(&normalize_url(&url));
         std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
         git(tmp.path(), &["clone", "-q", &url, dest.to_str().unwrap()]);
         assert!(!paths.repos_file().exists());

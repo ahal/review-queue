@@ -9,8 +9,6 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     #[serde(default)]
     pub data_dir: Option<PathBuf>,
-    #[serde(default)]
-    pub repo_cache_dir: Option<PathBuf>,
 
     #[serde(rename = "source", default)]
     pub sources: Vec<SourceConfig>,
@@ -105,7 +103,6 @@ impl Config {
             toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
 
         config.data_dir = config.data_dir.map(|p| expand_tilde(&p));
-        config.repo_cache_dir = config.repo_cache_dir.map(|p| expand_tilde(&p));
         for repo in &mut config.repos {
             repo.path = expand_tilde(&repo.path);
         }

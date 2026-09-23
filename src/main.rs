@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
     let paths = Paths::discover()?;
     let config_path = cli.config.clone().unwrap_or_else(|| paths.config_file());
     let config = Config::load(&config_path)?;
-    let paths = paths.with_overrides(config.data_dir.clone(), config.repo_cache_dir.clone());
+    let paths = paths.with_overrides(config.data_dir.clone());
 
     match cli.command {
         Command::List { json, all, plain } => list(&paths, &config, json, all, plain).await,

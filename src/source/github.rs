@@ -134,7 +134,7 @@ impl GithubSource {
         Ok(Review {
             key: ReviewKey::new(
                 self.cfg.name.clone(),
-                format!("{owner}/{repo}/{}", pr.number),
+                format!("pr-{owner}/{repo}/{}", pr.number),
             ),
             title: pr.title.clone(),
             author: pr.user.login.clone(),
@@ -292,8 +292,13 @@ async fn resolve_token(cfg: &GithubConfig) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// `{owner}/{repo}/{number}` - unambiguous since owner/repo names can't contain `/`.
+/// `pr-{owner}/{repo}/{number}` - unambiguous since owner/repo names can't contain `/`. The
+/// `pr-` prefix distinguishes this source's ids from other sources' (e.g. `phab-`) sharing the
+/// same canonical repo's workspace directory.
 fn parse_id(id: &str) -> Result<(String, String, u64)> {
+    let id = id
+        .strip_prefix("pr-")
+        .with_context(|| format!("bad github review id `{id}` (missing `pr-` prefix)"))?;
     let mut parts = id.splitn(3, '/');
     let owner = parts
         .next()
@@ -422,11 +427,12 @@ mod tests {
     #[tokio::test]
     async fn parses_id_round_trip() {
         assert_eq!(
-            parse_id("mozilla/gecko-dev/123").unwrap(),
+            parse_id("pr-mozilla/gecko-dev/123").unwrap(),
             ("mozilla".into(), "gecko-dev".into(), 123)
         );
-        assert!(parse_id("not-enough-parts").is_err());
-        assert!(parse_id("owner/repo/not-a-number").is_err());
+        assert!(parse_id("mozilla/gecko-dev/123").is_err(), "missing pr- prefix");
+        assert!(parse_id("pr-not-enough-parts").is_err());
+        assert!(parse_id("pr-owner/repo/not-a-number").is_err());
     }
 
     #[tokio::test]
@@ -490,7 +496,7 @@ mod tests {
 
         assert_eq!(reviews.len(), 1);
         let r = &reviews[0];
-        assert_eq!(r.key, ReviewKey::new("gh", "mozilla/gecko-dev/123"));
+        assert_eq!(r.key, ReviewKey::new("gh", "pr-mozilla/gecko-dev/123"));
         assert_eq!(r.title, "Fix the thing");
         assert_eq!(r.author, "author");
         assert_eq!(r.version, "deadbeef");
@@ -571,7 +577,7 @@ mod tests {
         let src =
             GithubSource::for_test(cfg("gh"), Some("t".into()), server.uri(), SEARCH_PER_PAGE);
         let review = Review {
-            key: ReviewKey::new("gh", "mozilla/gecko-dev/123"),
+            key: ReviewKey::new("gh", "pr-mozilla/gecko-dev/123"),
             title: "x".into(),
             author: "author".into(),
             url: "https://github.com/mozilla/gecko-dev/pull/123".into(),
@@ -620,7 +626,7 @@ mod tests {
         let src =
             GithubSource::for_test(cfg("gh"), Some("t".into()), server.uri(), SEARCH_PER_PAGE);
         let review = Review {
-            key: ReviewKey::new("gh", "mozilla/gecko-dev/123"),
+            key: ReviewKey::new("gh", "pr-mozilla/gecko-dev/123"),
             title: "x".into(),
             author: "author".into(),
             url: "https://github.com/mozilla/gecko-dev/pull/123".into(),
@@ -658,7 +664,7 @@ mod tests {
         let src =
             GithubSource::for_test(cfg("gh"), Some("t".into()), server.uri(), SEARCH_PER_PAGE);
         let review = Review {
-            key: ReviewKey::new("gh", "mozilla/gecko-dev/123"),
+            key: ReviewKey::new("gh", "pr-mozilla/gecko-dev/123"),
             title: "x".into(),
             author: "author".into(),
             url: "https://github.com/mozilla/gecko-dev/pull/123".into(),
@@ -705,18 +711,18 @@ mod tests {
         let src =
             GithubSource::for_test(cfg("gh"), Some("t".into()), server.uri(), SEARCH_PER_PAGE);
         let ids = vec![
-            "mozilla/gecko-dev/1".to_string(),
-            "mozilla/gecko-dev/2".to_string(),
+            "pr-mozilla/gecko-dev/1".to_string(),
+            "pr-mozilla/gecko-dev/2".to_string(),
         ];
         let statuses = src.fetch_status(&ids).await.unwrap();
 
         assert_eq!(
             statuses[0],
-            ("mozilla/gecko-dev/1".to_string(), Lifecycle::Open)
+            ("pr-mozilla/gecko-dev/1".to_string(), Lifecycle::Open)
         );
         assert_eq!(
             statuses[1],
-            ("mozilla/gecko-dev/2".to_string(), Lifecycle::Resolved)
+            ("pr-mozilla/gecko-dev/2".to_string(), Lifecycle::Resolved)
         );
     }
 

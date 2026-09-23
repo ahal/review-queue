@@ -491,7 +491,7 @@ impl ReviewSource for MozPhabSource {
                 .join(",");
 
             reviews.push(Review {
-                key: ReviewKey::new(self.cfg.name.clone(), format!("D{}", rev.id)),
+                key: ReviewKey::new(self.cfg.name.clone(), format!("phab-D{}", rev.id)),
                 title: rev.fields.title.clone(),
                 author: usernames
                     .get(&rev.fields.author_phid)
@@ -656,9 +656,10 @@ async fn resolve_token(cfg: &MozPhabConfig) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// `"D12345"` -> `12345`.
+/// `"phab-D12345"` -> `12345`. The `phab-` prefix distinguishes this source's ids from other
+/// sources' (e.g. `pr-`) sharing the same canonical repo's workspace directory.
 fn parse_id(id: &str) -> Result<u64> {
-    id.strip_prefix('D')
+    id.strip_prefix("phab-D")
         .with_context(|| format!("bad moz-phab review id `{id}`"))?
         .parse()
         .with_context(|| format!("bad moz-phab review id `{id}`"))
@@ -913,9 +914,10 @@ mod tests {
 
     #[test]
     fn parse_id_round_trip() {
-        assert_eq!(parse_id("D12345").unwrap(), 12345);
+        assert_eq!(parse_id("phab-D12345").unwrap(), 12345);
+        assert!(parse_id("D12345").is_err(), "missing phab- prefix");
         assert!(parse_id("12345").is_err());
-        assert!(parse_id("Dabc").is_err());
+        assert!(parse_id("phab-Dabc").is_err());
     }
 
     #[test]
@@ -1023,19 +1025,19 @@ mod tests {
 
         let src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
         let ids = vec![
-            "D1".to_string(),
-            "D2".to_string(),
-            "D3".to_string(),
-            "D4".to_string(),
+            "phab-D1".to_string(),
+            "phab-D2".to_string(),
+            "phab-D3".to_string(),
+            "phab-D4".to_string(),
         ];
         let statuses = src.fetch_status(&ids).await.unwrap();
 
-        assert_eq!(statuses[0], ("D1".to_string(), Lifecycle::Resolved));
-        assert_eq!(statuses[1], ("D2".to_string(), Lifecycle::Open));
-        assert_eq!(statuses[2], ("D3".to_string(), Lifecycle::Resolved));
+        assert_eq!(statuses[0], ("phab-D1".to_string(), Lifecycle::Resolved));
+        assert_eq!(statuses[1], ("phab-D2".to_string(), Lifecycle::Open));
+        assert_eq!(statuses[2], ("phab-D3".to_string(), Lifecycle::Resolved));
         assert_eq!(
             statuses[3],
-            ("D4".to_string(), Lifecycle::Resolved),
+            ("phab-D4".to_string(), Lifecycle::Resolved),
             "an id missing from the response should count as resolved"
         );
     }
@@ -1168,7 +1170,7 @@ mod tests {
 
         assert_eq!(reviews.len(), 1);
         let r = &reviews[0];
-        assert_eq!(r.key, ReviewKey::new("moz", "D1"));
+        assert_eq!(r.key, ReviewKey::new("moz", "phab-D1"));
         assert_eq!(r.title, "Fix the thing");
         assert_eq!(
             r.author, "alice",
@@ -1247,8 +1249,8 @@ mod tests {
         reviews.sort_by(|a, b| a.key.id.cmp(&b.key.id));
 
         assert_eq!(reviews.len(), 2);
-        assert_eq!(reviews[0].key, ReviewKey::new("moz", "D1"));
-        assert_eq!(reviews[1].key, ReviewKey::new("moz", "D2"));
+        assert_eq!(reviews[0].key, ReviewKey::new("moz", "phab-D1"));
+        assert_eq!(reviews[1].key, ReviewKey::new("moz", "phab-D2"));
         for r in &reviews {
             assert_eq!(
                 r.repo.urls,
@@ -1283,7 +1285,7 @@ mod tests {
 
         let src = MozPhabSource::for_test(cfg(&server.uri()), Some("secret-token".into()));
         let review = Review {
-            key: ReviewKey::new("moz", "D1"),
+            key: ReviewKey::new("moz", "phab-D1"),
             title: "x".into(),
             author: "a".into(),
             url: "https://phab.example.com/D1".into(),
@@ -1315,7 +1317,7 @@ mod tests {
                         "base",
                         "--yes",
                         "--name",
-                        "moz-D1"
+                        "moz-phab-D1"
                     ]
                 );
                 assert!(env.contains(&(
@@ -1353,7 +1355,7 @@ mod tests {
 
         let src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
         let review = Review {
-            key: ReviewKey::new("moz", "D1"),
+            key: ReviewKey::new("moz", "phab-D1"),
             title: "x".into(),
             author: "a".into(),
             url: "https://phab.example.com/D1".into(),
