@@ -153,7 +153,10 @@ impl RepoStore {
     pub fn list(&self, state: &State) -> Vec<RepoListEntry> {
         let mut out = Vec::new();
         for rc in &self.config_repos {
-            let workspace_count = state.iter().filter(|e| e.repo_path == rc.path).count();
+            let workspace_count = state
+                .iter()
+                .filter(|e| e.workspace.as_ref().is_some_and(|w| w.repo_path == rc.path))
+                .count();
             out.push(RepoListEntry {
                 url: rc.urls.first().cloned().unwrap_or_default(),
                 path: rc.path.clone(),
@@ -162,7 +165,14 @@ impl RepoStore {
             });
         }
         for (url, entry) in &self.registry.repos {
-            let workspace_count = state.iter().filter(|e| e.repo_path == entry.path).count();
+            let workspace_count = state
+                .iter()
+                .filter(|e| {
+                    e.workspace
+                        .as_ref()
+                        .is_some_and(|w| w.repo_path == entry.path)
+                })
+                .count();
             out.push(RepoListEntry {
                 url: url.clone(),
                 path: entry.path.clone(),
@@ -188,7 +198,11 @@ impl RepoStore {
         let Some(entry) = self.registry.repos.get(&normalized).cloned() else {
             bail!("no tool-managed clone registered for `{url}` (see `rq repo list`)");
         };
-        if state.iter().any(|e| e.repo_path == entry.path) {
+        if state.iter().any(|e| {
+            e.workspace
+                .as_ref()
+                .is_some_and(|w| w.repo_path == entry.path)
+        }) {
             bail!(
                 "{} still has workspaces using it; run `rq prune` or remove them first",
                 entry.path.display()
@@ -460,14 +474,22 @@ mod tests {
             title: "x".into(),
             author: "a".into(),
             url: "https://example.com/D1".into(),
-            repo_path: repo_path.to_path_buf(),
-            vcs: VcsKind::Git,
-            workspace_path: PathBuf::from("/tmp/ws/D1"),
+            repo: RepoRef {
+                urls: vec!["https://example.com/o/r".into()],
+                display_name: "o/r".into(),
+            },
+            kind: crate::source::ReviewKind::Direct,
             version: "1".into(),
-            head_id: "abc".into(),
             in_queue: true,
-            status: crate::state::Status::Ready,
+            resolved: false,
             last_synced: chrono::Utc::now(),
+            workspace: Some(crate::state::Workspace {
+                repo_path: repo_path.to_path_buf(),
+                vcs: VcsKind::Git,
+                workspace_path: PathBuf::from("/tmp/ws/D1"),
+                head_id: "abc".into(),
+                status: crate::state::Status::Ready,
+            }),
         }
     }
 

@@ -1,21 +1,23 @@
 //! The sync engine: source-agnostic glue between `ReviewSource`, `RepoStore`, and the `Vcs`
-//! backends. `rq sync` runs this once per invocation (see the design plan for why sync is
-//! on-demand rather than a daemon).
+//! backends.
 //!
-//! Per source, per run:
+//! `rq sync` (this module's `sync()`) only ever tracks metadata and updates/removes *existing*
+//! workspaces - it never creates one. Per source, per run:
 //! 1. `fetch_queue()` - reviews currently waiting on you.
-//! 2. New reviews get a workspace (`add_workspace`).
-//! 3. Reviews already tracked whose `version` changed get updated in place if clean
-//!    (`update_workspace`); dirty ones are flagged instead of touched.
+//! 2. New reviews are recorded with no workspace (see `fetch_local()` for that).
+//! 3. Reviews already tracked whose `version` changed get their workspace (if any) updated in
+//!    place if clean (`update_workspace`); dirty ones are flagged instead of touched.
 //! 4. Reviews still in the queue but otherwise unchanged just get `in_queue` refreshed.
 //!
 //! Then, once per source, for tracked reviews that weren't in this run's queue (you acted on
 //! them - approved, requested changes - so they dropped out): `fetch_status()` tells us whether
-//! the review itself resolved (landed/closed/abandoned/merged). Resolved and clean -> the
-//! workspace is removed. Resolved and dirty, or still open -> kept, `in_queue = false`.
+//! the review itself resolved (landed/closed/abandoned/merged). A resolved review with no
+//! workspace is just dropped. A resolved review with a clean workspace has the workspace removed
+//! too. Either way, if dirty, it's kept.
 //!
-//! A `sync.lock` (`fd-lock`, guarding overlapping cron runs) and the standalone `rq prune`
-//! command are deferred; this module only implements what a single `rq sync` run needs.
+//! `fetch_local()` is the on-demand counterpart - resolving a canonical repo (cloning one if
+//! needed) and creating a workspace for a single already-tracked review. It's what `rq fetch` and
+//! the fetch hotkey in `rq list`'s TUI call; `sync()` never calls it itself.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -25,7 +27,7 @@ use crate::config::{Config, VcsKind};
 use crate::paths::Paths;
 use crate::repo::RepoStore;
 use crate::source::{Lifecycle, Review, ReviewSource};
-use crate::state::{ReviewEntry, ReviewKey, State, Status};
+use crate::state::{ReviewEntry, ReviewKey, State, Status, Workspace};
 use crate::vcs::Vcs;
 use crate::vcs::git::GitVcs;
 use crate::vcs::jj::JjVcs;
@@ -50,13 +52,11 @@ fn vcs_for(kind: VcsKind) -> Box<dyn Vcs> {
 pub async fn sync(
     sources: &[Box<dyn ReviewSource>],
     paths: &Paths,
-    config: &Config,
     only_source: Option<&str>,
     dry_run: bool,
 ) -> Result<SyncReport> {
     paths.ensure_dirs()?;
     let mut state = State::load(&paths.state_file())?;
-    let mut repo_store = RepoStore::load(paths, config)?;
     let mut report = SyncReport::default();
     let mut seen: BTreeSet<ReviewKey> = BTreeSet::new();
 
@@ -70,16 +70,8 @@ pub async fn sync(
             .with_context(|| format!("fetching queue from `{}`", source.name()))?;
         for review in queue {
             seen.insert(review.key.clone());
-            if let Err(e) = sync_one(
-                source.as_ref(),
-                &review,
-                paths,
-                &mut repo_store,
-                &mut state,
-                dry_run,
-                &mut report,
-            )
-            .await
+            if let Err(e) =
+                sync_one(source.as_ref(), &review, &mut state, dry_run, &mut report).await
             {
                 report.errors.push((review.key.clone(), e.to_string()));
             }
@@ -118,7 +110,6 @@ pub async fn sync(
 
     if !dry_run {
         state.save(&paths.state_file())?;
-        repo_store.save()?;
     }
     Ok(report)
 }
@@ -126,76 +117,37 @@ pub async fn sync(
 async fn sync_one(
     source: &dyn ReviewSource,
     review: &Review,
-    paths: &Paths,
-    repo_store: &mut RepoStore,
     state: &mut State,
     dry_run: bool,
     report: &mut SyncReport,
 ) -> Result<()> {
     match state.get(&review.key).cloned() {
-        None => add_new(source, review, paths, repo_store, state, dry_run, report).await,
+        None => {
+            add_new(review, state, dry_run, report);
+            Ok(())
+        }
         Some(entry) => update_existing(source, review, entry, state, dry_run, report).await,
     }
 }
 
-async fn add_new(
-    source: &dyn ReviewSource,
-    review: &Review,
-    paths: &Paths,
-    repo_store: &mut RepoStore,
-    state: &mut State,
-    dry_run: bool,
-    report: &mut SyncReport,
-) -> Result<()> {
+fn add_new(review: &Review, state: &mut State, dry_run: bool, report: &mut SyncReport) {
+    report.added.push(review.key.clone());
     if dry_run {
-        // `repo_store.resolve()` can clone a fresh canonical repo - a real side effect that a
-        // dry run must not have, even though it would also happen for a real sync of this review.
-        report.added.push(review.key.clone());
-        return Ok(());
+        return;
     }
-
-    let canon = repo_store.resolve(&review.repo)?;
-    let checkout = source.checkout_spec(review, &canon.path).await?;
-    let vcs = vcs_for(canon.vcs);
-    let ws = paths.workspace_dir(&review.key.source, &review.key.id);
-    if let Some(parent) = ws.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let base_entry = |status: Status, head_id: String| ReviewEntry {
+    state.insert(ReviewEntry {
         key: review.key.clone(),
         title: review.title.clone(),
         author: review.author.clone(),
         url: review.url.clone(),
-        repo_path: canon.path.clone(),
-        vcs: canon.vcs,
-        workspace_path: ws.clone(),
+        repo: review.repo.clone(),
+        kind: review.kind.clone(),
         version: review.version.clone(),
-        head_id,
         in_queue: true,
-        status,
+        resolved: false,
         last_synced: chrono::Utc::now(),
-    };
-
-    match vcs.add_workspace(
-        &canon.path,
-        &ws,
-        &checkout,
-        &review.key.slug(),
-        &review.version,
-    ) {
-        Ok(head) => {
-            state.insert(base_entry(Status::Ready, head));
-            report.added.push(review.key.clone());
-        }
-        Err(e) => {
-            // Recorded anyway (with the workspace left in place, per the vcs backends' own
-            // contract) so `rq list`/`rq path` can point at it for inspection.
-            state.insert(base_entry(Status::ApplyFailed, String::new()));
-            report.errors.push((review.key.clone(), e.to_string()));
-        }
-    }
-    Ok(())
+        workspace: None,
+    });
 }
 
 async fn update_existing(
@@ -209,7 +161,21 @@ async fn update_existing(
     entry.title = review.title.clone();
     entry.author = review.author.clone();
     entry.url = review.url.clone();
+    entry.repo = review.repo.clone();
+    entry.kind = review.kind.clone();
     entry.in_queue = true;
+    entry.resolved = false;
+
+    let Some(mut ws) = entry.workspace.clone() else {
+        // Not fetched locally - nothing on disk to update, just keep the tracked metadata
+        // (including `version`) current for a later `rq fetch`.
+        entry.version = review.version.clone();
+        entry.last_synced = chrono::Utc::now();
+        if !dry_run {
+            state.insert(entry);
+        }
+        return Ok(());
+    };
 
     if entry.version == review.version {
         entry.last_synced = chrono::Utc::now();
@@ -219,12 +185,13 @@ async fn update_existing(
         return Ok(());
     }
 
-    let vcs = vcs_for(entry.vcs);
+    let vcs = vcs_for(ws.vcs);
     if vcs
-        .is_dirty(&entry.workspace_path, &entry.head_id)
+        .is_dirty(&ws.workspace_path, &ws.head_id)
         .unwrap_or(true)
     {
-        entry.status = Status::Dirty;
+        ws.status = Status::Dirty;
+        entry.workspace = Some(ws);
         entry.last_synced = chrono::Utc::now();
         report.flagged.push((
             review.key.clone(),
@@ -241,24 +208,26 @@ async fn update_existing(
         return Ok(());
     }
 
-    let checkout = source.checkout_spec(review, &entry.repo_path).await?;
+    let checkout = source.checkout_spec(review, &ws.repo_path).await?;
     match vcs.update_workspace(
-        &entry.repo_path,
-        &entry.workspace_path,
+        &ws.repo_path,
+        &ws.workspace_path,
         &checkout,
         &review.key.slug(),
         &review.version,
     ) {
         Ok(head) => {
             entry.version = review.version.clone();
-            entry.head_id = head;
-            entry.status = Status::Ready;
+            ws.head_id = head;
+            ws.status = Status::Ready;
+            entry.workspace = Some(ws);
             entry.last_synced = chrono::Utc::now();
             state.insert(entry);
             report.updated.push(review.key.clone());
         }
         Err(e) => {
-            entry.status = Status::ApplyFailed;
+            ws.status = Status::ApplyFailed;
+            entry.workspace = Some(ws);
             entry.last_synced = chrono::Utc::now();
             state.insert(entry);
             report.errors.push((review.key.clone(), e.to_string()));
@@ -282,17 +251,27 @@ fn handle_out_of_queue(
 
     match lifecycle {
         Lifecycle::Open => {
+            entry.resolved = false;
             if !dry_run {
                 state.insert(entry);
             }
         }
         Lifecycle::Resolved => {
-            let vcs = vcs_for(entry.vcs);
+            entry.resolved = true;
+            let Some(ws) = entry.workspace.clone() else {
+                // Nothing local to preserve for inspection - just forget it.
+                if !dry_run {
+                    state.remove(key);
+                }
+                report.removed.push(key.clone());
+                return Ok(());
+            };
+
+            let vcs = vcs_for(ws.vcs);
             if vcs
-                .is_dirty(&entry.workspace_path, &entry.head_id)
+                .is_dirty(&ws.workspace_path, &ws.head_id)
                 .unwrap_or(true)
             {
-                entry.status = Status::Resolved;
                 report.flagged.push((
                     key.clone(),
                     "resolved but has local changes; workspace kept".into(),
@@ -302,12 +281,7 @@ fn handle_out_of_queue(
                 }
             } else {
                 if !dry_run {
-                    vcs.remove_workspace(
-                        &entry.repo_path,
-                        &entry.workspace_path,
-                        &key.slug(),
-                        false,
-                    )?;
+                    vcs.remove_workspace(&ws.repo_path, &ws.workspace_path, &key.slug(), false)?;
                     state.remove(key);
                 }
                 report.removed.push(key.clone());
@@ -317,6 +291,77 @@ fn handle_out_of_queue(
     Ok(())
 }
 
+/// Resolve a canonical repo (cloning one if needed) and create a workspace for `key`, a review
+/// already tracked by a prior `sync()`. A no-op that returns the existing path if `key` already
+/// has a workspace. This is the on-demand counterpart to `sync()`'s deliberate refusal to create
+/// workspaces on its own - see the module docs.
+pub async fn fetch_local(
+    sources: &[Box<dyn ReviewSource>],
+    paths: &Paths,
+    config: &Config,
+    key: &ReviewKey,
+) -> Result<std::path::PathBuf> {
+    paths.ensure_dirs()?;
+    let mut state = State::load(&paths.state_file())?;
+    let mut entry = state
+        .get(key)
+        .cloned()
+        .with_context(|| format!("`{key}` isn't tracked; run `rq sync` first"))?;
+
+    if let Some(ws) = &entry.workspace {
+        return Ok(ws.workspace_path.clone());
+    }
+
+    let source = sources
+        .iter()
+        .find(|s| s.name() == key.source)
+        .with_context(|| format!("no configured source named `{}`", key.source))?;
+
+    let review = Review {
+        key: entry.key.clone(),
+        title: entry.title.clone(),
+        author: entry.author.clone(),
+        url: entry.url.clone(),
+        repo: entry.repo.clone(),
+        version: entry.version.clone(),
+        kind: entry.kind.clone(),
+    };
+
+    let mut repo_store = RepoStore::load(paths, config)?;
+    let canon = repo_store.resolve(&review.repo)?;
+    let checkout = source.checkout_spec(&review, &canon.path).await?;
+    let vcs = vcs_for(canon.vcs);
+    let ws_path = paths.workspace_dir(&key.source, &key.id);
+    if let Some(parent) = ws_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let outcome = vcs.add_workspace(
+        &canon.path,
+        &ws_path,
+        &checkout,
+        &key.slug(),
+        &review.version,
+    );
+    let (status, head_id) = match &outcome {
+        Ok(head) => (Status::Ready, head.clone()),
+        // Recorded anyway (with the workspace left in place, per the vcs backends' own
+        // contract) so `rq list`/`rq path` can point at it for inspection.
+        Err(_) => (Status::ApplyFailed, String::new()),
+    };
+    entry.workspace = Some(Workspace {
+        repo_path: canon.path.clone(),
+        vcs: canon.vcs,
+        workspace_path: ws_path.clone(),
+        head_id,
+        status,
+    });
+    state.insert(entry);
+    state.save(&paths.state_file())?;
+    repo_store.save()?;
+    outcome.map(|_| ws_path)
+}
+
 #[derive(Debug, Default)]
 pub struct PruneReport {
     pub removed: Vec<ReviewKey>,
@@ -324,9 +369,10 @@ pub struct PruneReport {
     pub kept_dirty: Vec<ReviewKey>,
 }
 
-/// Remove workspaces: every `Status::Resolved` one if `ids` is empty, or specifically the
+/// Remove workspaces: every resolved review's if `ids` is empty, or specifically the
 /// (unique-prefix-resolved) reviews named in `ids` regardless of their status. A dirty workspace
-/// is left in place (reported via `kept_dirty`) unless `force` is set.
+/// is left in place (reported via `kept_dirty`) unless `force` is set. Reviews with no workspace
+/// are simply dropped from tracking if resolved, or left untouched otherwise.
 pub fn prune(paths: &Paths, force: bool, ids: &[String]) -> Result<PruneReport> {
     let mut state = State::load(&paths.state_file())?;
     let mut report = PruneReport::default();
@@ -334,7 +380,7 @@ pub fn prune(paths: &Paths, force: bool, ids: &[String]) -> Result<PruneReport> 
     let targets: Vec<ReviewKey> = if ids.is_empty() {
         state
             .iter()
-            .filter(|e| e.status == Status::Resolved)
+            .filter(|e| e.resolved)
             .map(|e| e.key.clone())
             .collect()
     } else {
@@ -358,22 +404,30 @@ pub fn prune(paths: &Paths, force: bool, ids: &[String]) -> Result<PruneReport> 
             .expect("key was just resolved from this state")
             .clone();
 
-        if !entry.workspace_path.exists() {
+        let Some(ws) = entry.workspace else {
+            if entry.resolved {
+                state.remove(&key);
+                report.removed.push(key);
+            }
+            continue;
+        };
+
+        if !ws.workspace_path.exists() {
             state.remove(&key);
             report.removed.push(key);
             continue;
         }
 
-        let vcs = vcs_for(entry.vcs);
+        let vcs = vcs_for(ws.vcs);
         let dirty = vcs
-            .is_dirty(&entry.workspace_path, &entry.head_id)
+            .is_dirty(&ws.workspace_path, &ws.head_id)
             .unwrap_or(true);
         if dirty && !force {
             report.kept_dirty.push(key);
             continue;
         }
 
-        vcs.remove_workspace(&entry.repo_path, &entry.workspace_path, &key.slug(), force)?;
+        vcs.remove_workspace(&ws.repo_path, &ws.workspace_path, &key.slug(), force)?;
         state.remove(&key);
         report.removed.push(key);
     }
@@ -395,6 +449,7 @@ mod tests {
     use crate::config::GithubConfig;
     use crate::source::Checkout;
     use crate::source::github::GithubSource;
+    use crate::source::{RepoRef, ReviewKind};
 
     fn git(dir: &Path, args: &[&str]) {
         let out = Command::new("git")
@@ -547,7 +602,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adds_a_new_review_end_to_end() {
+    async fn tracks_new_review_without_creating_a_workspace() {
+        let repos = make_repos();
+        let sha = git_rev_parse(&repos.fork, "HEAD");
+        let server = MockServer::start().await;
+        mount_search(&server, true).await;
+        mount_pull(
+            &server,
+            pull_json("moz", "proj", &repos.upstream, &repos.fork, &sha, "open"),
+        )
+        .await;
+
+        let work_tmp = TempDir::new().unwrap();
+        let paths = paths_in(work_tmp.path());
+        let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
+
+        let report = sync(&sources, &paths, None, false).await.unwrap();
+
+        assert_eq!(report.added, vec![ReviewKey::new("gh", "moz/proj/1")]);
+        let state = State::load(&paths.state_file()).unwrap();
+        let entry = state.get(&ReviewKey::new("gh", "moz/proj/1")).unwrap();
+        assert!(entry.in_queue);
+        assert!(!entry.resolved);
+        assert_eq!(entry.version, sha);
+        assert!(
+            entry.workspace.is_none(),
+            "sync must not create a workspace on its own"
+        );
+
+        // Nothing was cloned or registered either - that only happens on `fetch_local`.
+        assert!(!paths.repos_file().exists());
+        assert!(!paths.repo_cache_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn fetch_local_creates_workspace_on_demand() {
         let repos = make_repos();
         let sha = git_rev_parse(&repos.fork, "HEAD");
         let server = MockServer::start().await;
@@ -563,20 +652,79 @@ mod tests {
         let config = Config::default();
         let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
 
-        let report = sync(&sources, &paths, &config, None, false).await.unwrap();
+        sync(&sources, &paths, None, false).await.unwrap();
 
-        assert_eq!(report.added, vec![ReviewKey::new("gh", "moz/proj/1")]);
+        let key = ReviewKey::new("gh", "moz/proj/1");
+        let ws_path = fetch_local(&sources, &paths, &config, &key).await.unwrap();
+
+        assert!(ws_path.join("pr.txt").exists());
         let state = State::load(&paths.state_file()).unwrap();
-        let entry = state.get(&ReviewKey::new("gh", "moz/proj/1")).unwrap();
-        assert_eq!(entry.status, Status::Ready);
-        assert!(entry.in_queue);
-        assert_eq!(entry.head_id, sha);
-        assert!(entry.workspace_path.join("pr.txt").exists());
+        let entry = state.get(&key).unwrap();
+        let ws = entry.workspace.as_ref().unwrap();
+        assert_eq!(ws.status, Status::Ready);
+        assert_eq!(ws.head_id, sha);
+        assert_eq!(ws.workspace_path, ws_path);
 
         // The canonical repo was cloned (tool-managed - no `[[repo]]` config entry) and
-        // registered, so a second sync would reuse it instead of cloning again.
-        assert!(entry.repo_path.join(".git").exists());
+        // registered, so a second fetch would reuse it instead of cloning again.
+        assert!(ws.repo_path.join(".git").exists());
         assert!(paths.repos_file().exists());
+
+        // Calling it again is a no-op that just returns the existing path.
+        let ws_path2 = fetch_local(&sources, &paths, &config, &key).await.unwrap();
+        assert_eq!(ws_path2, ws_path);
+    }
+
+    #[tokio::test]
+    async fn resolved_review_without_a_workspace_is_dropped_with_no_git_calls() {
+        let repos = make_repos();
+        let sha = git_rev_parse(&repos.fork, "HEAD");
+        let server = MockServer::start().await;
+        mount_search(&server, true).await;
+        mount_pull(
+            &server,
+            pull_json("moz", "proj", &repos.upstream, &repos.fork, &sha, "open"),
+        )
+        .await;
+
+        let work_tmp = TempDir::new().unwrap();
+        let paths = paths_in(work_tmp.path());
+        let key = ReviewKey::new("gh", "moz/proj/1");
+
+        sync(&[github_source(&server)], &paths, None, false)
+            .await
+            .unwrap();
+        assert!(
+            State::load(&paths.state_file())
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .workspace
+                .is_none()
+        );
+        drop(server);
+
+        // Never fetched locally, and now merged - nothing to check for dirtiness, so it's just
+        // dropped from tracking.
+        let server = MockServer::start().await;
+        mount_search(&server, false).await;
+        mount_pull(
+            &server,
+            pull_json("moz", "proj", &repos.upstream, &repos.fork, &sha, "closed"),
+        )
+        .await;
+
+        let report = sync(&[github_source(&server)], &paths, None, false)
+            .await
+            .unwrap();
+
+        assert_eq!(report.removed, vec![key.clone()]);
+        assert!(
+            State::load(&paths.state_file())
+                .unwrap()
+                .get(&key)
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -594,16 +742,11 @@ mod tests {
         let work_tmp = TempDir::new().unwrap();
         let paths = paths_in(work_tmp.path());
         let config = Config::default();
+        let key = ReviewKey::new("gh", "moz/proj/1");
 
-        sync(&[github_source(&server)], &paths, &config, None, false)
-            .await
-            .unwrap();
-        let ws_path = State::load(&paths.state_file())
-            .unwrap()
-            .get(&ReviewKey::new("gh", "moz/proj/1"))
-            .unwrap()
-            .workspace_path
-            .clone();
+        let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
+        sync(&sources, &paths, None, false).await.unwrap();
+        let ws_path = fetch_local(&sources, &paths, &config, &key).await.unwrap();
         assert!(ws_path.exists());
         drop(server);
 
@@ -617,7 +760,7 @@ mod tests {
         )
         .await;
 
-        let report = sync(&[github_source(&server)], &paths, &config, None, false)
+        let report = sync(&[github_source(&server)], &paths, None, false)
             .await
             .unwrap();
 
@@ -646,9 +789,10 @@ mod tests {
         let work_tmp = TempDir::new().unwrap();
         let paths = paths_in(work_tmp.path());
         let config = Config::default();
-        sync(&[github_source(&server)], &paths, &config, None, false)
-            .await
-            .unwrap();
+        let key = ReviewKey::new("gh", "moz/proj/1");
+        let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
+        sync(&sources, &paths, None, false).await.unwrap();
+        fetch_local(&sources, &paths, &config, &key).await.unwrap();
         drop(server);
 
         // Second sync: changes requested, so the PR drops out of the queue, but it's still open.
@@ -660,15 +804,15 @@ mod tests {
         )
         .await;
 
-        let report = sync(&[github_source(&server)], &paths, &config, None, false)
+        let report = sync(&[github_source(&server)], &paths, None, false)
             .await
             .unwrap();
 
         assert!(report.removed.is_empty());
         let entry = State::load(&paths.state_file()).unwrap();
-        let entry = entry.get(&ReviewKey::new("gh", "moz/proj/1")).unwrap();
+        let entry = entry.get(&key).unwrap();
         assert!(!entry.in_queue);
-        assert!(entry.workspace_path.exists());
+        assert!(entry.workspace.as_ref().unwrap().workspace_path.exists());
     }
 
     #[tokio::test]
@@ -686,17 +830,12 @@ mod tests {
         let work_tmp = TempDir::new().unwrap();
         let paths = paths_in(work_tmp.path());
         let config = Config::default();
-        sync(&[github_source(&server)], &paths, &config, None, false)
-            .await
-            .unwrap();
+        let key = ReviewKey::new("gh", "moz/proj/1");
+        let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
+        sync(&sources, &paths, None, false).await.unwrap();
+        let ws_path = fetch_local(&sources, &paths, &config, &key).await.unwrap();
         drop(server);
 
-        let ws_path = State::load(&paths.state_file())
-            .unwrap()
-            .get(&ReviewKey::new("gh", "moz/proj/1"))
-            .unwrap()
-            .workspace_path
-            .clone();
         std::fs::write(ws_path.join("untracked.txt"), "local edit\n").unwrap();
 
         // The PR gets a new commit pushed.
@@ -715,15 +854,15 @@ mod tests {
         )
         .await;
 
-        let report = sync(&[github_source(&server)], &paths, &config, None, false)
+        let report = sync(&[github_source(&server)], &paths, None, false)
             .await
             .unwrap();
 
         assert!(report.updated.is_empty());
         assert_eq!(report.flagged.len(), 1);
         let entry = State::load(&paths.state_file()).unwrap();
-        let entry = entry.get(&ReviewKey::new("gh", "moz/proj/1")).unwrap();
-        assert_eq!(entry.status, Status::Dirty);
+        let entry = entry.get(&key).unwrap();
+        assert_eq!(entry.workspace.as_ref().unwrap().status, Status::Dirty);
         assert_eq!(
             entry.version, sha1,
             "dirty workspace must not be moved to the new version"
@@ -748,9 +887,8 @@ mod tests {
 
         let work_tmp = TempDir::new().unwrap();
         let paths = paths_in(work_tmp.path());
-        let config = Config::default();
 
-        let report = sync(&[github_source(&server)], &paths, &config, None, true)
+        let report = sync(&[github_source(&server)], &paths, None, true)
             .await
             .unwrap();
 
@@ -759,9 +897,8 @@ mod tests {
             !paths.state_file().exists(),
             "dry-run must not write state.json"
         );
-        // Regression: `add_new` used to resolve (and potentially clone) the canonical repo
-        // before checking `dry_run`, so a dry run had the very real side effect of actually
-        // cloning it.
+        // `sync` never resolves/clones a canonical repo itself - only `fetch_local` does - so
+        // this holds regardless of `dry_run`, but is worth pinning down for the dry-run path too.
         assert!(
             !paths.repos_file().exists(),
             "dry-run must not touch the repo registry"
@@ -802,21 +939,29 @@ mod tests {
         canon: &std::path::Path,
         ws: &std::path::Path,
         head: &str,
-        status: Status,
+        resolved: bool,
     ) -> ReviewEntry {
         ReviewEntry {
             key,
             title: "x".into(),
             author: "a".into(),
             url: "https://example.com".into(),
-            repo_path: canon.to_path_buf(),
-            vcs: crate::config::VcsKind::Git,
-            workspace_path: ws.to_path_buf(),
+            repo: RepoRef {
+                urls: vec!["https://example.com/o/r".into()],
+                display_name: "o/r".into(),
+            },
+            kind: ReviewKind::Direct,
             version: "1".into(),
-            head_id: head.to_string(),
             in_queue: false,
-            status,
+            resolved,
             last_synced: chrono::Utc::now(),
+            workspace: Some(Workspace {
+                repo_path: canon.to_path_buf(),
+                vcs: crate::config::VcsKind::Git,
+                workspace_path: ws.to_path_buf(),
+                head_id: head.to_string(),
+                status: Status::Ready,
+            }),
         }
     }
 
@@ -848,14 +993,14 @@ mod tests {
             &canon,
             &ws_clean,
             &head_clean,
-            Status::Resolved,
+            true,
         ));
         state.insert(entry_for(
             ReviewKey::new("moz", "D2"),
             &canon,
             &ws_dirty,
             &head_dirty,
-            Status::Resolved,
+            true,
         ));
         state.save(&paths.state_file()).unwrap();
 
@@ -892,13 +1037,13 @@ mod tests {
             .unwrap();
 
         let mut state = State::default();
-        // Still open (not Resolved) - a plain `prune` with no ids would never touch this.
+        // Still open (not resolved) - a plain `prune` with no ids would never touch this.
         state.insert(entry_for(
             ReviewKey::new("moz", "D3"),
             &canon,
             &ws,
             &head,
-            Status::Ready,
+            false,
         ));
         state.save(&paths.state_file()).unwrap();
 
@@ -924,7 +1069,7 @@ mod tests {
             &canon,
             &paths.workspace_dir("moz", "D4"), // never actually created on disk
             "deadbeef",
-            Status::Resolved,
+            true,
         ));
         state.save(&paths.state_file()).unwrap();
 

@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -11,8 +12,9 @@ use review_queue::repo::RepoStore;
 use review_queue::source::ReviewSource;
 use review_queue::source::github::GithubSource;
 use review_queue::source::moz_phab::MozPhabSource;
-use review_queue::state::{ReviewEntry, State};
+use review_queue::state::{ReviewEntry, ReviewKey, State};
 use review_queue::sync::{self, PruneReport, SyncReport};
+use review_queue::tui;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -25,8 +27,9 @@ async fn main() -> Result<()> {
     let paths = paths.with_overrides(config.data_dir.clone(), config.repo_cache_dir.clone());
 
     match cli.command {
-        Command::List { json, all } => list(&paths, json, all),
+        Command::List { json, all, plain } => list(&paths, &config, json, all, plain).await,
         Command::Path { id } => path(&paths, &id),
+        Command::Fetch { id } => fetch_cmd(&paths, &config, &id).await,
         Command::Sync { source, dry_run } => {
             sync_cmd(&paths, &config, source.as_deref(), dry_run).await
         }
@@ -92,9 +95,39 @@ async fn sync_cmd(
     if sources.is_empty() {
         bail!("no usable sources configured (see `config.toml`)");
     }
-    let report = sync::sync(&sources, paths, config, only_source, dry_run).await?;
+    let report = sync::sync(&sources, paths, only_source, dry_run).await?;
     print_sync_report(&report, dry_run);
     Ok(())
+}
+
+async fn fetch_cmd(paths: &Paths, config: &Config, id: &str) -> Result<()> {
+    let key = resolve_key(paths, id)?;
+    let mut lock = acquire_sync_lock(paths)?;
+    let _guard = lock.try_write().map_err(|_| {
+        anyhow::anyhow!(
+            "another `rq sync` or `rq prune` is already running (lock: {})",
+            paths.sync_lock_file().display()
+        )
+    })?;
+
+    let sources = build_sources(config).await?;
+    let ws_path = sync::fetch_local(&sources, paths, config, &key).await?;
+    println!("{}", ws_path.display());
+    Ok(())
+}
+
+/// Resolve a review id/prefix (see `State::find_by_prefix`) to its key, without holding onto the
+/// borrowed `State`.
+fn resolve_key(paths: &Paths, id: &str) -> Result<ReviewKey> {
+    let state = State::load(&paths.state_file())?;
+    match state.find_by_prefix(id).as_slice() {
+        [] => bail!("no tracked review matches `{id}`"),
+        [entry] => Ok(entry.key.clone()),
+        many => {
+            let keys: Vec<_> = many.iter().map(|e| e.key.slug()).collect();
+            bail!("`{id}` matches multiple reviews: {}", keys.join(", "))
+        }
+    }
 }
 
 fn prune_cmd(paths: &Paths, force: bool, ids: &[String]) -> Result<()> {
@@ -306,15 +339,21 @@ fn print_prune_report(report: &PruneReport) {
     }
 }
 
-fn list(paths: &Paths, json: bool, all: bool) -> Result<()> {
-    let state = State::load(&paths.state_file())?;
-    let entries: Vec<&ReviewEntry> = state.iter().filter(|e| all || e.in_queue).collect();
-
+async fn list(paths: &Paths, config: &Config, json: bool, all: bool, plain: bool) -> Result<()> {
     if json {
+        let state = State::load(&paths.state_file())?;
+        let entries: Vec<&ReviewEntry> = state.iter().filter(|e| all || e.in_queue).collect();
         println!("{}", serde_json::to_string_pretty(&entries)?);
         return Ok(());
     }
 
+    if !plain && std::io::stdout().is_terminal() {
+        let sources = build_sources(config).await?;
+        return tui::run(paths.clone(), config.clone(), sources, all);
+    }
+
+    let state = State::load(&paths.state_file())?;
+    let entries: Vec<&ReviewEntry> = state.iter().filter(|e| all || e.in_queue).collect();
     if entries.is_empty() {
         println!("No reviews tracked yet. Run `rq sync` first.");
         return Ok(());
@@ -324,12 +363,19 @@ fn list(paths: &Paths, json: bool, all: bool) -> Result<()> {
     table.load_preset(UTF8_FULL_CONDENSED);
     table.set_header(vec!["KEY", "TITLE", "AUTHOR", "STATUS", "PATH"]);
     for e in entries {
+        let (status, path) = match &e.workspace {
+            Some(ws) => (
+                format!("{:?}", ws.status),
+                ws.workspace_path.display().to_string(),
+            ),
+            None => ("not fetched".to_string(), "-".to_string()),
+        };
         table.add_row(vec![
             e.key.slug(),
             e.title.clone(),
             e.author.clone(),
-            format!("{:?}", e.status),
-            e.workspace_path.display().to_string(),
+            status,
+            path,
         ]);
     }
     println!("{table}");
@@ -341,10 +387,15 @@ fn path(paths: &Paths, id: &str) -> Result<()> {
     let matches = state.find_by_prefix(id);
     match matches.as_slice() {
         [] => bail!("no tracked review matches `{id}`"),
-        [entry] => {
-            println!("{}", entry.workspace_path.display());
-            Ok(())
-        }
+        [entry] => match &entry.workspace {
+            Some(ws) => {
+                println!("{}", ws.workspace_path.display());
+                Ok(())
+            }
+            None => bail!(
+                "`{id}` has no local workspace yet; run `rq fetch {id}` (or press the fetch key in `rq list`)"
+            ),
+        },
         many => {
             let keys: Vec<_> = many.iter().map(|e| e.key.slug()).collect();
             bail!("`{id}` matches multiple reviews: {}", keys.join(", "))

@@ -6,6 +6,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 pub mod github;
 pub mod moz_phab;
@@ -20,14 +21,18 @@ pub enum Lifecycle {
     Resolved,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serialized into `state.json` (as part of `ReviewEntry`) so a review's kind survives between
+/// `sync` and a later on-demand `rq fetch`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewKind {
     Direct,
     Group(String),
 }
 
-/// A repo referenced by a review, before it's resolved to a canonical local repo.
-#[derive(Debug, Clone)]
+/// A repo referenced by a review, before it's resolved to a canonical local repo. Serialized into
+/// `state.json` (as part of `ReviewEntry`) so `rq fetch`/the TUI can resolve it later without
+/// re-querying the source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoRef {
     /// Candidate clone URLs (mirrors, ssh/https variants) - matched against config `[[repo]]`
     /// entries and the tool-managed clone registry after normalization.

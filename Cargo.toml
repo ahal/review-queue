@@ -26,6 +26,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 comfy-table = "7"
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3"
+cursive = { version = "0.21.1", default-features = false, features = ["crossterm-backend"] }
+open = "5.4.4"
 
 [dev-dependencies]
 wiremock = "0.6"

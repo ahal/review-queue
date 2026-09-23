@@ -5,4 +5,5 @@ pub mod repo;
 pub mod source;
 pub mod state;
 pub mod sync;
+pub mod tui;
 pub mod vcs;

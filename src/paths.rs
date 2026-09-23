@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 
+#[derive(Clone)]
 pub struct Paths {
     config_dir: PathBuf,
     cache_dir: PathBuf,

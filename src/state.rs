@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::VcsKind;
+use crate::source::{RepoRef, ReviewKind};
 
 /// `{source}/{id}`, e.g. `moz/D12345` or `github/mozilla-taskgraph-123`. Used as both the
 /// state map key and the workspace directory name.
@@ -46,8 +47,20 @@ pub enum Status {
     ApplyFailed,
     /// Local modifications (or a HEAD that doesn't match state) prevented an update or removal.
     Dirty,
-    /// The review landed/closed/merged/abandoned. Removed on the next clean sync, unless dirty.
-    Resolved,
+}
+
+/// A local worktree/workspace fetched for a review - absent until the user explicitly asks for
+/// one (`rq fetch`, or the fetch hotkey in `rq list`'s TUI), since `sync` no longer creates these
+/// on its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workspace {
+    /// Canonical repo this workspace was created from (may be a tool-managed clone or a
+    /// user-owned `[[repo]]` path). Kept even if config later points elsewhere.
+    pub repo_path: PathBuf,
+    pub vcs: VcsKind,
+    pub workspace_path: PathBuf,
+    pub head_id: String,
+    pub status: Status,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,19 +69,22 @@ pub struct ReviewEntry {
     pub title: String,
     pub author: String,
     pub url: String,
-    /// Canonical repo this workspace was created from (may be a tool-managed clone or a
-    /// user-owned `[[repo]]` path). Kept even if config later points elsewhere.
-    pub repo_path: PathBuf,
-    pub vcs: VcsKind,
-    pub workspace_path: PathBuf,
-    /// Diff ID / head SHA (or comma-joined stack of diff IDs for Phabricator) last applied.
+    /// The review's repo, as reported by its source - kept even without a workspace so `rq
+    /// fetch`/the TUI can resolve a canonical repo later without re-querying the source.
+    pub repo: RepoRef,
+    pub kind: ReviewKind,
+    /// Diff ID / head SHA (or comma-joined stack of diff IDs for Phabricator) last seen from the
+    /// source - independent of whether a workspace has caught up to it.
     pub version: String,
-    pub head_id: String,
     /// True while the review is waiting on you; false once you've acted (e.g. requested
     /// changes) but the review itself hasn't resolved yet.
     pub in_queue: bool,
-    pub status: Status,
+    /// The review itself landed/closed/merged/abandoned (as opposed to just dropping out of your
+    /// queue). A resolved review with no workspace is dropped on the next sync; one with a clean
+    /// workspace has that workspace removed too - dirty workspaces are kept either way.
+    pub resolved: bool,
     pub last_synced: chrono::DateTime<chrono::Utc>,
+    pub workspace: Option<Workspace>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -157,14 +173,22 @@ mod tests {
             title: "Fix the thing".into(),
             author: "someone".into(),
             url: format!("https://phabricator.services.mozilla.com/{id}"),
-            repo_path: PathBuf::from("/tmp/repo"),
-            vcs: VcsKind::Git,
-            workspace_path: PathBuf::from(format!("/tmp/ws/{id}")),
+            repo: RepoRef {
+                urls: vec!["https://example.com/o/r".into()],
+                display_name: "o/r".into(),
+            },
+            kind: ReviewKind::Direct,
             version: "1".into(),
-            head_id: "abc123".into(),
             in_queue: true,
-            status: Status::Ready,
+            resolved: false,
             last_synced: chrono::Utc::now(),
+            workspace: Some(Workspace {
+                repo_path: PathBuf::from("/tmp/repo"),
+                vcs: VcsKind::Git,
+                workspace_path: PathBuf::from(format!("/tmp/ws/{id}")),
+                head_id: "abc123".into(),
+                status: Status::Ready,
+            }),
         }
     }
 
