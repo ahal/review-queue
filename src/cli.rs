@@ -15,8 +15,9 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Fetch review queues and update/remove existing workspaces. Never creates a new one - use
-    /// `rq fetch` (or the fetch hotkey in `rq list`) for that.
+    /// Fetch review queues and update existing workspaces, removing one once its review resolves
+    /// and is clean. Never creates a new workspace - use `rq fetch` (or the fetch hotkey in `rq
+    /// list`) for that.
     Sync {
         /// Only sync the named source (as configured, e.g. "moz" or "github").
         #[arg(long)]
@@ -49,14 +50,6 @@ pub enum Command {
     Fetch {
         /// A review id, or unique prefix of one (e.g. "D123" or "moz/D123").
         id: String,
-    },
-    /// Remove workspaces for resolved reviews.
-    Prune {
-        /// Also remove dirty workspaces.
-        #[arg(long)]
-        force: bool,
-        /// Remove specific reviews' workspaces even if still open.
-        ids: Vec<String>,
     },
     /// Check auth and tool availability for each configured source.
     Doctor,

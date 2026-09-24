@@ -365,9 +365,7 @@ impl Vcs for JjVcs {
         Ok(parent != expected_head)
     }
 
-    fn remove_workspace(&self, repo: &Path, ws: &Path, name: &str, _force: bool) -> Result<()> {
-        // `jj workspace forget` + `rm -rf` don't check for a dirty working copy the way git's
-        // `worktree remove` does, so there's nothing for `force` to change here.
+    fn remove_workspace(&self, repo: &Path, ws: &Path, name: &str) -> Result<()> {
         let ws_name = Self::workspace_name(name);
         self.run(repo, &["workspace", "forget", &ws_name])
             .with_context(|| format!("forgetting jj workspace `{ws_name}`"))?;
@@ -854,8 +852,7 @@ mod tests {
 
         let trunk_before = commit_id(&f.canon, "trunk()");
 
-        vcs.remove_workspace(&f.canon, &ws, "moz/D7", false)
-            .unwrap();
+        vcs.remove_workspace(&f.canon, &ws, "moz/D7").unwrap();
 
         assert!(!ws.exists());
         let bookmarks = jj_out(&f.canon, &["bookmark", "list"]);

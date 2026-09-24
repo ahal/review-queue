@@ -255,14 +255,9 @@ impl Vcs for GitVcs {
         Ok(head != expected_head)
     }
 
-    fn remove_workspace(&self, repo: &Path, ws: &Path, name: &str, force: bool) -> Result<()> {
+    fn remove_workspace(&self, repo: &Path, ws: &Path, name: &str) -> Result<()> {
         let ws_str = ws.to_string_lossy().to_string();
-        let mut args = vec!["worktree", "remove"];
-        if force {
-            args.push("--force");
-        }
-        args.push(&ws_str);
-        self.run(repo, &args)
+        self.run(repo, &["worktree", "remove", &ws_str])
             .with_context(|| format!("removing worktree at {}", ws.display()))?;
 
         let refs = self.run(
@@ -555,8 +550,7 @@ mod tests {
 
         let canon_head_before = rev_parse(&f.canon, "HEAD");
 
-        vcs.remove_workspace(&f.canon, &ws, "moz/D6", false)
-            .unwrap();
+        vcs.remove_workspace(&f.canon, &ws, "moz/D6").unwrap();
 
         assert!(!ws.exists());
         let refs = vcs

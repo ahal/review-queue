@@ -45,13 +45,11 @@ pub trait Vcs {
     ) -> Result<String>;
 
     /// True if the workspace has local modifications, or its head no longer matches
-    /// `expected_head` - either case means `sync`/`prune` must not touch it silently.
+    /// `expected_head` - either case means `sync` must not touch it silently.
     fn is_dirty(&self, ws: &Path, expected_head: &str) -> Result<bool>;
 
     /// Remove the worktree/workspace and every ref/bookmark `add_workspace`/`update_workspace`
-    /// pinned for it under `name`. `force` must be set to remove a workspace `is_dirty` reports
-    /// as dirty - callers otherwise get an error rather than silently discarding local changes
-    /// (git's own `worktree remove` already refuses a dirty worktree without `--force`; jj's
-    /// removal has no such guard, so `force` is a no-op there).
-    fn remove_workspace(&self, repo: &Path, ws: &Path, name: &str, force: bool) -> Result<()>;
+    /// pinned for it under `name`. Callers only ever call this on a workspace `is_dirty` has
+    /// already confirmed is clean - there's no way to force-remove a dirty one.
+    fn remove_workspace(&self, repo: &Path, ws: &Path, name: &str) -> Result<()>;
 }

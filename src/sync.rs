@@ -12,8 +12,10 @@
 //! Then, once per source, for tracked reviews that weren't in this run's queue (you acted on
 //! them - approved, requested changes - so they dropped out): `fetch_status()` tells us whether
 //! the review itself resolved (landed/closed/abandoned/merged). A resolved review with no
-//! workspace is just dropped. A resolved review with a clean workspace has the workspace removed
-//! too. Either way, if dirty, it's kept.
+//! workspace, or one whose workspace directory is already gone from disk, is just dropped. A
+//! resolved review with a clean workspace has the workspace removed too. Either way, if dirty,
+//! it's kept - and re-checked on every later sync, so it clears out on its own once the local
+//! changes are gone. This is the only workspace-removal path; there's no separate prune step.
 //!
 //! `fetch_local()` is the on-demand counterpart - resolving a canonical repo (asking before
 //! cloning one, unless told otherwise) and creating a workspace for a single already-tracked
@@ -268,6 +270,16 @@ fn handle_out_of_queue(
                 return Ok(());
             };
 
+            if !ws.workspace_path.exists() {
+                // Already gone from disk (e.g. removed by hand) - nothing left to clean up,
+                // just stop tracking it rather than flagging it as dirty forever.
+                if !dry_run {
+                    state.remove(key);
+                }
+                report.removed.push(key.clone());
+                return Ok(());
+            }
+
             let vcs = vcs_for(ws.vcs);
             if vcs
                 .is_dirty(&ws.workspace_path, &ws.head_id)
@@ -282,7 +294,7 @@ fn handle_out_of_queue(
                 }
             } else {
                 if !dry_run {
-                    vcs.remove_workspace(&ws.repo_path, &ws.workspace_path, &key.slug(), false)?;
+                    vcs.remove_workspace(&ws.repo_path, &ws.workspace_path, &key.slug())?;
                     state.remove(key);
                 }
                 report.removed.push(key.clone());
@@ -368,79 +380,6 @@ pub async fn fetch_local(
     outcome.map(|_| ws_path)
 }
 
-#[derive(Debug, Default)]
-pub struct PruneReport {
-    pub removed: Vec<ReviewKey>,
-    /// Dirty and not force-removed - left in place.
-    pub kept_dirty: Vec<ReviewKey>,
-}
-
-/// Remove workspaces: every resolved review's if `ids` is empty, or specifically the
-/// (unique-prefix-resolved) reviews named in `ids` regardless of their status. A dirty workspace
-/// is left in place (reported via `kept_dirty`) unless `force` is set. Reviews with no workspace
-/// are simply dropped from tracking if resolved, or left untouched otherwise.
-pub fn prune(paths: &Paths, force: bool, ids: &[String]) -> Result<PruneReport> {
-    let mut state = State::load(&paths.state_file())?;
-    let mut report = PruneReport::default();
-
-    let targets: Vec<ReviewKey> = if ids.is_empty() {
-        state
-            .iter()
-            .filter(|e| e.resolved)
-            .map(|e| e.key.clone())
-            .collect()
-    } else {
-        let mut keys = Vec::new();
-        for id in ids {
-            match state.find_by_prefix(id).as_slice() {
-                [] => anyhow::bail!("no tracked review matches `{id}`"),
-                [entry] => keys.push(entry.key.clone()),
-                many => {
-                    let slugs: Vec<_> = many.iter().map(|e| e.key.slug()).collect();
-                    anyhow::bail!("`{id}` matches multiple reviews: {}", slugs.join(", "));
-                }
-            }
-        }
-        keys
-    };
-
-    for key in targets {
-        let entry = state
-            .get(&key)
-            .expect("key was just resolved from this state")
-            .clone();
-
-        let Some(ws) = entry.workspace else {
-            if entry.resolved {
-                state.remove(&key);
-                report.removed.push(key);
-            }
-            continue;
-        };
-
-        if !ws.workspace_path.exists() {
-            state.remove(&key);
-            report.removed.push(key);
-            continue;
-        }
-
-        let vcs = vcs_for(ws.vcs);
-        let dirty = vcs
-            .is_dirty(&ws.workspace_path, &ws.head_id)
-            .unwrap_or(true);
-        if dirty && !force {
-            report.kept_dirty.push(key);
-            continue;
-        }
-
-        vcs.remove_workspace(&ws.repo_path, &ws.workspace_path, &key.slug(), force)?;
-        state.remove(&key);
-        report.removed.push(key);
-    }
-
-    state.save(&paths.state_file())?;
-    Ok(report)
-}
 
 #[cfg(test)]
 mod tests {
@@ -453,9 +392,7 @@ mod tests {
 
     use super::*;
     use crate::config::GithubConfig;
-    use crate::source::Checkout;
     use crate::source::github::GithubSource;
-    use crate::source::{RepoRef, ReviewKind};
 
     fn git(dir: &Path, args: &[&str]) {
         let out = Command::new("git")
@@ -912,180 +849,6 @@ mod tests {
         assert!(
             !paths.repos_dir().exists(),
             "dry-run must not clone the canonical repo"
-        );
-    }
-
-    /// A minimal canonical git repo (upstream + a clone) for `prune` tests, which don't need a
-    /// `ReviewSource` at all - just a real workspace and a matching `state.json` entry.
-    fn small_canon(tmp: &std::path::Path) -> std::path::PathBuf {
-        let upstream = tmp.join("upstream");
-        std::fs::create_dir(&upstream).unwrap();
-        git(&upstream, &["init", "-q", "-b", "main"]);
-        git(&upstream, &["config", "user.name", "test"]);
-        git(&upstream, &["config", "user.email", "test@example.com"]);
-        git(&upstream, &["commit", "-q", "--allow-empty", "-m", "base"]);
-
-        let canon = tmp.join("canon");
-        git(
-            tmp,
-            &[
-                "clone",
-                "-q",
-                upstream.to_str().unwrap(),
-                canon.to_str().unwrap(),
-            ],
-        );
-        git(&canon, &["config", "user.name", "test"]);
-        git(&canon, &["config", "user.email", "test@example.com"]);
-        canon
-    }
-
-    fn entry_for(
-        key: ReviewKey,
-        canon: &std::path::Path,
-        ws: &std::path::Path,
-        head: &str,
-        resolved: bool,
-    ) -> ReviewEntry {
-        ReviewEntry {
-            key,
-            title: "x".into(),
-            author: "a".into(),
-            url: "https://example.com".into(),
-            repo: RepoRef {
-                urls: vec!["https://example.com/o/r".into()],
-                display_name: "o/r".into(),
-            },
-            kind: ReviewKind::Direct,
-            version: "1".into(),
-            in_queue: false,
-            resolved,
-            last_synced: chrono::Utc::now(),
-            workspace: Some(Workspace {
-                repo_path: canon.to_path_buf(),
-                vcs: crate::config::VcsKind::Git,
-                workspace_path: ws.to_path_buf(),
-                head_id: head.to_string(),
-                status: Status::Ready,
-            }),
-        }
-    }
-
-    #[test]
-    fn prune_removes_resolved_and_keeps_dirty_unless_forced() {
-        let tmp = TempDir::new().unwrap();
-        let paths = paths_in(tmp.path());
-        paths.ensure_dirs().unwrap();
-        let canon = small_canon(tmp.path());
-        let vcs = GitVcs;
-        let checkout = Checkout::Patches {
-            base: None,
-            patches: vec![],
-        };
-
-        let ws_clean = paths.workspace_dir("test/repo", "D1");
-        let head_clean = vcs
-            .add_workspace(&canon, &ws_clean, &checkout, "moz/D1", "1")
-            .unwrap();
-        let ws_dirty = paths.workspace_dir("test/repo", "D2");
-        let head_dirty = vcs
-            .add_workspace(&canon, &ws_dirty, &checkout, "moz/D2", "1")
-            .unwrap();
-        std::fs::write(ws_dirty.join("local.txt"), "uncommitted\n").unwrap();
-
-        let mut state = State::default();
-        state.insert(entry_for(
-            ReviewKey::new("moz", "D1"),
-            &canon,
-            &ws_clean,
-            &head_clean,
-            true,
-        ));
-        state.insert(entry_for(
-            ReviewKey::new("moz", "D2"),
-            &canon,
-            &ws_dirty,
-            &head_dirty,
-            true,
-        ));
-        state.save(&paths.state_file()).unwrap();
-
-        let report = prune(&paths, false, &[]).unwrap();
-
-        assert_eq!(report.removed, vec![ReviewKey::new("moz", "D1")]);
-        assert_eq!(report.kept_dirty, vec![ReviewKey::new("moz", "D2")]);
-        assert!(!ws_clean.exists());
-        assert!(
-            ws_dirty.exists(),
-            "dirty workspace must survive without --force"
-        );
-
-        let report2 = prune(&paths, true, &[]).unwrap();
-        assert_eq!(report2.removed, vec![ReviewKey::new("moz", "D2")]);
-        assert!(!ws_dirty.exists(), "--force removes dirty workspaces too");
-    }
-
-    #[test]
-    fn prune_only_touches_open_reviews_when_explicit_ids_given() {
-        let tmp = TempDir::new().unwrap();
-        let paths = paths_in(tmp.path());
-        paths.ensure_dirs().unwrap();
-        let canon = small_canon(tmp.path());
-        let vcs = GitVcs;
-        let checkout = Checkout::Patches {
-            base: None,
-            patches: vec![],
-        };
-
-        let ws = paths.workspace_dir("test/repo", "D3");
-        let head = vcs
-            .add_workspace(&canon, &ws, &checkout, "moz/D3", "1")
-            .unwrap();
-
-        let mut state = State::default();
-        // Still open (not resolved) - a plain `prune` with no ids would never touch this.
-        state.insert(entry_for(
-            ReviewKey::new("moz", "D3"),
-            &canon,
-            &ws,
-            &head,
-            false,
-        ));
-        state.save(&paths.state_file()).unwrap();
-
-        let untouched = prune(&paths, false, &[]).unwrap();
-        assert!(untouched.removed.is_empty());
-        assert!(ws.exists());
-
-        let explicit = prune(&paths, false, &["D3".to_string()]).unwrap();
-        assert_eq!(explicit.removed, vec![ReviewKey::new("moz", "D3")]);
-        assert!(!ws.exists());
-    }
-
-    #[test]
-    fn prune_removes_state_entry_for_an_already_missing_workspace() {
-        let tmp = TempDir::new().unwrap();
-        let paths = paths_in(tmp.path());
-        paths.ensure_dirs().unwrap();
-        let canon = small_canon(tmp.path());
-
-        let mut state = State::default();
-        state.insert(entry_for(
-            ReviewKey::new("moz", "D4"),
-            &canon,
-            &paths.workspace_dir("test/repo", "D4"), // never actually created on disk
-            "deadbeef",
-            true,
-        ));
-        state.save(&paths.state_file()).unwrap();
-
-        let report = prune(&paths, false, &[]).unwrap();
-        assert_eq!(report.removed, vec![ReviewKey::new("moz", "D4")]);
-        assert!(
-            State::load(&paths.state_file())
-                .unwrap()
-                .get(&ReviewKey::new("moz", "D4"))
-                .is_none()
         );
     }
 }

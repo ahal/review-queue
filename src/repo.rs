@@ -1,5 +1,5 @@
 //! Canonical repo resolution: every review repo maps to exactly one canonical local repo, which
-//! `sync`/`prune` never delete - only the worktrees/workspaces created from it. A canonical repo
+//! `sync` never deletes - only the worktrees/workspaces created from it. A canonical repo
 //! is either discovered (an existing checkout found by scanning `Config::workdir`, see
 //! `crate::workdir`) or tool-managed (cloned once under `Paths::repo_source_dir()` and recorded
 //! in `repos.json`).
@@ -306,7 +306,8 @@ impl RepoStore {
                 .is_some_and(|w| w.repo_path == entry.path)
         }) {
             bail!(
-                "{} still has workspaces using it; run `rq prune` or remove them first",
+                "{} still has workspaces using it; wait for `rq sync` to clean up resolved \
+                 ones, or remove them by hand first",
                 entry.path.display()
             );
         }

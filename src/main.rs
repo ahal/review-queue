@@ -13,7 +13,7 @@ use review_queue::source::ReviewSource;
 use review_queue::source::github::GithubSource;
 use review_queue::source::moz_phab::MozPhabSource;
 use review_queue::state::{ReviewEntry, ReviewKey, State};
-use review_queue::sync::{self, PruneReport, SyncReport};
+use review_queue::sync::{self, SyncReport};
 use review_queue::tui;
 
 #[tokio::main]
@@ -35,7 +35,6 @@ async fn main() -> Result<()> {
         Command::Sync { source, dry_run } => {
             sync_cmd(&paths, &config, source.as_deref(), dry_run).await
         }
-        Command::Prune { force, ids } => prune_cmd(&paths, force, &ids),
         Command::Doctor => doctor_cmd(&paths, &config_path, &config).await,
         Command::Repo { command } => match command {
             RepoCommand::List => repo_list_cmd(&paths, &config),
@@ -65,7 +64,7 @@ async fn build_sources(config: &Config) -> Result<Vec<Box<dyn ReviewSource>>> {
 }
 
 /// Hold `sync.lock` for the duration of `f`, refusing to run alongside another `rq sync`/`rq
-/// prune` (e.g. an overlapping cron invocation). Advisory only, per `fd_lock`'s own caveats.
+/// fetch` (e.g. an overlapping cron invocation). Advisory only, per `fd_lock`'s own caveats.
 fn acquire_sync_lock(paths: &Paths) -> Result<fd_lock::RwLock<std::fs::File>> {
     paths.ensure_dirs()?;
     let lock_path = paths.sync_lock_file();
@@ -87,7 +86,7 @@ async fn sync_cmd(
     let mut lock = acquire_sync_lock(paths)?;
     let _guard = lock.try_write().map_err(|_| {
         anyhow::anyhow!(
-            "another `rq sync` or `rq prune` is already running (lock: {})",
+            "another `rq sync` or `rq fetch` is already running (lock: {})",
             paths.sync_lock_file().display()
         )
     })?;
@@ -106,7 +105,7 @@ async fn fetch_cmd(paths: &Paths, config: &Config, config_path: &Path, id: &str)
     let mut lock = acquire_sync_lock(paths)?;
     let _guard = lock.try_write().map_err(|_| {
         anyhow::anyhow!(
-            "another `rq sync` or `rq prune` is already running (lock: {})",
+            "another `rq sync` or `rq fetch` is already running (lock: {})",
             paths.sync_lock_file().display()
         )
     })?;
@@ -177,20 +176,6 @@ fn resolve_key(paths: &Paths, id: &str) -> Result<ReviewKey> {
             bail!("`{id}` matches multiple reviews: {}", keys.join(", "))
         }
     }
-}
-
-fn prune_cmd(paths: &Paths, force: bool, ids: &[String]) -> Result<()> {
-    let mut lock = acquire_sync_lock(paths)?;
-    let _guard = lock.try_write().map_err(|_| {
-        anyhow::anyhow!(
-            "another `rq sync` or `rq prune` is already running (lock: {})",
-            paths.sync_lock_file().display()
-        )
-    })?;
-
-    let report = sync::prune(paths, force, ids)?;
-    print_prune_report(&report);
-    Ok(())
 }
 
 async fn doctor_cmd(paths: &Paths, config_path: &Path, config: &Config) -> Result<()> {
@@ -349,18 +334,6 @@ fn print_sync_report(report: &SyncReport, dry_run: bool) {
     }
     if !report.errors.is_empty() {
         std::process::exit(1);
-    }
-}
-
-fn print_prune_report(report: &PruneReport) {
-    for key in &report.removed {
-        println!("removed {key}");
-    }
-    for key in &report.kept_dirty {
-        println!("kept {key} (dirty; use --force)");
-    }
-    if report.removed.is_empty() && report.kept_dirty.is_empty() {
-        println!("Nothing to prune.");
     }
 }
 

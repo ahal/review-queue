@@ -1,5 +1,5 @@
 //! `state.json`: the single source of truth for which reviews have a workspace,
-//! where it lives, and whether it's safe for `sync`/`prune` to touch it.
+//! where it lives, and whether it's safe for `sync` to touch it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
