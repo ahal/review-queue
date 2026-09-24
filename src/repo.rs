@@ -651,7 +651,7 @@ mod tests {
 
     fn entry_using(repo_path: &Path) -> crate::state::ReviewEntry {
         crate::state::ReviewEntry {
-            key: crate::state::ReviewKey::new("moz", "phab-D1"),
+            key: crate::state::ReviewKey::new("phab", "D1"),
             title: "x".into(),
             author: "a".into(),
             url: "https://example.com/D1".into(),

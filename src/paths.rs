@@ -5,8 +5,9 @@
 //! - data: `$XDG_DATA_HOME/review-queue/` — state.json, repos.json, sync.lock, workdir.json (the
 //!   `crate::workdir` scan cache), and `repos/` (every canonical repo, keyed by its normalized
 //!   URL, holding both the tool-managed clone under `source/` and the workspaces built from it
-//!   under `workspaces/{id}`; each source prefixes its ids, e.g. `phab-D1234`/`pr-owner/repo/42`,
-//!   so ids never collide across sources sharing a repo)
+//!   under `workspaces/{source}/{id}`; keying by the full canonical id (see
+//!   `crate::state::ReviewKey::slug`), not just `id`, is what keeps ids from colliding across
+//!   sources sharing a repo)
 
 use std::path::{Path, PathBuf};
 
@@ -79,10 +80,11 @@ impl Paths {
         self.repo_dir(name).join("workspaces")
     }
 
-    /// Where a specific review's workspace lives: `repos/{name}/workspaces/{id}`. `id` is already
-    /// unique across sources - see [`crate::state::ReviewKey`].
-    pub fn workspace_dir(&self, name: &str, id: &str) -> PathBuf {
-        self.repo_workspaces_dir(name).join(id)
+    /// Where a specific review's workspace lives: `repos/{name}/workspaces/{slug}`. `slug` should
+    /// be the review's full canonical id (`ReviewKey::slug`, e.g. `gh/owner/repo/42`) so it can't
+    /// collide with another source's workspace under the same canonical repo.
+    pub fn workspace_dir(&self, name: &str, slug: &str) -> PathBuf {
+        self.repo_workspaces_dir(name).join(slug)
     }
 
     pub fn data_dir(&self) -> &Path {

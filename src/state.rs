@@ -10,11 +10,11 @@ use serde::{Deserialize, Serialize};
 use crate::config::VcsKind;
 use crate::source::{RepoRef, ReviewKind};
 
-/// `{source}/{id}`, e.g. `moz/phab-D12345` or `gh/pr-mozilla/taskgraph/123`. `source` is the
-/// configured source's name (used to look up its `ReviewSource` impl); `id` is that source's own
-/// review id, prefixed (`phab-`/`pr-`) so it can't collide with another source's ids sharing the
-/// same canonical repo's workspace directory - see `Paths::workspace_dir`. Used as the state map
-/// key.
+/// `{source}/{id}`, e.g. `phab/D12345` or `gh/mozilla/taskgraph/123`. `source` is the configured
+/// source's name (used to look up its `ReviewSource` impl); `id` is that source's own review id.
+/// Used as the state map key and, via `Paths::workspace_dir`, the workspace directory name - the
+/// full slug (not just `id`) is used there so ids can't collide across sources sharing the same
+/// canonical repo's workspace directory.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ReviewKey {
     pub source: String,
@@ -141,20 +141,17 @@ impl State {
         self.reviews.values()
     }
 
-    /// Matches from the front of `id` (`"D123"` -> `"phab-D12345"`, prefix and all), from the
-    /// front of `id`'s last `/`-delimited segment once its source prefix is stripped (GitHub ids
-    /// are `pr-owner/repo/number`, so `"123"` -> `".../123"` - otherwise there'd be no way to
-    /// find a PR by the number you'd actually remember, since it sits at the end, not the
-    /// start), or an exact `source/id` slug.
+    /// Matches from the front of `id` (`"D123"` -> `"D12345"`), from the front of `id`'s last
+    /// `/`-delimited segment (GitHub ids are `owner/repo/number`, so `"123"` -> `".../123"` -
+    /// otherwise there'd be no way to find a PR by the number you'd actually remember, since it
+    /// sits at the end, not the start), or an exact `source/id` slug.
     pub fn find_by_prefix<'a>(&'a self, prefix: &str) -> Vec<&'a ReviewEntry> {
         self.reviews
             .values()
             .filter(|e| {
                 let id = &e.key.id;
-                let bare = strip_source_prefix(id);
                 id.starts_with(prefix)
-                    || bare.starts_with(prefix)
-                    || bare
+                    || id
                         .rsplit('/')
                         .next()
                         .is_some_and(|last| last.starts_with(prefix))
@@ -162,14 +159,6 @@ impl State {
             })
             .collect()
     }
-}
-
-/// Strip a source's own id-kind prefix (`phab-`/`pr-`) so users can type ids without it, e.g.
-/// `rq fetch D1234` for a `phab-D1234` id.
-fn strip_source_prefix(id: &str) -> &str {
-    id.strip_prefix("phab-")
-        .or_else(|| id.strip_prefix("pr-"))
-        .unwrap_or(id)
 }
 
 #[cfg(test)]
@@ -231,28 +220,27 @@ mod tests {
     #[test]
     fn find_by_prefix_matches_id_or_full_slug() {
         let mut state = State::default();
-        state.insert(sample_entry("phab-D12345"));
-        state.insert(sample_entry("phab-D999"));
+        state.insert(sample_entry("D12345"));
+        state.insert(sample_entry("D999"));
 
-        // Bare, unprefixed typing still works - the phab- prefix is stripped before matching.
         assert_eq!(state.find_by_prefix("D123").len(), 1);
-        assert_eq!(state.find_by_prefix("moz/phab-D999").len(), 1);
+        assert_eq!(state.find_by_prefix("moz/D999").len(), 1);
         assert_eq!(state.find_by_prefix("D").len(), 2);
         assert_eq!(state.find_by_prefix("nope").len(), 0);
     }
 
     #[test]
     fn find_by_prefix_matches_the_trailing_segment_of_a_multi_part_id() {
-        // GitHub ids are "pr-owner/repo/number" - the part someone actually remembers (the PR
+        // GitHub ids are "owner/repo/number" - the part someone actually remembers (the PR
         // number) sits at the end, not the start, so a plain `id.starts_with(prefix)` could
         // never find it.
         let mut state = State::default();
-        state.insert(sample_entry_for("github", "pr-mozilla/gecko-dev/123"));
-        state.insert(sample_entry_for("github", "pr-mozilla/other-repo/456"));
+        state.insert(sample_entry_for("gh", "mozilla/gecko-dev/123"));
+        state.insert(sample_entry_for("gh", "mozilla/other-repo/456"));
 
         let by_number = state.find_by_prefix("123");
         assert_eq!(by_number.len(), 1);
-        assert_eq!(by_number[0].key.id, "pr-mozilla/gecko-dev/123");
+        assert_eq!(by_number[0].key.id, "mozilla/gecko-dev/123");
 
         // A prefix of the number should work too, not just the exact number.
         assert_eq!(state.find_by_prefix("12").len(), 1);
@@ -261,8 +249,7 @@ mod tests {
         // prefix of its own segment, so it must not match.
         assert_eq!(state.find_by_prefix("23").len(), 0);
 
-        // The existing owner/repo-starts-with behavior still works (once the pr- prefix is
-        // stripped) alongside the new rule.
+        // The existing owner/repo-starts-with behavior still works alongside the new rule.
         assert_eq!(state.find_by_prefix("mozilla/gecko-dev").len(), 1);
     }
 }

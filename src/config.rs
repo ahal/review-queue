@@ -18,32 +18,26 @@ pub struct Config {
     #[serde(default)]
     pub auto_clone: bool,
 
-    #[serde(rename = "source", default)]
-    pub sources: Vec<SourceConfig>,
+    #[serde(default)]
+    pub source: SourcesConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum SourceConfig {
+/// Each source is a fixed, hardcoded slot (`[source.github]`, `[source.moz-phab]`) rather than a
+/// list - there's exactly one of each kind, and its id-namespace prefix (see
+/// `crate::source::github::NAME`/`crate::source::moz_phab::NAME`) is likewise hardcoded, not
+/// user-configurable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SourcesConfig {
+    #[serde(default)]
+    pub github: Option<GithubConfig>,
     /// Mozilla's Phabricator, via the `moz-phab` CLI - not a general-purpose Phabricator source.
     /// See `crate::source::moz_phab` for why.
-    #[serde(rename = "moz-phab")]
-    MozPhab(MozPhabConfig),
-    Github(GithubConfig),
-}
-
-impl SourceConfig {
-    pub fn name(&self) -> &str {
-        match self {
-            SourceConfig::MozPhab(c) => &c.name,
-            SourceConfig::Github(c) => &c.name,
-        }
-    }
+    #[serde(rename = "moz-phab", default)]
+    pub moz_phab: Option<MozPhabConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MozPhabConfig {
-    pub name: String,
     pub url: String,
     #[serde(default)]
     pub token: Option<String>,
@@ -53,9 +47,8 @@ pub struct MozPhabConfig {
     pub include_groups: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GithubConfig {
-    pub name: String,
     /// REST API base URL. Defaults to `https://api.github.com`; set this for GitHub Enterprise
     /// (typically `https://{host}/api/v3`).
     #[serde(default)]
@@ -114,9 +107,9 @@ fn expand_tilde(path: &std::path::Path) -> PathBuf {
 }
 
 /// Record a "always clone without asking" answer to the clone prompt. Prepended (rather than
-/// appended, like nothing else in this file does) because `config.toml`'s `[[source]]` tables
-/// are unkeyed - appending a bare `key = value` after one would parse as belonging to it instead
-/// of to the top-level document.
+/// appended, like nothing else in this file does) because appending a bare `key = value` after
+/// one of `config.toml`'s `[source.*]` tables would parse as belonging to that table instead of
+/// to the top-level document.
 pub fn set_auto_clone(path: &std::path::Path) -> Result<()> {
     let existing = std::fs::read_to_string(path).unwrap_or_default();
     if let Some(parent) = path.parent() {
@@ -136,20 +129,21 @@ mod tests {
         let text = r#"
 workdir = "~/dev"
 
-[[source]]
-type = "moz-phab"
-name = "moz"
+[source.moz-phab]
 url = "https://phabricator.services.mozilla.com"
 
-[[source]]
-type = "github"
-name = "github"
+[source.github]
 ignore_repos = ["mozilla/some-noisy-repo"]
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
-        assert_eq!(cfg.sources.len(), 2);
-        assert_eq!(cfg.sources[0].name(), "moz");
-        assert_eq!(cfg.sources[1].name(), "github");
+        assert_eq!(
+            cfg.source.moz_phab.unwrap().url,
+            "https://phabricator.services.mozilla.com"
+        );
+        assert_eq!(
+            cfg.source.github.unwrap().ignore_repos,
+            vec!["mozilla/some-noisy-repo".to_string()]
+        );
         assert_eq!(cfg.workdir, Some(PathBuf::from("~/dev")));
         assert!(!cfg.auto_clone);
     }
@@ -157,7 +151,8 @@ ignore_repos = ["mozilla/some-noisy-repo"]
     #[test]
     fn missing_file_is_empty_config() {
         let cfg = Config::load(std::path::Path::new("/nonexistent/config.toml")).unwrap();
-        assert!(cfg.sources.is_empty());
+        assert!(cfg.source.github.is_none());
+        assert!(cfg.source.moz_phab.is_none());
         assert!(cfg.workdir.is_none());
     }
 
@@ -195,9 +190,7 @@ workdir = "~/dev"
         std::fs::write(
             &config_path,
             r#"
-[[source]]
-type = "github"
-name = "gh"
+[source.github]
 "#,
         )
         .unwrap();
@@ -206,7 +199,7 @@ name = "gh"
 
         let cfg = Config::load(&config_path).unwrap();
         assert!(cfg.auto_clone);
-        assert_eq!(cfg.sources.len(), 1, "existing sources must survive");
+        assert!(cfg.source.github.is_some(), "existing sources must survive");
     }
 
     #[test]

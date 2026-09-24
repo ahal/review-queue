@@ -349,7 +349,7 @@ pub async fn fetch_local(
     let canon = repo_store.resolve(&review.repo, on_missing)?;
     let checkout = source.checkout_spec(&review, &canon.path).await?;
     let vcs = vcs_for(canon.vcs);
-    let ws_path = paths.workspace_dir(&canon.name, &key.id);
+    let ws_path = paths.workspace_dir(&canon.name, &key.slug());
     if let Some(parent) = ws_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -379,7 +379,6 @@ pub async fn fetch_local(
     repo_store.save()?;
     outcome.map(|_| ws_path)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -490,7 +489,6 @@ mod tests {
     fn github_source(server: &MockServer) -> Box<dyn ReviewSource> {
         Box::new(GithubSource::for_test(
             GithubConfig {
-                name: "gh".into(),
                 api_url: None,
                 token: Some("t".into()),
                 token_cmd: None,
@@ -562,9 +560,9 @@ mod tests {
 
         let report = sync(&sources, &paths, None, false).await.unwrap();
 
-        assert_eq!(report.added, vec![ReviewKey::new("gh", "pr-moz/proj/1")]);
+        assert_eq!(report.added, vec![ReviewKey::new("gh", "moz/proj/1")]);
         let state = State::load(&paths.state_file()).unwrap();
-        let entry = state.get(&ReviewKey::new("gh", "pr-moz/proj/1")).unwrap();
+        let entry = state.get(&ReviewKey::new("gh", "moz/proj/1")).unwrap();
         assert!(entry.in_queue);
         assert!(!entry.resolved);
         assert_eq!(entry.version, sha);
@@ -597,8 +595,10 @@ mod tests {
 
         sync(&sources, &paths, None, false).await.unwrap();
 
-        let key = ReviewKey::new("gh", "pr-moz/proj/1");
-        let ws_path = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone).await.unwrap();
+        let key = ReviewKey::new("gh", "moz/proj/1");
+        let ws_path = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone)
+            .await
+            .unwrap();
 
         assert!(ws_path.join("pr.txt").exists());
         let state = State::load(&paths.state_file()).unwrap();
@@ -614,7 +614,9 @@ mod tests {
         assert!(paths.repos_file().exists());
 
         // Calling it again is a no-op that just returns the existing path.
-        let ws_path2 = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone).await.unwrap();
+        let ws_path2 = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone)
+            .await
+            .unwrap();
         assert_eq!(ws_path2, ws_path);
     }
 
@@ -632,7 +634,7 @@ mod tests {
 
         let work_tmp = TempDir::new().unwrap();
         let paths = paths_in(work_tmp.path());
-        let key = ReviewKey::new("gh", "pr-moz/proj/1");
+        let key = ReviewKey::new("gh", "moz/proj/1");
 
         sync(&[github_source(&server)], &paths, None, false)
             .await
@@ -685,11 +687,13 @@ mod tests {
         let work_tmp = TempDir::new().unwrap();
         let paths = paths_in(work_tmp.path());
         let config = Config::default();
-        let key = ReviewKey::new("gh", "pr-moz/proj/1");
+        let key = ReviewKey::new("gh", "moz/proj/1");
 
         let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
         sync(&sources, &paths, None, false).await.unwrap();
-        let ws_path = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone).await.unwrap();
+        let ws_path = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone)
+            .await
+            .unwrap();
         assert!(ws_path.exists());
         drop(server);
 
@@ -707,12 +711,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(report.removed, vec![ReviewKey::new("gh", "pr-moz/proj/1")]);
+        assert_eq!(report.removed, vec![ReviewKey::new("gh", "moz/proj/1")]);
         assert!(!ws_path.exists());
         assert!(
             State::load(&paths.state_file())
                 .unwrap()
-                .get(&ReviewKey::new("gh", "pr-moz/proj/1"))
+                .get(&ReviewKey::new("gh", "moz/proj/1"))
                 .is_none()
         );
     }
@@ -732,10 +736,12 @@ mod tests {
         let work_tmp = TempDir::new().unwrap();
         let paths = paths_in(work_tmp.path());
         let config = Config::default();
-        let key = ReviewKey::new("gh", "pr-moz/proj/1");
+        let key = ReviewKey::new("gh", "moz/proj/1");
         let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
         sync(&sources, &paths, None, false).await.unwrap();
-        fetch_local(&sources, &paths, &config, &key, OnMissing::Clone).await.unwrap();
+        fetch_local(&sources, &paths, &config, &key, OnMissing::Clone)
+            .await
+            .unwrap();
         drop(server);
 
         // Second sync: changes requested, so the PR drops out of the queue, but it's still open.
@@ -773,10 +779,12 @@ mod tests {
         let work_tmp = TempDir::new().unwrap();
         let paths = paths_in(work_tmp.path());
         let config = Config::default();
-        let key = ReviewKey::new("gh", "pr-moz/proj/1");
+        let key = ReviewKey::new("gh", "moz/proj/1");
         let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
         sync(&sources, &paths, None, false).await.unwrap();
-        let ws_path = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone).await.unwrap();
+        let ws_path = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone)
+            .await
+            .unwrap();
         drop(server);
 
         std::fs::write(ws_path.join("untracked.txt"), "local edit\n").unwrap();
@@ -835,7 +843,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(report.added, vec![ReviewKey::new("gh", "pr-moz/proj/1")]);
+        assert_eq!(report.added, vec![ReviewKey::new("gh", "moz/proj/1")]);
         assert!(
             !paths.state_file().exists(),
             "dry-run must not write state.json"

@@ -19,7 +19,7 @@ pub enum Command {
     /// and is clean. Never creates a new workspace - use `rq fetch` (or the fetch hotkey in `rq
     /// list`) for that.
     Sync {
-        /// Only sync the named source (as configured, e.g. "moz" or "github").
+        /// Only sync the named source ("gh" or "phab").
         #[arg(long)]
         source: Option<String>,
         #[arg(long)]

@@ -106,6 +106,9 @@ use serde_json::{Value, json};
 use crate::config::MozPhabConfig;
 use crate::source::{Checkout, Lifecycle, RepoRef, Review, ReviewKey, ReviewKind, ReviewSource};
 
+/// This source's hardcoded id-namespace prefix - see [`crate::state::ReviewKey`].
+pub const NAME: &str = "phab";
+
 pub struct MozPhabSource {
     cfg: MozPhabConfig,
     client: reqwest::Client,
@@ -135,7 +138,7 @@ impl MozPhabSource {
         let token = self
             .token
             .as_ref()
-            .with_context(|| format!("moz-phab source `{}` has no token", self.cfg.name))?;
+            .context("moz-phab source has no token")?;
         let mut form = flatten_params(&params);
         form.push(("api.token".to_string(), token.clone()));
 
@@ -409,7 +412,7 @@ impl MozPhabSource {
 #[async_trait]
 impl ReviewSource for MozPhabSource {
     fn name(&self) -> &str {
-        &self.cfg.name
+        NAME
     }
 
     async fn fetch_queue(&self) -> Result<Vec<Review>> {
@@ -491,7 +494,7 @@ impl ReviewSource for MozPhabSource {
                 .join(",");
 
             reviews.push(Review {
-                key: ReviewKey::new(self.cfg.name.clone(), format!("phab-D{}", rev.id)),
+                key: ReviewKey::new(NAME, format!("D{}", rev.id)),
                 title: rev.fields.title.clone(),
                 author: usernames
                     .get(&rev.fields.author_phid)
@@ -552,7 +555,6 @@ impl ReviewSource for MozPhabSource {
         }
         Ok(out)
     }
-
 }
 
 fn is_closed(status: &str) -> bool {
@@ -652,10 +654,9 @@ async fn resolve_token(cfg: &MozPhabConfig) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// `"phab-D12345"` -> `12345`. The `phab-` prefix distinguishes this source's ids from other
-/// sources' (e.g. `pr-`) sharing the same canonical repo's workspace directory.
+/// `"D12345"` -> `12345`.
 fn parse_id(id: &str) -> Result<u64> {
-    id.strip_prefix("phab-D")
+    id.strip_prefix('D')
         .with_context(|| format!("bad moz-phab review id `{id}`"))?
         .parse()
         .with_context(|| format!("bad moz-phab review id `{id}`"))
@@ -848,7 +849,6 @@ mod tests {
 
     fn cfg(url: &str) -> MozPhabConfig {
         MozPhabConfig {
-            name: "moz".into(),
             url: url.into(),
             token: Some("t".into()),
             token_cmd: None,
@@ -908,10 +908,9 @@ mod tests {
 
     #[test]
     fn parse_id_round_trip() {
-        assert_eq!(parse_id("phab-D12345").unwrap(), 12345);
-        assert!(parse_id("D12345").is_err(), "missing phab- prefix");
+        assert_eq!(parse_id("D12345").unwrap(), 12345);
         assert!(parse_id("12345").is_err());
-        assert!(parse_id("phab-Dabc").is_err());
+        assert!(parse_id("Dabc").is_err());
     }
 
     #[test]
@@ -1019,19 +1018,19 @@ mod tests {
 
         let src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
         let ids = vec![
-            "phab-D1".to_string(),
-            "phab-D2".to_string(),
-            "phab-D3".to_string(),
-            "phab-D4".to_string(),
+            "D1".to_string(),
+            "D2".to_string(),
+            "D3".to_string(),
+            "D4".to_string(),
         ];
         let statuses = src.fetch_status(&ids).await.unwrap();
 
-        assert_eq!(statuses[0], ("phab-D1".to_string(), Lifecycle::Resolved));
-        assert_eq!(statuses[1], ("phab-D2".to_string(), Lifecycle::Open));
-        assert_eq!(statuses[2], ("phab-D3".to_string(), Lifecycle::Resolved));
+        assert_eq!(statuses[0], ("D1".to_string(), Lifecycle::Resolved));
+        assert_eq!(statuses[1], ("D2".to_string(), Lifecycle::Open));
+        assert_eq!(statuses[2], ("D3".to_string(), Lifecycle::Resolved));
         assert_eq!(
             statuses[3],
-            ("phab-D4".to_string(), Lifecycle::Resolved),
+            ("D4".to_string(), Lifecycle::Resolved),
             "an id missing from the response should count as resolved"
         );
     }
@@ -1151,7 +1150,7 @@ mod tests {
 
         assert_eq!(reviews.len(), 1);
         let r = &reviews[0];
-        assert_eq!(r.key, ReviewKey::new("moz", "phab-D1"));
+        assert_eq!(r.key, ReviewKey::new("phab", "D1"));
         assert_eq!(r.title, "Fix the thing");
         assert_eq!(
             r.author, "alice",
@@ -1230,8 +1229,8 @@ mod tests {
         reviews.sort_by(|a, b| a.key.id.cmp(&b.key.id));
 
         assert_eq!(reviews.len(), 2);
-        assert_eq!(reviews[0].key, ReviewKey::new("moz", "phab-D1"));
-        assert_eq!(reviews[1].key, ReviewKey::new("moz", "phab-D2"));
+        assert_eq!(reviews[0].key, ReviewKey::new("phab", "D1"));
+        assert_eq!(reviews[1].key, ReviewKey::new("phab", "D2"));
         for r in &reviews {
             assert_eq!(
                 r.repo.urls,
@@ -1266,7 +1265,7 @@ mod tests {
 
         let src = MozPhabSource::for_test(cfg(&server.uri()), Some("secret-token".into()));
         let review = Review {
-            key: ReviewKey::new("moz", "phab-D1"),
+            key: ReviewKey::new("phab", "D1"),
             title: "x".into(),
             author: "a".into(),
             url: "https://phab.example.com/D1".into(),
@@ -1298,7 +1297,7 @@ mod tests {
                         "base",
                         "--yes",
                         "--name",
-                        "moz-phab-D1"
+                        "phab-D1"
                     ]
                 );
                 assert!(env.contains(&(
@@ -1336,7 +1335,7 @@ mod tests {
 
         let src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
         let review = Review {
-            key: ReviewKey::new("moz", "phab-D1"),
+            key: ReviewKey::new("phab", "D1"),
             title: "x".into(),
             author: "a".into(),
             url: "https://phab.example.com/D1".into(),

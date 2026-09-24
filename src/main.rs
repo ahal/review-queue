@@ -6,7 +6,7 @@ use clap::Parser;
 use comfy_table::{Table, presets::UTF8_FULL_CONDENSED};
 
 use review_queue::cli::{Cli, Command, RepoCommand, Shell};
-use review_queue::config::{self, Config, SourceConfig};
+use review_queue::config::{self, Config};
 use review_queue::paths::Paths;
 use review_queue::repo::{NeedsClone, OnMissing, RepoKind, RepoStore};
 use review_queue::source::ReviewSource;
@@ -49,15 +49,11 @@ async fn main() -> Result<()> {
 /// Build a `ReviewSource` for each configured source.
 async fn build_sources(config: &Config) -> Result<Vec<Box<dyn ReviewSource>>> {
     let mut sources: Vec<Box<dyn ReviewSource>> = Vec::new();
-    for sc in &config.sources {
-        match sc {
-            SourceConfig::Github(cfg) => {
-                sources.push(Box::new(GithubSource::new(cfg.clone()).await?))
-            }
-            SourceConfig::MozPhab(cfg) => {
-                sources.push(Box::new(MozPhabSource::new(cfg.clone()).await?))
-            }
-        }
+    if let Some(cfg) = &config.source.github {
+        sources.push(Box::new(GithubSource::new(cfg.clone()).await?));
+    }
+    if let Some(cfg) = &config.source.moz_phab {
+        sources.push(Box::new(MozPhabSource::new(cfg.clone()).await?));
     }
     Ok(sources)
 }
@@ -152,7 +148,10 @@ fn prompt_clone_cli(url: &str, dest: &Path) -> Result<CloneAnswer> {
              set `auto_clone = true` in config.toml, or run this interactively"
         );
     }
-    print!("No local checkout of `{url}` found. Clone into {}? [Y/n/always] ", dest.display());
+    print!(
+        "No local checkout of `{url}` found. Clone into {}? [Y/n/always] ",
+        dest.display()
+    );
     std::io::stdout().flush()?;
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
@@ -290,7 +289,13 @@ async fn list(
 
     if !plain && std::io::stdout().is_terminal() {
         let sources = build_sources(config).await?;
-        return tui::run(paths.clone(), config.clone(), config_path.to_path_buf(), sources, all);
+        return tui::run(
+            paths.clone(),
+            config.clone(),
+            config_path.to_path_buf(),
+            sources,
+            all,
+        );
     }
 
     let state = State::load(&paths.state_file())?;

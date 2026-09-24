@@ -40,6 +40,9 @@ use crate::source::{
 const DEFAULT_API_BASE: &str = "https://api.github.com";
 const SEARCH_PER_PAGE: u32 = 100;
 
+/// This source's hardcoded id-namespace prefix - see [`crate::state::ReviewKey`].
+pub const NAME: &str = "gh";
+
 pub struct GithubSource {
     cfg: GithubConfig,
     client: reqwest::Client,
@@ -132,10 +135,7 @@ impl GithubSource {
     fn review_from_pull(&self, owner: &str, repo: &str, pr: &PullRequest) -> Result<Review> {
         let base_repo = pr.base.repo.as_ref().context("PR has no base repo")?;
         Ok(Review {
-            key: ReviewKey::new(
-                self.cfg.name.clone(),
-                format!("pr-{owner}/{repo}/{}", pr.number),
-            ),
+            key: ReviewKey::new(NAME, format!("{owner}/{repo}/{}", pr.number)),
             title: pr.title.clone(),
             author: pr.user.login.clone(),
             url: pr.html_url.clone(),
@@ -170,15 +170,14 @@ impl GithubSource {
 #[async_trait]
 impl ReviewSource for GithubSource {
     fn name(&self) -> &str {
-        &self.cfg.name
+        NAME
     }
 
     async fn fetch_queue(&self) -> Result<Vec<Review>> {
         if self.token.is_none() {
             bail!(
-                "GitHub source `{}` needs a token to search `@me` - configure `token`/`token_cmd`, \
-                 set $GITHUB_TOKEN, or run `gh auth login`",
-                self.cfg.name
+                "GitHub source needs a token to search `@me` - configure `token`/`token_cmd`, \
+                 set $GITHUB_TOKEN, or run `gh auth login`"
             );
         }
 
@@ -237,7 +236,6 @@ impl ReviewSource for GithubSource {
         }
         Ok(out)
     }
-
 }
 
 /// `token`, then `token_cmd`, then `$GITHUB_TOKEN`, then `gh auth token`.
@@ -282,13 +280,8 @@ async fn resolve_token(cfg: &GithubConfig) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// `pr-{owner}/{repo}/{number}` - unambiguous since owner/repo names can't contain `/`. The
-/// `pr-` prefix distinguishes this source's ids from other sources' (e.g. `phab-`) sharing the
-/// same canonical repo's workspace directory.
+/// `{owner}/{repo}/{number}` - unambiguous since owner/repo names can't contain `/`.
 fn parse_id(id: &str) -> Result<(String, String, u64)> {
-    let id = id
-        .strip_prefix("pr-")
-        .with_context(|| format!("bad github review id `{id}` (missing `pr-` prefix)"))?;
     let mut parts = id.splitn(3, '/');
     let owner = parts
         .next()
@@ -372,9 +365,8 @@ mod tests {
     use wiremock::matchers::{method, path, path_regex, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn cfg(name: &str) -> GithubConfig {
+    fn cfg() -> GithubConfig {
         GithubConfig {
-            name: name.into(),
             api_url: None,
             token: Some("t".into()),
             token_cmd: None,
@@ -417,12 +409,11 @@ mod tests {
     #[tokio::test]
     async fn parses_id_round_trip() {
         assert_eq!(
-            parse_id("pr-mozilla/gecko-dev/123").unwrap(),
+            parse_id("mozilla/gecko-dev/123").unwrap(),
             ("mozilla".into(), "gecko-dev".into(), 123)
         );
-        assert!(parse_id("mozilla/gecko-dev/123").is_err(), "missing pr- prefix");
-        assert!(parse_id("pr-not-enough-parts").is_err());
-        assert!(parse_id("pr-owner/repo/not-a-number").is_err());
+        assert!(parse_id("not-enough-parts").is_err());
+        assert!(parse_id("owner/repo/not-a-number").is_err());
     }
 
     #[tokio::test]
@@ -436,7 +427,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_query_folds_in_config_filters() {
-        let mut c = cfg("gh");
+        let mut c = cfg();
         c.ignore_repos = vec!["mozilla/noisy".into()];
         c.ignore_authors = vec!["bot".into()];
         c.ignore_teams = vec!["mozilla/reviewers".into()];
@@ -480,13 +471,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let src =
-            GithubSource::for_test(cfg("gh"), Some("t".into()), server.uri(), SEARCH_PER_PAGE);
+        let src = GithubSource::for_test(cfg(), Some("t".into()), server.uri(), SEARCH_PER_PAGE);
         let reviews = src.fetch_queue().await.unwrap();
 
         assert_eq!(reviews.len(), 1);
         let r = &reviews[0];
-        assert_eq!(r.key, ReviewKey::new("gh", "pr-mozilla/gecko-dev/123"));
+        assert_eq!(r.key, ReviewKey::new("gh", "mozilla/gecko-dev/123"));
         assert_eq!(r.title, "Fix the thing");
         assert_eq!(r.author, "author");
         assert_eq!(r.version, "deadbeef");
@@ -545,7 +535,7 @@ mod tests {
             .await;
 
         // per_page=1 so each mocked page has exactly one item, forcing the loop to page 3.
-        let src = GithubSource::for_test(cfg("gh"), Some("t".into()), server.uri(), 1);
+        let src = GithubSource::for_test(cfg(), Some("t".into()), server.uri(), 1);
         let reviews = src.fetch_queue().await.unwrap();
         assert_eq!(reviews.len(), 2);
     }
@@ -564,10 +554,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let src =
-            GithubSource::for_test(cfg("gh"), Some("t".into()), server.uri(), SEARCH_PER_PAGE);
+        let src = GithubSource::for_test(cfg(), Some("t".into()), server.uri(), SEARCH_PER_PAGE);
         let review = Review {
-            key: ReviewKey::new("gh", "pr-mozilla/gecko-dev/123"),
+            key: ReviewKey::new("gh", "mozilla/gecko-dev/123"),
             title: "x".into(),
             author: "author".into(),
             url: "https://github.com/mozilla/gecko-dev/pull/123".into(),
@@ -613,10 +602,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let src =
-            GithubSource::for_test(cfg("gh"), Some("t".into()), server.uri(), SEARCH_PER_PAGE);
+        let src = GithubSource::for_test(cfg(), Some("t".into()), server.uri(), SEARCH_PER_PAGE);
         let review = Review {
-            key: ReviewKey::new("gh", "pr-mozilla/gecko-dev/123"),
+            key: ReviewKey::new("gh", "mozilla/gecko-dev/123"),
             title: "x".into(),
             author: "author".into(),
             url: "https://github.com/mozilla/gecko-dev/pull/123".into(),
@@ -651,10 +639,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let src =
-            GithubSource::for_test(cfg("gh"), Some("t".into()), server.uri(), SEARCH_PER_PAGE);
+        let src = GithubSource::for_test(cfg(), Some("t".into()), server.uri(), SEARCH_PER_PAGE);
         let review = Review {
-            key: ReviewKey::new("gh", "pr-mozilla/gecko-dev/123"),
+            key: ReviewKey::new("gh", "mozilla/gecko-dev/123"),
             title: "x".into(),
             author: "author".into(),
             url: "https://github.com/mozilla/gecko-dev/pull/123".into(),
@@ -698,32 +685,30 @@ mod tests {
             .mount(&server)
             .await;
 
-        let src =
-            GithubSource::for_test(cfg("gh"), Some("t".into()), server.uri(), SEARCH_PER_PAGE);
+        let src = GithubSource::for_test(cfg(), Some("t".into()), server.uri(), SEARCH_PER_PAGE);
         let ids = vec![
-            "pr-mozilla/gecko-dev/1".to_string(),
-            "pr-mozilla/gecko-dev/2".to_string(),
+            "mozilla/gecko-dev/1".to_string(),
+            "mozilla/gecko-dev/2".to_string(),
         ];
         let statuses = src.fetch_status(&ids).await.unwrap();
 
         assert_eq!(
             statuses[0],
-            ("pr-mozilla/gecko-dev/1".to_string(), Lifecycle::Open)
+            ("mozilla/gecko-dev/1".to_string(), Lifecycle::Open)
         );
         assert_eq!(
             statuses[1],
-            ("pr-mozilla/gecko-dev/2".to_string(), Lifecycle::Resolved)
+            ("mozilla/gecko-dev/2".to_string(), Lifecycle::Resolved)
         );
     }
 
     #[tokio::test]
     async fn fetch_queue_without_token_is_an_error() {
-        let src = GithubSource::for_test(cfg("gh"), None, DEFAULT_API_BASE.into(), SEARCH_PER_PAGE);
+        let src = GithubSource::for_test(cfg(), None, DEFAULT_API_BASE.into(), SEARCH_PER_PAGE);
         let err = src.fetch_queue().await.unwrap_err();
         assert!(
             err.to_string().contains("needs a token"),
             "unexpected error: {err}"
         );
     }
-
 }
