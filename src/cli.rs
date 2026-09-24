@@ -42,9 +42,10 @@ pub enum Command {
         /// A review id, or unique prefix of one (e.g. "D123" or "moz/D123").
         id: String,
     },
-    /// Fetch a review locally: resolve its canonical repo (cloning one if needed) and create a
-    /// worktree/workspace for it. `rq sync` never does this on its own; use this (or the fetch
-    /// hotkey in `rq list`) for reviews that actually warrant checking out.
+    /// Fetch a review locally: resolve its canonical repo (asking before cloning one, unless
+    /// `auto_clone` is set) and create a worktree/workspace for it. `rq sync` never does this on
+    /// its own; use this (or the fetch hotkey in `rq list`) for reviews that actually warrant
+    /// checking out.
     Fetch {
         /// A review id, or unique prefix of one (e.g. "D123" or "moz/D123").
         id: String,
@@ -59,7 +60,7 @@ pub enum Command {
     },
     /// Check auth and tool availability for each configured source.
     Doctor,
-    /// Manage canonical repos.
+    /// Manage canonical repos (discovered by scanning `workdir`, or tool-managed clones).
     Repo {
         #[command(subcommand)]
         command: RepoCommand,
@@ -72,9 +73,8 @@ pub enum Command {
 pub enum RepoCommand {
     /// List canonical repos and how many live workspaces each has.
     List,
-    /// Register a user-owned canonical repo.
-    Add { url: String, path: PathBuf },
-    /// Delete a tool-managed clone (refuses if it still has workspaces).
+    /// Delete a tool-managed clone (refuses for a discovered repo, or if it still has
+    /// workspaces).
     Rm { url: String },
 }
 

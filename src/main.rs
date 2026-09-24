@@ -1,4 +1,4 @@
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -6,9 +6,9 @@ use clap::Parser;
 use comfy_table::{Table, presets::UTF8_FULL_CONDENSED};
 
 use review_queue::cli::{Cli, Command, RepoCommand, Shell};
-use review_queue::config::{Config, SourceConfig};
+use review_queue::config::{self, Config, SourceConfig};
 use review_queue::paths::Paths;
-use review_queue::repo::RepoStore;
+use review_queue::repo::{NeedsClone, OnMissing, RepoKind, RepoStore};
 use review_queue::source::ReviewSource;
 use review_queue::source::github::GithubSource;
 use review_queue::source::moz_phab::MozPhabSource;
@@ -27,9 +27,11 @@ async fn main() -> Result<()> {
     let paths = paths.with_overrides(config.data_dir.clone());
 
     match cli.command {
-        Command::List { json, all, plain } => list(&paths, &config, json, all, plain).await,
+        Command::List { json, all, plain } => {
+            list(&paths, &config, &config_path, json, all, plain).await
+        }
         Command::Path { id } => path(&paths, &id),
-        Command::Fetch { id } => fetch_cmd(&paths, &config, &id).await,
+        Command::Fetch { id } => fetch_cmd(&paths, &config, &config_path, &id).await,
         Command::Sync { source, dry_run } => {
             sync_cmd(&paths, &config, source.as_deref(), dry_run).await
         }
@@ -37,7 +39,6 @@ async fn main() -> Result<()> {
         Command::Doctor => doctor_cmd(&paths, &config_path, &config).await,
         Command::Repo { command } => match command {
             RepoCommand::List => repo_list_cmd(&paths, &config),
-            RepoCommand::Add { url, path } => repo_add_cmd(&config_path, &url, &path),
             RepoCommand::Rm { url } => repo_rm_cmd(&paths, &config, &url),
         },
         Command::ShellInit { shell } => {
@@ -100,7 +101,7 @@ async fn sync_cmd(
     Ok(())
 }
 
-async fn fetch_cmd(paths: &Paths, config: &Config, id: &str) -> Result<()> {
+async fn fetch_cmd(paths: &Paths, config: &Config, config_path: &Path, id: &str) -> Result<()> {
     let key = resolve_key(paths, id)?;
     let mut lock = acquire_sync_lock(paths)?;
     let _guard = lock.try_write().map_err(|_| {
@@ -111,9 +112,57 @@ async fn fetch_cmd(paths: &Paths, config: &Config, id: &str) -> Result<()> {
     })?;
 
     let sources = build_sources(config).await?;
-    let ws_path = sync::fetch_local(&sources, paths, config, &key).await?;
-    println!("{}", ws_path.display());
-    Ok(())
+    let mut on_missing = if config.auto_clone {
+        OnMissing::Clone
+    } else {
+        OnMissing::Ask
+    };
+    loop {
+        match sync::fetch_local(&sources, paths, config, &key, on_missing).await {
+            Ok(ws_path) => {
+                println!("{}", ws_path.display());
+                return Ok(());
+            }
+            Err(e) => {
+                let Some(needs_clone) = e.downcast_ref::<NeedsClone>() else {
+                    return Err(e);
+                };
+                on_missing = match prompt_clone_cli(&needs_clone.url, &needs_clone.dest)? {
+                    CloneAnswer::Yes => OnMissing::Clone,
+                    CloneAnswer::Always => {
+                        config::set_auto_clone(config_path)?;
+                        OnMissing::Clone
+                    }
+                    CloneAnswer::No => bail!("not cloning `{}`", needs_clone.url),
+                };
+            }
+        }
+    }
+}
+
+enum CloneAnswer {
+    Yes,
+    Always,
+    No,
+}
+
+/// Ask whether to clone a review's repo into the data dir, since no local checkout was found.
+fn prompt_clone_cli(url: &str, dest: &Path) -> Result<CloneAnswer> {
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "no local checkout of `{url}` found, and stdin isn't a terminal to ask; \
+             set `auto_clone = true` in config.toml, or run this interactively"
+        );
+    }
+    print!("No local checkout of `{url}` found. Clone into {}? [Y/n/always] ", dest.display());
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(match line.trim().to_lowercase().as_str() {
+        "" | "y" | "yes" => CloneAnswer::Yes,
+        "always" | "a" => CloneAnswer::Always,
+        _ => CloneAnswer::No,
+    })
 }
 
 /// Resolve a review id/prefix (see `State::find_by_prefix`) to its key, without holding onto the
@@ -149,6 +198,10 @@ async fn doctor_cmd(paths: &Paths, config_path: &Path, config: &Config) -> Resul
 
     println!("config: {}", config_path.display());
     println!("data dir: {}", paths.data_dir().display());
+    match &config.workdir {
+        Some(w) => println!("workdir: {}", w.display()),
+        None => println!("workdir: not set"),
+    }
     println!();
 
     for tool in ["git", "jj"] {
@@ -204,12 +257,15 @@ async fn doctor_cmd(paths: &Paths, config_path: &Path, config: &Config) -> Resul
 }
 
 fn repo_list_cmd(paths: &Paths, config: &Config) -> Result<()> {
-    let store = RepoStore::load(paths, config)?;
+    let mut store = RepoStore::load(paths, config)?;
+    store.rescan_if_needed()?;
     let state = State::load(&paths.state_file())?;
     let repos = store.list(&state);
 
     if repos.is_empty() {
-        println!("No canonical repos yet. Run `rq sync` or `rq repo add`.");
+        println!(
+            "No canonical repos yet. Set `workdir` in config.toml, or run `rq fetch`/`rq sync`."
+        );
         return Ok(());
     }
 
@@ -219,46 +275,15 @@ fn repo_list_cmd(paths: &Paths, config: &Config) -> Result<()> {
     for r in repos {
         table.add_row(vec![
             r.url,
-            if r.user_owned {
-                "user-owned".to_string()
-            } else {
-                "tool-managed".to_string()
+            match r.kind {
+                RepoKind::Discovered => "discovered".to_string(),
+                RepoKind::ToolManaged => "tool-managed".to_string(),
             },
             r.path.display().to_string(),
             r.workspace_count.to_string(),
         ]);
     }
     println!("{table}");
-    Ok(())
-}
-
-fn repo_add_cmd(config_path: &Path, url: &str, target: &Path) -> Result<()> {
-    if !target.join(".git").exists() && !target.join(".jj").exists() {
-        tracing::warn!(
-            "{} doesn't look like a git or jj checkout (no .git or .jj found)",
-            target.display()
-        );
-    }
-
-    let mut text = std::fs::read_to_string(config_path).unwrap_or_default();
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text.push_str(&format!(
-        "\n[[repo]]\nurls = [\"{url}\"]\npath = \"{}\"\n",
-        target.display()
-    ));
-
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(config_path, text)
-        .with_context(|| format!("writing {}", config_path.display()))?;
-    println!(
-        "Added [[repo]] entry to {}: {url} -> {}",
-        config_path.display(),
-        target.display()
-    );
     Ok(())
 }
 
@@ -339,7 +364,14 @@ fn print_prune_report(report: &PruneReport) {
     }
 }
 
-async fn list(paths: &Paths, config: &Config, json: bool, all: bool, plain: bool) -> Result<()> {
+async fn list(
+    paths: &Paths,
+    config: &Config,
+    config_path: &Path,
+    json: bool,
+    all: bool,
+    plain: bool,
+) -> Result<()> {
     if json {
         let state = State::load(&paths.state_file())?;
         let entries: Vec<&ReviewEntry> = state.iter().filter(|e| all || e.in_queue).collect();
@@ -349,7 +381,7 @@ async fn list(paths: &Paths, config: &Config, json: bool, all: bool, plain: bool
 
     if !plain && std::io::stdout().is_terminal() {
         let sources = build_sources(config).await?;
-        return tui::run(paths.clone(), config.clone(), sources, all);
+        return tui::run(paths.clone(), config.clone(), config_path.to_path_buf(), sources, all);
     }
 
     let state = State::load(&paths.state_file())?;

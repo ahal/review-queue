@@ -1,10 +1,14 @@
 //! Canonical repo resolution: every review repo maps to exactly one canonical local repo, which
 //! `sync`/`prune` never delete - only the worktrees/workspaces created from it. A canonical repo
-//! is either user-owned (an explicit `[[repo]]` config entry pointing at an existing checkout)
-//! or tool-managed (cloned once under `Paths::repo_source_dir()` and recorded in `repos.json`).
+//! is either discovered (an existing checkout found by scanning `Config::workdir`, see
+//! `crate::workdir`) or tool-managed (cloned once under `Paths::repo_source_dir()` and recorded
+//! in `repos.json`).
 //!
-//! Lookup order: config `[[repo]]`, then the `repos.json` registry, then clone a new one (always
-//! plain git - only a pre-existing user-owned checkout can be jj) and register it.
+//! Lookup order: the workdir scan cache, then the `repos.json` registry, then - if `workdir` is
+//! set - a rescan (throttled, see `RepoStore::needs_rescan`) in case the repo was just cloned or
+//! is newly discoverable. Still missing after all that: `OnMissing` decides whether to clone
+//! (always plain git - only a discovered checkout can be jj) or hand back `NeedsClone` for the
+//! caller to ask about first.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -12,10 +16,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, RepoConfig, VcsKind};
+use crate::config::{Config, VcsKind};
 use crate::paths::Paths;
 use crate::source::RepoRef;
 use crate::state::State;
+use crate::workdir::{self, WorkdirCache};
 
 /// A resolved local repo that review workspaces are built from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +30,26 @@ pub struct CanonicalRepo {
     /// Identifies this repo's directory under `Paths::repos_dir()` - its normalized URL. Stable
     /// across aliases (origin vs mirror) so a review's workspace always lands in the same place.
     pub name: String,
+}
+
+/// What `RepoStore::resolve` should do when a review's repo isn't found locally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnMissing {
+    /// Return `NeedsClone` instead, so the caller can confirm with the user first.
+    Ask,
+    /// Clone into the data dir without asking (`Config::auto_clone`, or a context - like a
+    /// non-interactive `rq sync` - that can't ask).
+    Clone,
+}
+
+/// Returned by `RepoStore::resolve` under `OnMissing::Ask` when a review's repo has no local
+/// checkout. Callers should `downcast_ref` for this to offer the clone prompt, and re-resolve
+/// with `OnMissing::Clone` if the user agrees.
+#[derive(Debug, thiserror::Error)]
+#[error("no local checkout of `{url}` found (would clone into {})", dest.display())]
+pub struct NeedsClone {
+    pub url: String,
+    pub dest: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,43 +95,38 @@ impl Registry {
     }
 }
 
+/// A rescan is skipped if the cache is younger than this - covers the ask/confirm/retry round
+/// trip and bursts of `rq fetch` calls, without letting a real miss go undetected for long.
+const RESCAN_THROTTLE: chrono::Duration = chrono::Duration::seconds(60);
+
 pub struct RepoStore {
     registry_path: PathBuf,
     registry: Registry,
-    config_repos: Vec<RepoConfig>,
     repos_dir: PathBuf,
+    workdir: Option<PathBuf>,
+    workdir_cache_path: PathBuf,
+    workdir_cache: Option<WorkdirCache>,
 }
 
 impl RepoStore {
     pub fn load(paths: &Paths, config: &Config) -> Result<Self> {
+        let workdir_cache_path = paths.workdir_cache_file();
         Ok(Self {
             registry_path: paths.repos_file(),
             registry: Registry::load(&paths.repos_file())?,
-            config_repos: config.repos.clone(),
             repos_dir: paths.repos_dir(),
+            workdir: config.workdir.clone(),
+            workdir_cache: WorkdirCache::load(&workdir_cache_path)?,
+            workdir_cache_path,
         })
     }
 
-    /// Resolve `repo_ref` to a canonical local repo: a matching `[[repo]]` config entry, a
-    /// previously registered tool-managed clone, or - failing both - a fresh clone that gets
-    /// registered for next time.
-    pub fn resolve(&mut self, repo_ref: &RepoRef) -> Result<CanonicalRepo> {
+    /// Resolve `repo_ref` to a canonical local repo. See the module docs for the lookup order.
+    pub fn resolve(&mut self, repo_ref: &RepoRef, on_missing: OnMissing) -> Result<CanonicalRepo> {
         let normalized: Vec<String> = repo_ref.urls.iter().map(|u| normalize_url(u)).collect();
 
-        for rc in &self.config_repos {
-            let rc_normalized: Vec<String> = rc.urls.iter().map(|u| normalize_url(u)).collect();
-            if normalized.iter().any(|n| rc_normalized.contains(n)) {
-                let vcs = rc.vcs.unwrap_or_else(|| detect_vcs(&rc.path));
-                let name = rc_normalized
-                    .into_iter()
-                    .next()
-                    .context("`[[repo]]` entry has no urls")?;
-                return Ok(CanonicalRepo {
-                    path: rc.path.clone(),
-                    vcs,
-                    name,
-                });
-            }
+        if let Some(canon) = self.lookup_workdir(&normalized) {
+            return Ok(canon);
         }
 
         for n in &normalized {
@@ -121,12 +141,26 @@ impl RepoStore {
             }
         }
 
+        self.rescan_if_needed()?;
+        if let Some(canon) = self.lookup_workdir(&normalized) {
+            return Ok(canon);
+        }
+
         let url = repo_ref
             .urls
             .first()
             .context("review's repo has no candidate URLs to clone")?;
         let name = normalize_url(url);
         let dest = self.repos_dir.join(&name).join("source");
+
+        if on_missing == OnMissing::Ask {
+            return Err(NeedsClone {
+                url: url.clone(),
+                dest,
+            }
+            .into());
+        }
+
         if dest.exists() {
             // Self-heal a registry that fell out of sync with the filesystem - e.g. a prior run
             // cloned this but was interrupted before it could save `repos.json`. Trust an
@@ -155,25 +189,79 @@ impl RepoStore {
         })
     }
 
+    /// Looks up `normalized` in the workdir cache - but only if it was scanned for the
+    /// currently-configured `workdir`. A cache left over from a since-changed (or removed)
+    /// `workdir` setting is treated as absent rather than trusted, even though the directories it
+    /// recorded may still exist on disk.
+    fn lookup_workdir(&self, normalized: &[String]) -> Option<CanonicalRepo> {
+        let cache = self.workdir_cache.as_ref()?;
+        if Some(&cache.workdir) != self.workdir.as_ref() {
+            return None;
+        }
+        let repo = cache.lookup(normalized)?;
+        Some(CanonicalRepo {
+            path: repo.path.clone(),
+            vcs: repo.vcs,
+            name: repo.name.clone(),
+        })
+    }
+
+    /// Scan `workdir` if it's never been scanned, or the cache is stale - the same throttled
+    /// policy `resolve` uses on a miss. Exposed so `rq repo list` reflects the workdir without
+    /// requiring an `rq fetch` to have triggered a scan first.
+    pub fn rescan_if_needed(&mut self) -> Result<()> {
+        if self.workdir.is_some() && self.needs_rescan() {
+            self.rescan()?;
+        }
+        Ok(())
+    }
+
+    fn needs_rescan(&self) -> bool {
+        match &self.workdir_cache {
+            None => true,
+            Some(cache) => {
+                Some(&cache.workdir) != self.workdir.as_ref()
+                    || chrono::Utc::now().signed_duration_since(cache.scanned_at) >= RESCAN_THROTTLE
+            }
+        }
+    }
+
+    fn rescan(&mut self) -> Result<()> {
+        let Some(workdir) = self.workdir.clone() else {
+            return Ok(());
+        };
+        let repos = workdir::scan(&workdir, &self.repos_dir);
+        let cache = WorkdirCache {
+            workdir,
+            scanned_at: chrono::Utc::now(),
+            repos,
+        };
+        cache.save(&self.workdir_cache_path)?;
+        self.workdir_cache = Some(cache);
+        Ok(())
+    }
+
     pub fn save(&self) -> Result<()> {
         self.registry.save(&self.registry_path)
     }
 
-    /// Every canonical repo (user-owned and tool-managed), with how many tracked workspaces
+    /// Every canonical repo (discovered and tool-managed), with how many tracked workspaces
     /// currently point at it - for `rq repo list`.
     pub fn list(&self, state: &State) -> Vec<RepoListEntry> {
         let mut out = Vec::new();
-        for rc in &self.config_repos {
-            let workspace_count = state
-                .iter()
-                .filter(|e| e.workspace.as_ref().is_some_and(|w| w.repo_path == rc.path))
-                .count();
-            out.push(RepoListEntry {
-                url: rc.urls.first().cloned().unwrap_or_default(),
-                path: rc.path.clone(),
-                user_owned: true,
-                workspace_count,
-            });
+        if let Some(cache) = &self.workdir_cache {
+            for r in &cache.repos {
+                let workspace_count = state
+                    .iter()
+                    .filter(|e| e.workspace.as_ref().is_some_and(|w| w.repo_path == r.path))
+                    .count();
+                out.push(RepoListEntry {
+                    url: r.name.clone(),
+                    path: r.path.clone(),
+                    kind: RepoKind::Discovered,
+                    workspace_count,
+                });
+            }
         }
         for (url, entry) in &self.registry.repos {
             let workspace_count = state
@@ -187,24 +275,27 @@ impl RepoStore {
             out.push(RepoListEntry {
                 url: url.clone(),
                 path: entry.path.clone(),
-                user_owned: false,
+                kind: RepoKind::ToolManaged,
                 workspace_count,
             });
         }
         out
     }
 
-    /// Delete a tool-managed clone and forget it. Refuses if `url` is a user-owned `[[repo]]`
-    /// entry instead (those are removed by editing `config.toml`, never by this tool), or if any
-    /// tracked workspace still points at it.
+    /// Delete a tool-managed clone and forget it. Refuses if `url` is a discovered repo instead
+    /// (rq never deletes checkouts it didn't create), or if any tracked workspace still points
+    /// at it.
     pub fn remove(&mut self, url: &str, state: &State) -> Result<()> {
         let normalized = normalize_url(url);
-        if self
-            .config_repos
-            .iter()
-            .any(|rc| rc.urls.iter().any(|u| normalize_url(u) == normalized))
-        {
-            bail!("`{url}` is a user-owned `[[repo]]` entry; remove it from config.toml instead");
+        if self.workdir_cache.as_ref().is_some_and(|cache| {
+            cache
+                .repos
+                .iter()
+                .any(|r| r.remotes.contains(&normalized))
+        }) {
+            bail!(
+                "`{url}` is a discovered repo in your workdir; rq never deletes those - remove the checkout yourself if you want it forgotten"
+            );
         }
         let Some(entry) = self.registry.repos.get(&normalized).cloned() else {
             bail!("no tool-managed clone registered for `{url}` (see `rq repo list`)");
@@ -226,20 +317,18 @@ impl RepoStore {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoKind {
+    Discovered,
+    ToolManaged,
+}
+
 #[derive(Debug, Clone)]
 pub struct RepoListEntry {
     pub url: String,
     pub path: PathBuf,
-    pub user_owned: bool,
+    pub kind: RepoKind,
     pub workspace_count: usize,
-}
-
-fn detect_vcs(path: &Path) -> VcsKind {
-    if path.join(".jj").exists() {
-        VcsKind::Jj
-    } else {
-        VcsKind::Git
-    }
 }
 
 fn clone_repo(url: &str, dest: &Path) -> Result<()> {
@@ -289,6 +378,7 @@ pub fn normalize_url(url: &str) -> String {
 mod tests {
     use super::*;
     use crate::paths::Paths;
+    use crate::workdir::DiscoveredRepo;
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -339,24 +429,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolves_user_owned_config_repo_without_cloning() {
-        let tmp = TempDir::new().unwrap();
-        let owned = tmp.path().join("owned");
-        std::fs::create_dir(&owned).unwrap();
-        git(&owned, &["init", "-q"]);
-
-        let config = Config {
-            repos: vec![RepoConfig {
-                urls: vec!["https://github.com/o/r".into()],
-                path: owned.clone(),
-                vcs: None,
-            }],
+    fn config_with_workdir(workdir: &Path) -> Config {
+        Config {
+            workdir: Some(workdir.to_path_buf()),
             ..Default::default()
-        };
+        }
+    }
+
+    #[test]
+    fn resolves_a_discovered_repo_without_cloning() {
+        let tmp = TempDir::new().unwrap();
+        let owned = tmp.path().join("dev/owned");
+        std::fs::create_dir_all(&owned).unwrap();
+        git(&owned, &["init", "-q"]);
+        git(&owned, &["remote", "add", "origin", "git@github.com:o/r.git"]);
+
+        let config = config_with_workdir(&tmp.path().join("dev"));
         let mut store = RepoStore::load(&paths_in(tmp.path()), &config).unwrap();
         let canon = store
-            .resolve(&repo_ref(&["git@github.com:o/r.git"]))
+            .resolve(&repo_ref(&["https://github.com/o/r"]), OnMissing::Ask)
             .unwrap();
 
         assert_eq!(canon.path, owned);
@@ -368,52 +459,126 @@ mod tests {
     }
 
     #[test]
-    fn detects_jj_over_git_when_both_present() {
+    fn a_cache_miss_triggers_a_rescan_that_picks_up_a_newly_cloned_repo() {
         let tmp = TempDir::new().unwrap();
-        let owned = tmp.path().join("owned");
-        std::fs::create_dir_all(owned.join(".git")).unwrap();
-        std::fs::create_dir_all(owned.join(".jj")).unwrap();
+        let dev = tmp.path().join("dev");
+        std::fs::create_dir_all(&dev).unwrap();
 
-        let config = Config {
-            repos: vec![RepoConfig {
-                urls: vec!["https://example.com/o/r".into()],
-                path: owned.clone(),
-                vcs: None,
-            }],
-            ..Default::default()
-        };
-        let mut store = RepoStore::load(&paths_in(tmp.path()), &config).unwrap();
-        let canon = store
-            .resolve(&repo_ref(&["https://example.com/o/r"]))
+        let config = config_with_workdir(&dev);
+        let paths = paths_in(tmp.path());
+        let mut store = RepoStore::load(&paths, &config).unwrap();
+
+        // First lookup: nothing in `dev` yet, and no config to clone from - `Ask` reports
+        // `NeedsClone` (this also seeds the workdir cache as "empty, just scanned").
+        let err = store
+            .resolve(&repo_ref(&["https://example.com/o/r"]), OnMissing::Ask)
+            .unwrap_err();
+        assert!(err.downcast_ref::<NeedsClone>().is_some());
+
+        // The repo shows up in `dev` after that (e.g. the user cloned it by hand). A fresh
+        // `RepoStore` (as a later `rq fetch` would construct) still has the stale cache on disk,
+        // but it's older than the throttle window, so resolving rescans and finds it.
+        let repo = dev.join("owned");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["remote", "add", "origin", "https://example.com/o/r"]);
+        backdate_cache(&paths);
+
+        let mut store2 = RepoStore::load(&paths, &config).unwrap();
+        let canon = store2
+            .resolve(&repo_ref(&["https://example.com/o/r"]), OnMissing::Ask)
             .unwrap();
+        assert_eq!(canon.path, repo);
+    }
 
-        assert_eq!(canon.vcs, VcsKind::Jj);
+    /// Force the on-disk workdir cache's `scanned_at` far enough into the past to clear
+    /// `RESCAN_THROTTLE`, simulating "it's been a while since the last scan" without sleeping.
+    fn backdate_cache(paths: &Paths) {
+        let mut cache = WorkdirCache::load(&paths.workdir_cache_file())
+            .unwrap()
+            .unwrap();
+        cache.scanned_at -= RESCAN_THROTTLE * 2;
+        cache.save(&paths.workdir_cache_file()).unwrap();
     }
 
     #[test]
-    fn explicit_vcs_override_wins_over_autodetection() {
+    fn a_cached_path_that_no_longer_exists_is_treated_as_a_miss() {
         let tmp = TempDir::new().unwrap();
-        let owned = tmp.path().join("owned");
-        std::fs::create_dir_all(owned.join(".jj")).unwrap();
+        let paths = paths_in(tmp.path());
+        let dev = tmp.path().join("dev");
+        std::fs::create_dir_all(&dev).unwrap();
+        let config = config_with_workdir(&dev);
 
-        let config = Config {
-            repos: vec![RepoConfig {
-                urls: vec!["https://example.com/o/r".into()],
-                path: owned.clone(),
-                vcs: Some(VcsKind::Git),
+        let cache = WorkdirCache {
+            workdir: dev.clone(),
+            scanned_at: chrono::Utc::now(),
+            repos: vec![DiscoveredRepo {
+                path: dev.join("gone"),
+                vcs: VcsKind::Git,
+                name: "example.com/o/r".into(),
+                remotes: vec!["example.com/o/r".into()],
             }],
-            ..Default::default()
         };
-        let mut store = RepoStore::load(&paths_in(tmp.path()), &config).unwrap();
-        let canon = store
-            .resolve(&repo_ref(&["https://example.com/o/r"]))
-            .unwrap();
+        cache.save(&paths.workdir_cache_file()).unwrap();
 
-        assert_eq!(
-            canon.vcs,
-            VcsKind::Git,
-            "explicit config override should beat .jj autodetection"
+        let mut store = RepoStore::load(&paths, &config).unwrap();
+        let err = store
+            .resolve(&repo_ref(&["https://example.com/o/r"]), OnMissing::Ask)
+            .unwrap_err();
+        assert!(err.downcast_ref::<NeedsClone>().is_some());
+    }
+
+    /// Regression test: a cache scanned under a workdir the user has since changed (or removed
+    /// from config) must not be trusted, even though the directory it recorded still exists on
+    /// disk - otherwise turning `workdir` off doesn't actually stop rq from using it.
+    #[test]
+    fn a_cache_from_a_different_workdir_is_treated_as_a_miss() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        let old_dev = tmp.path().join("old-dev");
+        let repo = old_dev.join("owned");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["remote", "add", "origin", "https://example.com/o/r"]);
+
+        let cache = WorkdirCache {
+            workdir: old_dev,
+            scanned_at: chrono::Utc::now(),
+            repos: vec![DiscoveredRepo {
+                path: repo,
+                vcs: VcsKind::Git,
+                name: "example.com/o/r".into(),
+                remotes: vec!["example.com/o/r".into()],
+            }],
+        };
+        cache.save(&paths.workdir_cache_file()).unwrap();
+
+        // No `workdir` configured now (e.g. the user removed it from config.toml).
+        let config = Config::default();
+        let mut store = RepoStore::load(&paths, &config).unwrap();
+        let err = store
+            .resolve(&repo_ref(&["https://example.com/o/r"]), OnMissing::Ask)
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<NeedsClone>().is_some(),
+            "must not serve a repo cached under a different workdir"
         );
+    }
+
+    #[test]
+    fn ask_reports_needs_clone_without_touching_the_filesystem() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        let config = Config::default();
+        let mut store = RepoStore::load(&paths, &config).unwrap();
+
+        let err = store
+            .resolve(&repo_ref(&["https://example.com/o/r"]), OnMissing::Ask)
+            .unwrap_err();
+        let needs_clone = err.downcast_ref::<NeedsClone>().unwrap();
+        assert_eq!(needs_clone.url, "https://example.com/o/r");
+        assert!(!needs_clone.dest.exists());
+        assert!(!paths.repos_file().exists());
     }
 
     #[test]
@@ -431,7 +596,7 @@ mod tests {
         let url = upstream.to_string_lossy().to_string();
 
         let mut store = RepoStore::load(&paths, &config).unwrap();
-        let canon1 = store.resolve(&repo_ref(&[&url])).unwrap();
+        let canon1 = store.resolve(&repo_ref(&[&url]), OnMissing::Clone).unwrap();
         assert_eq!(canon1.vcs, VcsKind::Git);
         assert!(canon1.path.join(".git").exists());
         store.save().unwrap();
@@ -439,12 +604,16 @@ mod tests {
         // A fresh store (simulating a later `rq sync` run) reuses the registered clone rather
         // than cloning again.
         let mut store2 = RepoStore::load(&paths, &config).unwrap();
-        let canon2 = store2.resolve(&repo_ref(&[&url])).unwrap();
+        let canon2 = store2
+            .resolve(&repo_ref(&[&url]), OnMissing::Clone)
+            .unwrap();
         assert_eq!(canon2.path, canon1.path);
 
         // Reusing it via a differently-formed but equivalent URL also hits the same registry
         // entry, not a second clone.
-        let canon3 = store2.resolve(&repo_ref(&[&format!("{url}.git")])).unwrap();
+        let canon3 = store2
+            .resolve(&repo_ref(&[&format!("{url}.git")]), OnMissing::Clone)
+            .unwrap();
         assert_eq!(canon3.path, canon1.path);
     }
 
@@ -473,7 +642,7 @@ mod tests {
         assert!(!paths.repos_file().exists());
 
         let mut store = RepoStore::load(&paths, &config).unwrap();
-        let canon = store.resolve(&repo_ref(&[&url])).unwrap();
+        let canon = store.resolve(&repo_ref(&[&url]), OnMissing::Clone).unwrap();
 
         assert_eq!(canon.path, dest);
         assert!(canon.path.join(".git").exists());
@@ -481,7 +650,7 @@ mod tests {
 
     fn entry_using(repo_path: &Path) -> crate::state::ReviewEntry {
         crate::state::ReviewEntry {
-            key: crate::state::ReviewKey::new("moz", "D1"),
+            key: crate::state::ReviewKey::new("moz", "phab-D1"),
             title: "x".into(),
             author: "a".into(),
             url: "https://example.com/D1".into(),
@@ -505,50 +674,45 @@ mod tests {
     }
 
     #[test]
-    fn list_reports_config_and_registry_repos_with_workspace_counts() {
+    fn list_reports_discovered_and_registry_repos_with_workspace_counts() {
         let tmp = TempDir::new().unwrap();
-        let owned = tmp.path().join("owned");
-        std::fs::create_dir(&owned).unwrap();
+        let owned = tmp.path().join("dev/owned");
+        std::fs::create_dir_all(&owned).unwrap();
         git(&owned, &["init", "-q"]);
+        git(&owned, &["remote", "add", "origin", "https://example.com/o/r"]);
 
-        let config = Config {
-            repos: vec![RepoConfig {
-                urls: vec!["https://example.com/o/r".into()],
-                path: owned.clone(),
-                vcs: None,
-            }],
-            ..Default::default()
-        };
-        let store = RepoStore::load(&paths_in(tmp.path()), &config).unwrap();
+        let config = config_with_workdir(&tmp.path().join("dev"));
+        let paths = paths_in(tmp.path());
+        let mut store = RepoStore::load(&paths, &config).unwrap();
+        // Force a scan so `list()` has something to report.
+        store.rescan().unwrap();
 
         let mut state = crate::state::State::default();
         state.insert(entry_using(&owned));
 
         let repos = store.list(&state);
         assert_eq!(repos.len(), 1);
-        assert!(repos[0].user_owned);
+        assert_eq!(repos[0].kind, RepoKind::Discovered);
         assert_eq!(repos[0].workspace_count, 1);
     }
 
     #[test]
-    fn remove_refuses_for_user_owned_repo() {
+    fn remove_refuses_for_a_discovered_repo() {
         let tmp = TempDir::new().unwrap();
-        let owned = tmp.path().join("owned");
-        std::fs::create_dir(&owned).unwrap();
-        let config = Config {
-            repos: vec![RepoConfig {
-                urls: vec!["https://example.com/o/r".into()],
-                path: owned,
-                vcs: None,
-            }],
-            ..Default::default()
-        };
-        let mut store = RepoStore::load(&paths_in(tmp.path()), &config).unwrap();
+        let owned = tmp.path().join("dev/owned");
+        std::fs::create_dir_all(&owned).unwrap();
+        git(&owned, &["init", "-q"]);
+        git(&owned, &["remote", "add", "origin", "https://example.com/o/r"]);
+
+        let config = config_with_workdir(&tmp.path().join("dev"));
+        let paths = paths_in(tmp.path());
+        let mut store = RepoStore::load(&paths, &config).unwrap();
+        store.rescan().unwrap();
         let state = crate::state::State::default();
 
         let err = store.remove("https://example.com/o/r", &state).unwrap_err();
         assert!(
-            err.to_string().contains("config.toml"),
+            err.to_string().contains("workdir"),
             "unexpected error: {err}"
         );
     }
@@ -567,7 +731,7 @@ mod tests {
         let paths = paths_in(tmp.path());
         let config = Config::default();
         let mut store = RepoStore::load(&paths, &config).unwrap();
-        let canon = store.resolve(&repo_ref(&[&url])).unwrap();
+        let canon = store.resolve(&repo_ref(&[&url]), OnMissing::Clone).unwrap();
 
         let mut state = crate::state::State::default();
         state.insert(entry_using(&canon.path));
@@ -594,7 +758,7 @@ mod tests {
         let paths = paths_in(tmp.path());
         let config = Config::default();
         let mut store = RepoStore::load(&paths, &config).unwrap();
-        let canon = store.resolve(&repo_ref(&[&url])).unwrap();
+        let canon = store.resolve(&repo_ref(&[&url]), OnMissing::Clone).unwrap();
         store.save().unwrap();
 
         let state = crate::state::State::default();
@@ -604,7 +768,9 @@ mod tests {
         assert!(!canon.path.exists());
         let mut reloaded = RepoStore::load(&paths, &config).unwrap();
         // A removed clone is forgotten, not just deleted - resolving again clones fresh.
-        let canon2 = reloaded.resolve(&repo_ref(&[&url])).unwrap();
+        let canon2 = reloaded
+            .resolve(&repo_ref(&[&url]), OnMissing::Clone)
+            .unwrap();
         assert!(canon2.path.exists());
     }
 }

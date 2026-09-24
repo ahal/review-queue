@@ -2,11 +2,11 @@
 //!
 //! Layout:
 //! - config: `$XDG_CONFIG_HOME/review-queue/config.toml`
-//! - data: `$XDG_DATA_HOME/review-queue/` — state.json, repos.json, sync.lock, and `repos/`
-//!   (every canonical repo, keyed by its normalized URL, holding both the tool-managed clone
-//!   under `source/` and the workspaces built from it under `workspaces/{id}`; each source
-//!   prefixes its ids, e.g. `phab-D1234`/`pr-owner/repo/42`, so ids never collide across sources
-//!   sharing a repo)
+//! - data: `$XDG_DATA_HOME/review-queue/` — state.json, repos.json, sync.lock, workdir.json (the
+//!   `crate::workdir` scan cache), and `repos/` (every canonical repo, keyed by its normalized
+//!   URL, holding both the tool-managed clone under `source/` and the workspaces built from it
+//!   under `workspaces/{id}`; each source prefixes its ids, e.g. `phab-D1234`/`pr-owner/repo/42`,
+//!   so ids never collide across sources sharing a repo)
 
 use std::path::{Path, PathBuf};
 
@@ -52,6 +52,11 @@ impl Paths {
 
     pub fn sync_lock_file(&self) -> PathBuf {
         self.data_dir.join("sync.lock")
+    }
+
+    /// The `crate::workdir` scan cache.
+    pub fn workdir_cache_file(&self) -> PathBuf {
+        self.data_dir.join("workdir.json")
     }
 
     /// Root of every canonical repo's directory, keyed by name (its normalized URL).

@@ -15,9 +15,10 @@
 //! workspace is just dropped. A resolved review with a clean workspace has the workspace removed
 //! too. Either way, if dirty, it's kept.
 //!
-//! `fetch_local()` is the on-demand counterpart - resolving a canonical repo (cloning one if
-//! needed) and creating a workspace for a single already-tracked review. It's what `rq fetch` and
-//! the fetch hotkey in `rq list`'s TUI call; `sync()` never calls it itself.
+//! `fetch_local()` is the on-demand counterpart - resolving a canonical repo (asking before
+//! cloning one, unless told otherwise) and creating a workspace for a single already-tracked
+//! review. It's what `rq fetch` and the fetch hotkey in `rq list`'s TUI call; `sync()` never
+//! calls it itself.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -25,7 +26,7 @@ use anyhow::{Context, Result};
 
 use crate::config::{Config, VcsKind};
 use crate::paths::Paths;
-use crate::repo::RepoStore;
+use crate::repo::{OnMissing, RepoStore};
 use crate::source::{Lifecycle, Review, ReviewSource};
 use crate::state::{ReviewEntry, ReviewKey, State, Status, Workspace};
 use crate::vcs::Vcs;
@@ -291,15 +292,20 @@ fn handle_out_of_queue(
     Ok(())
 }
 
-/// Resolve a canonical repo (cloning one if needed) and create a workspace for `key`, a review
-/// already tracked by a prior `sync()`. A no-op that returns the existing path if `key` already
-/// has a workspace. This is the on-demand counterpart to `sync()`'s deliberate refusal to create
-/// workspaces on its own - see the module docs.
+/// Resolve a canonical repo (asking before cloning one, unless `on_missing` says otherwise) and
+/// create a workspace for `key`, a review already tracked by a prior `sync()`. A no-op that
+/// returns the existing path if `key` already has a workspace. This is the on-demand counterpart
+/// to `sync()`'s deliberate refusal to create workspaces on its own - see the module docs.
+///
+/// Under `OnMissing::Ask`, a repo with no local checkout surfaces as a `repo::NeedsClone` error
+/// (`downcast_ref` it) rather than cloning - callers should confirm with the user and retry with
+/// `OnMissing::Clone` if they agree.
 pub async fn fetch_local(
     sources: &[Box<dyn ReviewSource>],
     paths: &Paths,
     config: &Config,
     key: &ReviewKey,
+    on_missing: OnMissing,
 ) -> Result<std::path::PathBuf> {
     paths.ensure_dirs()?;
     let mut state = State::load(&paths.state_file())?;
@@ -328,7 +334,7 @@ pub async fn fetch_local(
     };
 
     let mut repo_store = RepoStore::load(paths, config)?;
-    let canon = repo_store.resolve(&review.repo)?;
+    let canon = repo_store.resolve(&review.repo, on_missing)?;
     let checkout = source.checkout_spec(&review, &canon.path).await?;
     let vcs = vcs_for(canon.vcs);
     let ws_path = paths.workspace_dir(&canon.name, &key.id);
@@ -655,7 +661,7 @@ mod tests {
         sync(&sources, &paths, None, false).await.unwrap();
 
         let key = ReviewKey::new("gh", "pr-moz/proj/1");
-        let ws_path = fetch_local(&sources, &paths, &config, &key).await.unwrap();
+        let ws_path = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone).await.unwrap();
 
         assert!(ws_path.join("pr.txt").exists());
         let state = State::load(&paths.state_file()).unwrap();
@@ -665,13 +671,13 @@ mod tests {
         assert_eq!(ws.head_id, sha);
         assert_eq!(ws.workspace_path, ws_path);
 
-        // The canonical repo was cloned (tool-managed - no `[[repo]]` config entry) and
+        // The canonical repo was cloned (tool-managed - not found in any workdir) and
         // registered, so a second fetch would reuse it instead of cloning again.
         assert!(ws.repo_path.join(".git").exists());
         assert!(paths.repos_file().exists());
 
         // Calling it again is a no-op that just returns the existing path.
-        let ws_path2 = fetch_local(&sources, &paths, &config, &key).await.unwrap();
+        let ws_path2 = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone).await.unwrap();
         assert_eq!(ws_path2, ws_path);
     }
 
@@ -746,7 +752,7 @@ mod tests {
 
         let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
         sync(&sources, &paths, None, false).await.unwrap();
-        let ws_path = fetch_local(&sources, &paths, &config, &key).await.unwrap();
+        let ws_path = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone).await.unwrap();
         assert!(ws_path.exists());
         drop(server);
 
@@ -792,7 +798,7 @@ mod tests {
         let key = ReviewKey::new("gh", "pr-moz/proj/1");
         let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
         sync(&sources, &paths, None, false).await.unwrap();
-        fetch_local(&sources, &paths, &config, &key).await.unwrap();
+        fetch_local(&sources, &paths, &config, &key, OnMissing::Clone).await.unwrap();
         drop(server);
 
         // Second sync: changes requested, so the PR drops out of the queue, but it's still open.
@@ -833,7 +839,7 @@ mod tests {
         let key = ReviewKey::new("gh", "pr-moz/proj/1");
         let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
         sync(&sources, &paths, None, false).await.unwrap();
-        let ws_path = fetch_local(&sources, &paths, &config, &key).await.unwrap();
+        let ws_path = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone).await.unwrap();
         drop(server);
 
         std::fs::write(ws_path.join("untracked.txt"), "local edit\n").unwrap();

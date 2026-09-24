@@ -81,9 +81,9 @@
 //! **Known limitation, not yet handled**: `moz-phab` defaults to the remote named `origin` and
 //! warns ("Multiple remotes found. Defaulting to 'origin'.") if a repo has more than one. Every
 //! tool-managed clone only ever has one remote, so this never bites the common path - but a
-//! user-owned `[[repo]]` checkout with multiple/nonstandard remotes (common for Mozilla
-//! developers, e.g. a `central`/`try` naming scheme instead of `origin`) may need `git.remote`
-//! set in their own `~/.moz-phab-config`, which this tool doesn't configure on their behalf.
+//! discovered workdir checkout with multiple/nonstandard remotes (common for Mozilla developers,
+//! e.g. a `central`/`try` naming scheme instead of `origin`) may need `git.remote` set in their
+//! own `~/.moz-phab-config`, which this tool doesn't configure on their behalf.
 //!
 //! Whether `moz-phab` itself is installed and runnable is left to `rq doctor` (not yet built),
 //! not `check_auth` here - `check_auth`'s job is verifying Conduit credentials, and testing this

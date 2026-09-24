@@ -3,14 +3,17 @@
 //! fetches it locally on demand - the same `sync::fetch_local` a plain `rq fetch <id>` runs. See
 //! `crate::sync`'s module docs for why `rq sync` itself never creates workspaces.
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use cursive::event::Key;
 use cursive::traits::*;
-use cursive::views::{LinearLayout, SelectView, TextView};
+use cursive::views::{Dialog, LinearLayout, SelectView, TextView};
 use cursive::{Cursive, CursiveExt};
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::paths::Paths;
+use crate::repo::{NeedsClone, OnMissing};
 use crate::source::ReviewSource;
 use crate::state::{ReviewEntry, ReviewKey, State};
 use crate::sync;
@@ -20,6 +23,7 @@ const HELP: &str = "↑/↓ move   enter open in browser   f fetch locally   r r
 struct Ctx {
     paths: Paths,
     config: Config,
+    config_path: PathBuf,
     sources: Vec<Box<dyn ReviewSource>>,
     handle: tokio::runtime::Handle,
     all: bool,
@@ -32,6 +36,7 @@ struct Ctx {
 pub fn run(
     paths: Paths,
     config: Config,
+    config_path: PathBuf,
     sources: Vec<Box<dyn ReviewSource>>,
     all: bool,
 ) -> Result<()> {
@@ -46,6 +51,7 @@ pub fn run(
     siv.set_user_data(Ctx {
         paths,
         config,
+        config_path,
         sources,
         handle: tokio::runtime::Handle::current(),
         all,
@@ -173,7 +179,20 @@ fn fetch_selected(s: &mut Cursive) {
     let Some(key) = selected_key(s) else {
         return;
     };
+    let on_missing = s
+        .user_data::<Ctx>()
+        .map(|ctx| {
+            if ctx.config.auto_clone {
+                OnMissing::Clone
+            } else {
+                OnMissing::Ask
+            }
+        })
+        .unwrap_or(OnMissing::Ask);
+    do_fetch(s, key, on_missing);
+}
 
+fn do_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
     let outcome = s.user_data::<Ctx>().map(|ctx| {
         tokio::task::block_in_place(|| {
             ctx.handle.clone().block_on(sync::fetch_local(
@@ -181,6 +200,7 @@ fn fetch_selected(s: &mut Cursive) {
                 &ctx.paths,
                 &ctx.config,
                 &key,
+                on_missing,
             ))
         })
     });
@@ -192,12 +212,51 @@ fn fetch_selected(s: &mut Cursive) {
             set_status(s, format!("fetched {key} -> {}", path.display()));
             reload(s);
         }
-        Some(Err(e)) => {
-            set_status(s, format!("error fetching {key}: {e:#}"));
-            reload(s);
-        }
+        Some(Err(e)) => match e.downcast::<NeedsClone>() {
+            Ok(needs_clone) => prompt_clone(s, key, needs_clone.url, needs_clone.dest),
+            Err(e) => {
+                set_status(s, format!("error fetching {key}: {e:#}"));
+                reload(s);
+            }
+        },
         None => {}
     }
+}
+
+/// Raw stdin can't be read while cursive owns the screen, so the CLI's `Y/n/always` prompt
+/// becomes a dialog here instead.
+fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf) {
+    let yes_key = key.clone();
+    let always_key = key.clone();
+    let dialog = Dialog::text(format!(
+        "No local checkout of `{url}` found.\nClone into {}?",
+        dest.display()
+    ))
+    .title("Clone repo?")
+    .button("No", |s| {
+        s.pop_layer();
+        set_status(s, "skipped - not cloned");
+    })
+    .button("Yes", move |s| {
+        s.pop_layer();
+        do_fetch(s, yes_key.clone(), OnMissing::Clone);
+    })
+    .button("Always", move |s| {
+        s.pop_layer();
+        let saved = s.user_data::<Ctx>().map(|ctx| {
+            let result = config::set_auto_clone(&ctx.config_path);
+            if result.is_ok() {
+                ctx.config.auto_clone = true;
+            }
+            result
+        });
+        if let Some(Err(e)) = saved {
+            set_status(s, format!("failed to save auto_clone: {e:#}"));
+            return;
+        }
+        do_fetch(s, always_key.clone(), OnMissing::Clone);
+    });
+    s.add_layer(dialog);
 }
 
 fn reload(s: &mut Cursive) {

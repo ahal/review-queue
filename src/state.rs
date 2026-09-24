@@ -58,7 +58,7 @@ pub enum Status {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     /// Canonical repo this workspace was created from (may be a tool-managed clone or a
-    /// user-owned `[[repo]]` path). Kept even if config later points elsewhere.
+    /// discovered workdir checkout). Kept even if a later scan points elsewhere.
     pub repo_path: PathBuf,
     pub vcs: VcsKind,
     pub workspace_path: PathBuf,

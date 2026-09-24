@@ -7,3 +7,4 @@ pub mod state;
 pub mod sync;
 pub mod tui;
 pub mod vcs;
+pub mod workdir;

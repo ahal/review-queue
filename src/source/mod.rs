@@ -34,8 +34,8 @@ pub enum ReviewKind {
 /// re-querying the source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoRef {
-    /// Candidate clone URLs (mirrors, ssh/https variants) - matched against config `[[repo]]`
-    /// entries and the tool-managed clone registry after normalization.
+    /// Candidate clone URLs (mirrors, ssh/https variants) - matched against discovered workdir
+    /// repos and the tool-managed clone registry after normalization.
     pub urls: Vec<String>,
     pub display_name: String,
 }

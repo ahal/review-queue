@@ -1,4 +1,4 @@
-//! `config.toml` schema: review sources and user-owned canonical repos.
+//! `config.toml` schema: review sources and where canonical repos live.
 
 use std::path::PathBuf;
 
@@ -9,11 +9,17 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     #[serde(default)]
     pub data_dir: Option<PathBuf>,
+    /// Directory rq scans for existing checkouts to use as canonical repos (see `crate::workdir`)
+    /// instead of cloning its own copy.
+    #[serde(default)]
+    pub workdir: Option<PathBuf>,
+    /// Clone into the data dir without asking, whenever a review's repo isn't found in
+    /// `workdir`. Set by answering "always" to the clone prompt (see `set_auto_clone`).
+    #[serde(default)]
+    pub auto_clone: bool,
 
     #[serde(rename = "source", default)]
     pub sources: Vec<SourceConfig>,
-    #[serde(rename = "repo", default)]
-    pub repos: Vec<RepoConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,19 +74,6 @@ pub struct GithubConfig {
     pub include_drafts: bool,
 }
 
-/// A user-owned canonical repo: an existing checkout the tool should create
-/// worktrees/workspaces from, rather than cloning its own copy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RepoConfig {
-    /// Clone URLs that all refer to this repo (origin, mirrors, etc). Matched after
-    /// normalization; see `crate::repo::normalize_url`.
-    pub urls: Vec<String>,
-    pub path: PathBuf,
-    /// Auto-detected from `path` (`.jj` wins over `.git`) when unset.
-    #[serde(default)]
-    pub vcs: Option<VcsKind>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VcsKind {
@@ -103,9 +96,7 @@ impl Config {
             toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
 
         config.data_dir = config.data_dir.map(|p| expand_tilde(&p));
-        for repo in &mut config.repos {
-            repo.path = expand_tilde(&repo.path);
-        }
+        config.workdir = config.workdir.map(|p| expand_tilde(&p));
         Ok(config)
     }
 }
@@ -122,6 +113,20 @@ fn expand_tilde(path: &std::path::Path) -> PathBuf {
     }
 }
 
+/// Record a "always clone without asking" answer to the clone prompt. Prepended (rather than
+/// appended, like nothing else in this file does) because `config.toml`'s `[[source]]` tables
+/// are unkeyed - appending a bare `key = value` after one would parse as belonging to it instead
+/// of to the top-level document.
+pub fn set_auto_clone(path: &std::path::Path) -> Result<()> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(path, format!("auto_clone = true\n{existing}"))
+        .with_context(|| format!("writing {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +134,8 @@ mod tests {
     #[test]
     fn parses_example_config() {
         let text = r#"
+workdir = "~/dev"
+
 [[source]]
 type = "moz-phab"
 name = "moz"
@@ -138,42 +145,31 @@ url = "https://phabricator.services.mozilla.com"
 type = "github"
 name = "github"
 ignore_repos = ["mozilla/some-noisy-repo"]
-
-[[repo]]
-urls = ["https://github.com/mozilla-firefox/firefox"]
-path = "~/dev/firefox"
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
         assert_eq!(cfg.sources.len(), 2);
         assert_eq!(cfg.sources[0].name(), "moz");
         assert_eq!(cfg.sources[1].name(), "github");
-        assert_eq!(cfg.repos.len(), 1);
-        assert_eq!(
-            cfg.repos[0].urls,
-            vec!["https://github.com/mozilla-firefox/firefox"]
-        );
-        assert!(cfg.repos[0].vcs.is_none());
+        assert_eq!(cfg.workdir, Some(PathBuf::from("~/dev")));
+        assert!(!cfg.auto_clone);
     }
 
     #[test]
     fn missing_file_is_empty_config() {
         let cfg = Config::load(std::path::Path::new("/nonexistent/config.toml")).unwrap();
         assert!(cfg.sources.is_empty());
-        assert!(cfg.repos.is_empty());
+        assert!(cfg.workdir.is_none());
     }
 
     #[test]
-    fn load_expands_tilde_in_repo_and_data_dir_paths() {
+    fn load_expands_tilde_in_data_dir_and_workdir_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let config_path = tmp.path().join("config.toml");
         std::fs::write(
             &config_path,
             r#"
 data_dir = "~/rq-data"
-
-[[repo]]
-urls = ["https://example.com/o/r"]
-path = "~/dev/firefox"
+workdir = "~/dev"
 "#,
         )
         .unwrap();
@@ -185,10 +181,41 @@ path = "~/dev/firefox"
             .to_path_buf();
 
         assert_eq!(cfg.data_dir, Some(home.join("rq-data")));
-        assert_eq!(cfg.repos[0].path, home.join("dev/firefox"));
+        assert_eq!(cfg.workdir, Some(home.join("dev")));
         assert!(
-            !cfg.repos[0].path.starts_with("~"),
+            !cfg.workdir.unwrap().starts_with("~"),
             "the literal `~` component must be gone"
         );
+    }
+
+    #[test]
+    fn set_auto_clone_prepends_and_survives_a_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[source]]
+type = "github"
+name = "gh"
+"#,
+        )
+        .unwrap();
+
+        set_auto_clone(&config_path).unwrap();
+
+        let cfg = Config::load(&config_path).unwrap();
+        assert!(cfg.auto_clone);
+        assert_eq!(cfg.sources.len(), 1, "existing sources must survive");
+    }
+
+    #[test]
+    fn set_auto_clone_creates_a_missing_config_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("nested").join("config.toml");
+
+        set_auto_clone(&config_path).unwrap();
+
+        assert!(Config::load(&config_path).unwrap().auto_clone);
     }
 }
