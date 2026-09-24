@@ -85,9 +85,9 @@
 //! e.g. a `central`/`try` naming scheme instead of `origin`) may need `git.remote` set in their
 //! own `~/.moz-phab-config`, which this tool doesn't configure on their behalf.
 //!
-//! Whether `moz-phab` itself is installed and runnable is left to `rq doctor` (not yet built),
-//! not `check_auth` here - `check_auth`'s job is verifying Conduit credentials, and testing this
-//! module shouldn't require `moz-phab` to be on `PATH`.
+//! Whether `moz-phab` itself is installed and runnable is never checked by this module - only
+//! `checkout_spec`'s `ExternalCommand` actually shells out to it, and testing this module
+//! shouldn't require `moz-phab` to be on `PATH`.
 //!
 //! `fetch_status`: `differential.revision.search {constraints:{ids:[...]}}`. `status.value` of
 //! `published` (landed) or `abandoned` is `Lifecycle::Resolved`; a revision id not found in the
@@ -553,10 +553,6 @@ impl ReviewSource for MozPhabSource {
         Ok(out)
     }
 
-    async fn check_auth(&self) -> Result<String> {
-        let who: WhoAmI = self.call("user.whoami", json!({})).await?;
-        Ok(who.user_name)
-    }
 }
 
 fn is_closed(status: &str) -> bool {
@@ -724,11 +720,9 @@ struct SearchCursor {
     after: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct WhoAmI {
     phid: String,
-    #[serde(rename = "userName")]
-    user_name: String,
 }
 
 #[derive(Deserialize)]
@@ -1043,22 +1037,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_auth_returns_username() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/user.whoami"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(call_response(json!({"phid": ME, "userName": "ahal"}))),
-            )
-            .mount(&server)
-            .await;
-
-        let src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
-        assert_eq!(src.check_auth().await.unwrap(), "ahal");
-    }
-
-    #[tokio::test]
     async fn call_surfaces_conduit_errors() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1070,7 +1048,10 @@ mod tests {
             .await;
 
         let src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
-        let err = src.check_auth().await.unwrap_err();
+        let err = src
+            .call::<WhoAmI>("user.whoami", json!({}))
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("ERR-INVALID-AUTH"),
             "unexpected error: {err}"

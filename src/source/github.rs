@@ -238,16 +238,6 @@ impl ReviewSource for GithubSource {
         Ok(out)
     }
 
-    async fn check_auth(&self) -> Result<String> {
-        if self.token.is_none() {
-            bail!("GitHub source `{}` has no token configured", self.cfg.name);
-        }
-        let user: GhUser = self
-            .get_json("/user", &[])
-            .await
-            .context("checking GitHub auth (GET /user)")?;
-        Ok(user.login)
-    }
 }
 
 /// `token`, then `token_cmd`, then `$GITHUB_TOKEN`, then `gh auth token`.
@@ -736,19 +726,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn check_auth_returns_login() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/user"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"login": "ahal"})),
-            )
-            .mount(&server)
-            .await;
-
-        let src =
-            GithubSource::for_test(cfg("gh"), Some("t".into()), server.uri(), SEARCH_PER_PAGE);
-        assert_eq!(src.check_auth().await.unwrap(), "ahal");
-    }
 }

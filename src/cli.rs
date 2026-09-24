@@ -51,8 +51,6 @@ pub enum Command {
         /// A review id, or unique prefix of one (e.g. "D123" or "moz/D123").
         id: String,
     },
-    /// Check auth and tool availability for each configured source.
-    Doctor,
     /// Manage canonical repos (discovered by scanning `workdir`, or tool-managed clones).
     Repo {
         #[command(subcommand)]

@@ -126,7 +126,4 @@ pub trait ReviewSource: Send + Sync {
     /// Refresh the lifecycle of reviews that are no longer in the queue (e.g. changes were
     /// requested, or the reviewer was removed) so `sync` knows whether to keep the workspace.
     async fn fetch_status(&self, ids: &[String]) -> Result<Vec<(String, Lifecycle)>>;
-
-    /// Verify credentials and return the authenticated username, for `rq doctor`.
-    async fn check_auth(&self) -> Result<String>;
 }

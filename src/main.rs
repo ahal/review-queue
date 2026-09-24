@@ -35,7 +35,6 @@ async fn main() -> Result<()> {
         Command::Sync { source, dry_run } => {
             sync_cmd(&paths, &config, source.as_deref(), dry_run).await
         }
-        Command::Doctor => doctor_cmd(&paths, &config_path, &config).await,
         Command::Repo { command } => match command {
             RepoCommand::List => repo_list_cmd(&paths, &config),
             RepoCommand::Rm { url } => repo_rm_cmd(&paths, &config, &url),
@@ -176,69 +175,6 @@ fn resolve_key(paths: &Paths, id: &str) -> Result<ReviewKey> {
             bail!("`{id}` matches multiple reviews: {}", keys.join(", "))
         }
     }
-}
-
-async fn doctor_cmd(paths: &Paths, config_path: &Path, config: &Config) -> Result<()> {
-    let mut ok = true;
-
-    println!("config: {}", config_path.display());
-    println!("data dir: {}", paths.data_dir().display());
-    match &config.workdir {
-        Some(w) => println!("workdir: {}", w.display()),
-        None => println!("workdir: not set"),
-    }
-    println!();
-
-    for tool in ["git", "jj"] {
-        match std::process::Command::new(tool).arg("--version").output() {
-            Ok(o) if o.status.success() => println!("✓ {tool} is available"),
-            _ => {
-                println!("✗ {tool} not found on PATH");
-                ok = false;
-            }
-        }
-    }
-
-    let needs_moz_phab = config
-        .sources
-        .iter()
-        .any(|s| matches!(s, SourceConfig::MozPhab(_)));
-    match std::process::Command::new("moz-phab")
-        .arg("version")
-        .output()
-    {
-        Ok(o) if o.status.success() => println!("✓ moz-phab is available"),
-        _ if needs_moz_phab => {
-            println!("✗ moz-phab not found on PATH (required by your configured moz-phab source)");
-            ok = false;
-        }
-        _ => println!("- moz-phab not found on PATH (fine - no moz-phab source configured)"),
-    }
-    println!();
-
-    if config.sources.is_empty() {
-        println!("✗ no sources configured in {}", config_path.display());
-        ok = false;
-    }
-    for sc in &config.sources {
-        let name = sc.name();
-        let auth_result = match sc {
-            SourceConfig::Github(cfg) => GithubSource::new(cfg.clone()).await?.check_auth().await,
-            SourceConfig::MozPhab(cfg) => MozPhabSource::new(cfg.clone()).await?.check_auth().await,
-        };
-        match auth_result {
-            Ok(username) => println!("✓ {name}: authenticated as {username}"),
-            Err(e) => {
-                println!("✗ {name}: {e}");
-                ok = false;
-            }
-        }
-    }
-
-    if !ok {
-        std::process::exit(1);
-    }
-    Ok(())
 }
 
 fn repo_list_cmd(paths: &Paths, config: &Config) -> Result<()> {
