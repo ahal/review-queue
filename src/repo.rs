@@ -671,6 +671,7 @@ mod tests {
                 head_id: "abc".into(),
                 status: crate::state::Status::Ready,
             }),
+            diff_stat: None,
         }
     }
 

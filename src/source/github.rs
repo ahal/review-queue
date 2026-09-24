@@ -13,6 +13,14 @@
 //! /repos/{owner}/{repo}/pulls/{number}` for `head.sha`, `head.ref`, `head.repo.clone_url`,
 //! `head.repo.owner.login`, and `base.repo.clone_url`.
 //!
+//! Diffstat: `review_from_pull` also fetches (paginated) `GET
+//! /repos/{owner}/{repo}/pulls/{number}/files` for the per-file `filename`/`additions`/
+//! `deletions` breakdown - one extra request per review, paid during `rq sync` rather than by
+//! `rq list`'s TUI. If that call fails (rate limit, permissions), it falls back to the
+//! aggregate-only `additions`/`deletions`/`changed_files` already on the pull object fetched
+//! above (present only on the single-PR fetch, not the search results) rather than showing no
+//! diffstat at all.
+//!
 //! Checkout is `Checkout::Ref { refspec: "refs/pull/{n}/head", commit: head.sha, fork }`.
 //! `refspec` is fetched from the base repo (GitHub exposes `refs/pull/N/head` there for any PR),
 //! so the git backend never needs a remote for the fork. `fork` is `Some(ForkRef { remote_name:
@@ -33,12 +41,16 @@ use serde::Deserialize;
 
 use crate::config::GithubConfig;
 use crate::repo::normalize_url;
+use crate::source::diffstat::{FileChange, format_diffstat, format_summary};
 use crate::source::{
     Checkout, ForkRef, Lifecycle, RepoRef, Review, ReviewKey, ReviewKind, ReviewSource,
 };
 
 const DEFAULT_API_BASE: &str = "https://api.github.com";
 const SEARCH_PER_PAGE: u32 = 100;
+/// GitHub caps a PR's file list at 3000 entries across pages; 100/page keeps this well under
+/// the pagination loop's own 30-page ceiling even at that cap.
+const FILES_PER_PAGE: u32 = 100;
 
 /// This source's hardcoded id-namespace prefix - see [`crate::state::ReviewKey`].
 pub const NAME: &str = "gh";
@@ -132,8 +144,14 @@ impl GithubSource {
             .await
     }
 
-    fn review_from_pull(&self, owner: &str, repo: &str, pr: &PullRequest) -> Result<Review> {
+    async fn review_from_pull(&self, owner: &str, repo: &str, pr: &PullRequest) -> Result<Review> {
         let base_repo = pr.base.repo.as_ref().context("PR has no base repo")?;
+        let diff_stat = match self.file_changes_for(owner, repo, pr.number).await {
+            Ok(changes) => format_diffstat(&changes),
+            // Fall back to the aggregate-only counts already on `pr` (present only on the
+            // single-PR fetch, not the search results) rather than showing no diffstat at all.
+            Err(_) => format_summary(pr.changed_files, pr.additions, pr.deletions),
+        };
         Ok(Review {
             key: ReviewKey::new(NAME, format!("{owner}/{repo}/{}", pr.number)),
             title: pr.title.clone(),
@@ -145,7 +163,41 @@ impl GithubSource {
             },
             version: pr.head.sha.clone(),
             kind: ReviewKind::Direct,
+            diff_stat: Some(diff_stat),
         })
+    }
+
+    /// Per-file `filename`/`additions`/`deletions`, paginating `GET
+    /// /repos/{owner}/{repo}/pulls/{number}/files`.
+    async fn file_changes_for(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<FileChange>> {
+        let mut changes = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let per_page_str = FILES_PER_PAGE.to_string();
+            let page_str = page.to_string();
+            let files: Vec<PullFile> = self
+                .get_json(
+                    &format!("/repos/{owner}/{repo}/pulls/{number}/files"),
+                    &[("per_page", &per_page_str), ("page", &page_str)],
+                )
+                .await?;
+            let count = files.len();
+            changes.extend(files.into_iter().map(|f| FileChange {
+                path: f.filename,
+                additions: f.additions,
+                deletions: f.deletions,
+            }));
+            if count < FILES_PER_PAGE as usize || page >= 30 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(changes)
     }
 
     fn fork_of(&self, pr: &PullRequest) -> Result<Option<ForkRef>> {
@@ -197,7 +249,7 @@ impl ReviewSource for GithubSource {
             for item in &resp.items {
                 let (owner, repo, number) = parse_pr_url(&item.html_url)?;
                 let pr = self.fetch_pull(&owner, &repo, number).await?;
-                reviews.push(self.review_from_pull(&owner, &repo, &pr)?);
+                reviews.push(self.review_from_pull(&owner, &repo, &pr).await?);
             }
             if count < self.search_per_page as usize || page >= 10 {
                 break;
@@ -337,6 +389,11 @@ struct PullRequest {
     user: GhUser,
     head: PrSide,
     base: PrSide,
+    /// Only present on the single-PR fetch (`GET .../pulls/{number}`), not the search results -
+    /// see `review_from_pull`.
+    additions: u64,
+    deletions: u64,
+    changed_files: u64,
 }
 
 #[derive(Deserialize)]
@@ -357,6 +414,13 @@ struct GhRepo {
     clone_url: String,
     full_name: String,
     owner: GhUser,
+}
+
+#[derive(Deserialize)]
+struct PullFile {
+    filename: String,
+    additions: u64,
+    deletions: u64,
 }
 
 #[cfg(test)]
@@ -403,6 +467,9 @@ mod tests {
                 "full_name": format!("{owner}/{repo}"),
                 "owner": {"login": owner},
             }},
+            "additions": 3,
+            "deletions": 1,
+            "changed_files": 2,
         })
     }
 
@@ -483,6 +550,68 @@ mod tests {
         assert_eq!(
             r.repo.urls,
             vec!["https://github.com/mozilla/gecko-dev.git"]
+        );
+        // `/files` isn't mocked in this test, so this exercises the fallback path - it happens to
+        // match `pull_json`'s aggregate fields exactly, which is what
+        // `diff_stat_falls_back_to_the_aggregate_when_the_files_endpoint_fails` asserts on
+        // directly; `diff_stat_prefers_the_full_per_file_breakdown` covers the primary path.
+        assert_eq!(
+            r.diff_stat.as_deref(),
+            Some("2 files changed, 3 insertions(+), 1 deletion(-)")
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_stat_prefers_the_full_per_file_breakdown() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/mozilla/gecko-dev/pulls/123/files"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"filename": "src/main.rs", "additions": 5, "deletions": 2},
+            ])))
+            .mount(&server)
+            .await;
+
+        let src = GithubSource::for_test(cfg(), Some("t".into()), server.uri(), SEARCH_PER_PAGE);
+        let review = src
+            .review_from_pull(
+                "mozilla",
+                "gecko-dev",
+                &serde_json::from_value(pull_json("mozilla", "gecko-dev", 123, None)).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let stat = review.diff_stat.unwrap();
+        assert!(stat.contains("src/main.rs"));
+        // Differs from `pull_json`'s aggregate fields (2 files/3+/1-) - proves this came from
+        // `/files`, not the fallback.
+        assert!(stat.ends_with("1 file changed, 5 insertions(+), 2 deletions(-)"));
+    }
+
+    #[tokio::test]
+    async fn diff_stat_falls_back_to_the_aggregate_when_the_files_endpoint_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/mozilla/gecko-dev/pulls/123/files"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let src = GithubSource::for_test(cfg(), Some("t".into()), server.uri(), SEARCH_PER_PAGE);
+        let review = src
+            .review_from_pull(
+                "mozilla",
+                "gecko-dev",
+                &serde_json::from_value(pull_json("mozilla", "gecko-dev", 123, None)).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            review.diff_stat.as_deref(),
+            Some("2 files changed, 3 insertions(+), 1 deletion(-)")
         );
     }
 
@@ -566,6 +695,7 @@ mod tests {
             },
             version: "deadbeef".into(),
             kind: ReviewKind::Direct,
+            diff_stat: None,
         };
         let checkout = src
             .checkout_spec(&review, std::path::Path::new("/tmp/unused"))
@@ -614,6 +744,7 @@ mod tests {
             },
             version: "deadbeef".into(),
             kind: ReviewKind::Direct,
+            diff_stat: None,
         };
         let Checkout::Ref { fork, .. } = src
             .checkout_spec(&review, std::path::Path::new("/tmp/unused"))
@@ -651,6 +782,7 @@ mod tests {
             },
             version: "deadbeef".into(),
             kind: ReviewKind::Direct,
+            diff_stat: None,
         };
         let Checkout::Ref { fork, .. } = src
             .checkout_spec(&review, std::path::Path::new("/tmp/unused"))
@@ -711,4 +843,5 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
 }

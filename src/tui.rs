@@ -1,14 +1,20 @@
 //! `rq list`'s interactive TUI: a `cursive` (crossterm backend) `SelectView` of tracked reviews.
-//! Up/down (built into `SelectView`) moves the cursor, enter opens the review in a browser, `f`
-//! fetches it locally on demand - the same `sync::fetch_local` a plain `rq fetch <id>` runs. See
-//! `crate::sync`'s module docs for why `rq sync` itself never creates workspaces.
+//! Up/down and `j`/`k` move the cursor between *reviews*, skipping over an expanded review's
+//! diffstat lines rather than stepping into them (see `move_selection`) - arrow keys are
+//! intercepted via an `OnEventView` since `SelectView`'s own built-in handling would otherwise
+//! land on those lines like any other row. Enter expands/collapses the selected review's diffstat
+//! (fetched by `rq sync` and read straight out of `state.json` - no network calls here), `b`
+//! opens it in a browser, `f` fetches it locally on demand - the same `sync::fetch_local` a plain
+//! `rq fetch <id>` runs. See `crate::sync`'s module docs for why `rq sync` itself never creates
+//! workspaces.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use cursive::event::Key;
 use cursive::traits::*;
-use cursive::views::{Dialog, LinearLayout, SelectView, TextView};
+use cursive::views::{Dialog, LinearLayout, OnEventView, SelectView, TextView};
 use cursive::{Cursive, CursiveExt};
 
 use crate::config::{self, Config};
@@ -18,7 +24,7 @@ use crate::source::ReviewSource;
 use crate::state::{ReviewEntry, ReviewKey, State};
 use crate::sync;
 
-const HELP: &str = "↑/↓ move   enter open in browser   f fetch locally   r reload   q quit";
+const HELP: &str = "↑/↓ move   enter expand/collapse   b open in browser   f fetch locally   r reload   q quit";
 
 struct Ctx {
     paths: Paths,
@@ -29,6 +35,25 @@ struct Ctx {
     all: bool,
     key_w: usize,
     author_w: usize,
+    /// Reviews currently expanded to show their diffstat - any number at once, independently.
+    expanded: BTreeSet<ReviewKey>,
+}
+
+/// A row in the `reviews` `SelectView`: either a review itself, or one of the diffstat lines
+/// shown underneath it while expanded. Both carry the owning review's key so `b`/fetch/collapse
+/// act on the right review regardless of which line the cursor happens to sit on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Row {
+    Entry(ReviewKey),
+    Detail(ReviewKey),
+}
+
+impl Row {
+    fn key(&self) -> &ReviewKey {
+        match self {
+            Row::Entry(k) | Row::Detail(k) => k,
+        }
+    }
 }
 
 /// Run the TUI until the user quits. Blocks the current thread; call from within a Tokio runtime
@@ -57,27 +82,37 @@ pub fn run(
         all,
         key_w,
         author_w,
+        expanded: BTreeSet::new(),
     });
 
-    let mut select = SelectView::<ReviewKey>::new();
-    for e in &entries {
-        select.add_item(row_label(e, key_w, author_w), e.key.clone());
+    let mut select = SelectView::<Row>::new();
+    for (label, row) in build_rows(&entries, key_w, author_w, &BTreeSet::new()) {
+        select.add_item(label, row);
     }
-    select.set_on_submit(open_in_browser);
+    select.set_on_submit(|s, row: &Row| toggle_expand(s, row.key()));
+
+    // `OnEventView` intercepts the arrow keys before `SelectView`'s own built-in handling sees
+    // them, so they go through `move_selection` too instead of stopping on a diffstat line.
+    let select = OnEventView::new(select.with_name("reviews"))
+        .on_event(Key::Down, |s| move_selection(s, true))
+        .on_event(Key::Up, |s| move_selection(s, false));
 
     let layout = LinearLayout::vertical()
         .child(TextView::new(header_line(key_w, author_w)))
-        .child(select.with_name("reviews").scrollable().full_height())
+        .child(select.scrollable().full_height())
         .child(TextView::new("").with_name("status"))
         .child(TextView::new(HELP));
     siv.add_fullscreen_layer(layout);
 
     siv.add_global_callback('q', |s| s.quit());
     siv.add_global_callback(Key::Esc, |s| s.quit());
+    siv.add_global_callback('b', open_in_browser_selected);
     siv.add_global_callback('f', fetch_selected);
     siv.add_global_callback('r', reload);
     siv.add_global_callback('j', |s| move_selection(s, true));
     siv.add_global_callback('k', |s| move_selection(s, false));
+    siv.add_global_callback('l', |s| set_expanded(s, true));
+    siv.add_global_callback('h', |s| set_expanded(s, false));
 
     siv.run();
     Ok(())
@@ -119,12 +154,13 @@ fn truncate(s: &str, width: usize) -> String {
 
 fn header_line(key_w: usize, author_w: usize) -> String {
     format!(
-        "{:<key_w$}  {:<3}  {:<9}  {:<author_w$}  TITLE",
+        "  {:<key_w$}  {:<3}  {:<9}  {:<author_w$}  TITLE",
         "KEY", "GOT", "STATUS", "AUTHOR"
     )
 }
 
-fn row_label(e: &ReviewEntry, key_w: usize, author_w: usize) -> String {
+fn row_label(e: &ReviewEntry, key_w: usize, author_w: usize, expanded: bool) -> String {
+    let marker = if expanded { '\u{25be}' } else { '\u{25b8}' };
     let fetched = if e.workspace.is_some() { "yes" } else { "no" };
     let status = match &e.workspace {
         Some(ws) => format!("{:?}", ws.status),
@@ -133,31 +169,104 @@ fn row_label(e: &ReviewEntry, key_w: usize, author_w: usize) -> String {
         None => "waiting".to_string(),
     };
     format!(
-        "{:<key_w$}  {fetched:<3}  {status:<9}  {}  {}",
+        "{marker} {:<key_w$}  {fetched:<3}  {status:<9}  {}  {}",
         e.key.slug(),
         truncate(&e.author, author_w),
         e.title,
     )
 }
 
+/// The diffstat lines shown under an expanded review - `rq sync` fetches this from the review's
+/// source and stores it on the `ReviewEntry`, so this is a plain read with no network call.
+fn detail_lines(e: &ReviewEntry) -> Vec<String> {
+    match &e.diff_stat {
+        None => vec!["      (no diffstat - run `rq sync`)".to_string()],
+        Some(stat) if stat.trim().is_empty() => vec!["      (no changes)".to_string()],
+        Some(stat) => stat.lines().map(|l| format!("      {l}")).collect(),
+    }
+}
+
+fn build_rows(
+    entries: &[ReviewEntry],
+    key_w: usize,
+    author_w: usize,
+    expanded: &BTreeSet<ReviewKey>,
+) -> Vec<(String, Row)> {
+    let mut rows = Vec::new();
+    for e in entries {
+        let is_expanded = expanded.contains(&e.key);
+        rows.push((
+            row_label(e, key_w, author_w, is_expanded),
+            Row::Entry(e.key.clone()),
+        ));
+        if is_expanded {
+            for line in detail_lines(e) {
+                rows.push((line, Row::Detail(e.key.clone())));
+            }
+        }
+    }
+    rows
+}
+
 fn set_status(s: &mut Cursive, msg: impl Into<String>) {
     s.call_on_name("status", |v: &mut TextView| v.set_content(msg.into()));
 }
 
+/// Moves to the next/previous review, skipping over any diffstat detail lines in between so the
+/// cursor only ever lands on a `Row::Entry` - backs both the arrow keys and `j`/`k`.
 fn move_selection(s: &mut Cursive, down: bool) {
-    s.call_on_name("reviews", |v: &mut SelectView<ReviewKey>| {
-        let _ = if down {
-            v.select_down(1)
-        } else {
-            v.select_up(1)
-        };
+    s.call_on_name("reviews", |v: &mut SelectView<Row>| {
+        loop {
+            let before = v.selected_id();
+            let _ = if down { v.select_down(1) } else { v.select_up(1) };
+            if v.selected_id() == before {
+                break; // hit the top/bottom of the list; nowhere left to go
+            }
+            if !matches!(v.selection().as_deref(), Some(Row::Detail(_))) {
+                break;
+            }
+        }
     });
 }
 
 fn selected_key(s: &mut Cursive) -> Option<ReviewKey> {
-    s.call_on_name("reviews", |v: &mut SelectView<ReviewKey>| v.selection())
+    s.call_on_name("reviews", |v: &mut SelectView<Row>| v.selection())
         .flatten()
-        .map(|k| (*k).clone())
+        .map(|row| row.key().clone())
+}
+
+/// Toggle whether `key`'s review is expanded (showing its diffstat) and reload the list to match.
+/// Independent of every other review's expanded state - expanding one never collapses another.
+fn toggle_expand(s: &mut Cursive, key: &ReviewKey) {
+    if let Some(ctx) = s.user_data::<Ctx>()
+        && !ctx.expanded.remove(key)
+    {
+        ctx.expanded.insert(key.clone());
+    }
+    reload(s);
+}
+
+/// `set_expanded(s, true/false)` backs the `l`/`h` vim-style bindings - unlike enter's toggle,
+/// these are directional, so repeating one is idempotent instead of flipping back and forth.
+fn set_expanded(s: &mut Cursive, expand: bool) {
+    let Some(key) = selected_key(s) else {
+        return;
+    };
+    if let Some(ctx) = s.user_data::<Ctx>() {
+        if expand {
+            ctx.expanded.insert(key);
+        } else {
+            ctx.expanded.remove(&key);
+        }
+    }
+    reload(s);
+}
+
+fn open_in_browser_selected(s: &mut Cursive) {
+    let Some(key) = selected_key(s) else {
+        return;
+    };
+    open_in_browser(s, &key);
 }
 
 fn open_in_browser(s: &mut Cursive, key: &ReviewKey) {
@@ -260,10 +369,15 @@ fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf) {
 }
 
 fn reload(s: &mut Cursive) {
-    let loaded = s
-        .user_data::<Ctx>()
-        .map(|ctx| (load_rows(&ctx.paths, ctx.all), ctx.key_w, ctx.author_w));
-    let Some((loaded, key_w, author_w)) = loaded else {
+    let loaded = s.user_data::<Ctx>().map(|ctx| {
+        (
+            load_rows(&ctx.paths, ctx.all),
+            ctx.key_w,
+            ctx.author_w,
+            ctx.expanded.clone(),
+        )
+    });
+    let Some((loaded, key_w, author_w, expanded)) = loaded else {
         return;
     };
     let entries = match loaded {
@@ -274,16 +388,283 @@ fn reload(s: &mut Cursive) {
         }
     };
 
-    s.call_on_name("reviews", |v: &mut SelectView<ReviewKey>| {
-        let selected = v.selection();
+    s.call_on_name("reviews", |v: &mut SelectView<Row>| {
+        let selected = v.selection().map(|row| row.key().clone());
         v.clear();
-        for e in &entries {
-            v.add_item(row_label(e, key_w, author_w), e.key.clone());
+        for (label, row) in build_rows(&entries, key_w, author_w, &expanded) {
+            v.add_item(label, row);
         }
         if let Some(selected) = selected
-            && let Some(idx) = entries.iter().position(|e| e.key == *selected)
+            && let Some(idx) = (0..v.len())
+                .find(|&i| v.get_item(i).is_some_and(|(_, row)| *row.key() == selected))
         {
             v.set_selection(idx);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::{RepoRef, ReviewKind};
+
+    fn entry(id: &str, diff_stat: Option<&str>) -> ReviewEntry {
+        ReviewEntry {
+            key: ReviewKey::new("moz", id),
+            title: "Fix the thing".into(),
+            author: "someone".into(),
+            url: format!("https://example.com/{id}"),
+            repo: RepoRef {
+                urls: vec!["https://example.com/o/r".into()],
+                display_name: "o/r".into(),
+            },
+            kind: ReviewKind::Direct,
+            version: "1".into(),
+            in_queue: true,
+            resolved: false,
+            last_synced: chrono::Utc::now(),
+            workspace: None,
+            diff_stat: diff_stat.map(String::from),
+        }
+    }
+
+    #[test]
+    fn collapsed_entries_produce_one_row_each() {
+        let entries = vec![entry("D1", None), entry("D2", None)];
+        let rows = build_rows(&entries, 5, 6, &BTreeSet::new());
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(&rows[0].1, Row::Entry(k) if k.id == "D1"));
+        assert!(matches!(&rows[1].1, Row::Entry(k) if k.id == "D2"));
+    }
+
+    #[test]
+    fn expanding_a_review_inserts_detail_rows_owned_by_its_key() {
+        let entries = vec![
+            entry("D1", Some("a.rs | 1 +\nb.rs | 2 ++")),
+            entry("D2", None),
+        ];
+        let expanded = ReviewKey::new("moz", "D1");
+        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([expanded.clone()]));
+
+        // D1's entry row, its two detail lines, then D2's entry row.
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(&rows[0].1, Row::Entry(k) if *k == expanded));
+        for (_, row) in &rows[1..3] {
+            assert_eq!(row, &Row::Detail(expanded.clone()));
+        }
+        assert!(matches!(&rows[3].1, Row::Entry(k) if k.id == "D2"));
+    }
+
+    #[test]
+    fn multiple_reviews_can_be_expanded_at_once() {
+        let entries = vec![
+            entry("D1", Some("a.rs | 1 +")),
+            entry("D2", Some("b.rs | 2 ++")),
+        ];
+        let d1 = ReviewKey::new("moz", "D1");
+        let d2 = ReviewKey::new("moz", "D2");
+        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([d1.clone(), d2.clone()]));
+
+        // D1's entry + its detail line, then D2's entry + its detail line - expanding D2 must
+        // not have collapsed D1.
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(&rows[0].1, Row::Entry(k) if *k == d1));
+        assert_eq!(rows[1].1, Row::Detail(d1));
+        assert!(matches!(&rows[2].1, Row::Entry(k) if *k == d2));
+        assert_eq!(rows[3].1, Row::Detail(d2));
+    }
+
+    #[tokio::test]
+    async fn toggle_expand_only_collapses_the_review_it_targets() {
+        let mut siv = cursive::dummy();
+        siv.set_user_data(Ctx {
+            paths: crate::paths::Paths::discover().unwrap(),
+            config: Config::default(),
+            config_path: PathBuf::new(),
+            sources: Vec::new(),
+            handle: tokio::runtime::Handle::current(),
+            all: true,
+            key_w: 5,
+            author_w: 6,
+            expanded: BTreeSet::from([ReviewKey::new("moz", "D1")]),
+        });
+
+        toggle_expand(&mut siv, &ReviewKey::new("moz", "D2"));
+
+        let ctx = siv.user_data::<Ctx>().unwrap();
+        assert_eq!(
+            ctx.expanded,
+            BTreeSet::from([ReviewKey::new("moz", "D1"), ReviewKey::new("moz", "D2")]),
+            "expanding D2 must not collapse the already-expanded D1"
+        );
+
+        toggle_expand(&mut siv, &ReviewKey::new("moz", "D1"));
+
+        let ctx = siv.user_data::<Ctx>().unwrap();
+        assert_eq!(
+            ctx.expanded,
+            BTreeSet::from([ReviewKey::new("moz", "D2")]),
+            "collapsing D1 must not touch D2"
+        );
+    }
+
+    #[test]
+    fn detail_lines_with_no_diff_stat_say_to_run_sync() {
+        let e = entry("D1", None);
+        let lines = detail_lines(&e);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("run `rq sync`"));
+    }
+
+    #[test]
+    fn detail_lines_with_an_empty_diff_stat_say_no_changes() {
+        let e = entry("D1", Some(""));
+        let lines = detail_lines(&e);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("no changes"));
+    }
+
+    #[test]
+    fn detail_lines_render_each_line_of_the_stored_diff_stat() {
+        let e = entry(
+            "D1",
+            Some("a.rs | 1 +\nb.rs | 2 ++\n2 files changed, 3 insertions(+)"),
+        );
+        let lines = detail_lines(&e);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("a.rs | 1 +"));
+        assert!(lines[1].contains("b.rs | 2 ++"));
+        assert!(lines[2].contains("2 files changed"));
+    }
+
+    fn selected_row(siv: &mut Cursive) -> Row {
+        (*siv
+            .call_on_name("reviews", |v: &mut SelectView<Row>| v.selection())
+            .flatten()
+            .unwrap())
+        .clone()
+    }
+
+    #[test]
+    fn move_selection_skips_detail_rows_in_both_directions() {
+        let mut siv = cursive::dummy();
+        let entries = vec![
+            entry("D1", Some("a.rs | 1 +\nb.rs | 2 ++")),
+            entry("D2", None),
+        ];
+        let mut select = SelectView::<Row>::new();
+        let expanded = ReviewKey::new("moz", "D1");
+        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded])) {
+            select.add_item(label, row);
+        }
+        siv.add_layer(select.with_name("reviews"));
+
+        // Starts on D1's entry row; moving down must skip both of its detail lines and land
+        // directly on D2, not stop partway through the diffstat.
+        move_selection(&mut siv, true);
+        assert!(matches!(selected_row(&mut siv), Row::Entry(k) if k.id == "D2"));
+
+        // And back up, skipping the same detail lines in the other direction.
+        move_selection(&mut siv, false);
+        assert!(matches!(selected_row(&mut siv), Row::Entry(k) if k.id == "D1"));
+    }
+
+    #[test]
+    fn move_selection_stops_at_the_last_row_even_if_it_is_a_detail_line() {
+        let mut siv = cursive::dummy();
+        let entries = vec![entry("D1", Some("a.rs | 1 +"))];
+        let mut select = SelectView::<Row>::new();
+        let expanded = ReviewKey::new("moz", "D1");
+        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded])) {
+            select.add_item(label, row);
+        }
+        siv.add_layer(select.with_name("reviews"));
+
+        move_selection(&mut siv, true); // land on the one detail row
+        assert!(matches!(selected_row(&mut siv), Row::Detail(_)));
+
+        // No review below it to skip forward to - must not hang looping at the boundary.
+        move_selection(&mut siv, true);
+        assert!(matches!(selected_row(&mut siv), Row::Detail(_)));
+    }
+
+    /// A `Ctx` whose `paths` point at a fresh tempdir seeded with `entries` in `state.json`, so
+    /// `reload` (which `set_expanded`/`toggle_expand` both call) has real, stable rows to rebuild
+    /// the `reviews` view from instead of reading whatever's on the real machine's disk.
+    fn ctx_with_state(tmp: &std::path::Path, entries: Vec<ReviewEntry>) -> Ctx {
+        let paths = crate::paths::Paths::discover()
+            .unwrap()
+            .with_overrides(Some(tmp.join("data")));
+        let mut state = crate::state::State::default();
+        for e in entries {
+            state.insert(e);
+        }
+        state.save(&paths.state_file()).unwrap();
+        Ctx {
+            paths,
+            config: Config::default(),
+            config_path: PathBuf::new(),
+            sources: Vec::new(),
+            handle: tokio::runtime::Handle::current(),
+            all: true,
+            key_w: 5,
+            author_w: 6,
+            expanded: BTreeSet::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_expanded_is_directional_not_a_toggle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut siv = cursive::dummy();
+        siv.set_user_data(ctx_with_state(tmp.path(), vec![entry("D1", None)]));
+        let mut select = SelectView::<Row>::new();
+        select.add_item("D1", Row::Entry(ReviewKey::new("moz", "D1")));
+        siv.add_layer(select.with_name("reviews"));
+
+        // Pressing `l` twice must stay expanded, not toggle back to collapsed.
+        set_expanded(&mut siv, true);
+        set_expanded(&mut siv, true);
+        assert!(
+            siv.user_data::<Ctx>()
+                .unwrap()
+                .expanded
+                .contains(&ReviewKey::new("moz", "D1"))
+        );
+
+        // Pressing `h` twice must stay collapsed.
+        set_expanded(&mut siv, false);
+        set_expanded(&mut siv, false);
+        assert!(
+            !siv.user_data::<Ctx>()
+                .unwrap()
+                .expanded
+                .contains(&ReviewKey::new("moz", "D1"))
+        );
+    }
+
+    #[tokio::test]
+    async fn set_expanded_targets_whichever_review_owns_the_selected_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut siv = cursive::dummy();
+        siv.set_user_data(ctx_with_state(
+            tmp.path(),
+            vec![entry("D1", Some("a.rs | 1 +")), entry("D2", None)],
+        ));
+        let mut select = SelectView::<Row>::new();
+        // Selection starts on D1's lone detail line, not its entry row.
+        select.add_item("D1", Row::Entry(ReviewKey::new("moz", "D1")));
+        select.add_item("  a.rs | 1 +", Row::Detail(ReviewKey::new("moz", "D1")));
+        select.add_item("D2", Row::Entry(ReviewKey::new("moz", "D2")));
+        select.set_selection(1);
+        siv.add_layer(select.with_name("reviews"));
+
+        set_expanded(&mut siv, true);
+
+        assert_eq!(
+            siv.user_data::<Ctx>().unwrap().expanded,
+            BTreeSet::from([ReviewKey::new("moz", "D1")]),
+            "the detail row's owning key (D1) should be expanded, not D2"
+        );
+    }
 }

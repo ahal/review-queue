@@ -88,6 +88,10 @@ pub struct ReviewEntry {
     pub resolved: bool,
     pub last_synced: chrono::DateTime<chrono::Utc>,
     pub workspace: Option<Workspace>,
+    /// Diffstat fetched from the source as of `last_synced` (same summary format `git diff
+    /// --stat`/`jj diff --stat` print) - `None` if the source couldn't produce one. Refreshed on
+    /// every `rq sync`, independent of whether a local workspace exists.
+    pub diff_stat: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -192,6 +196,7 @@ mod tests {
                 head_id: "abc123".into(),
                 status: Status::Ready,
             }),
+            diff_stat: None,
         }
     }
 

@@ -150,6 +150,7 @@ fn add_new(review: &Review, state: &mut State, dry_run: bool, report: &mut SyncR
         resolved: false,
         last_synced: chrono::Utc::now(),
         workspace: None,
+        diff_stat: review.diff_stat.clone(),
     });
 }
 
@@ -168,6 +169,7 @@ async fn update_existing(
     entry.kind = review.kind.clone();
     entry.in_queue = true;
     entry.resolved = false;
+    entry.diff_stat = review.diff_stat.clone();
 
     let Some(mut ws) = entry.workspace.clone() else {
         // Not fetched locally - nothing on disk to update, just keep the tracked metadata
@@ -343,6 +345,7 @@ pub async fn fetch_local(
         repo: entry.repo.clone(),
         version: entry.version.clone(),
         kind: entry.kind.clone(),
+        diff_stat: entry.diff_stat.clone(),
     };
 
     let mut repo_store = RepoStore::load(paths, config)?;
@@ -461,6 +464,9 @@ mod tests {
                 "full_name": format!("{owner}/{repo}"),
                 "owner": {"login": owner},
             }},
+            "additions": 1,
+            "deletions": 0,
+            "changed_files": 1,
         })
     }
 
@@ -566,6 +572,11 @@ mod tests {
         assert!(entry.in_queue);
         assert!(!entry.resolved);
         assert_eq!(entry.version, sha);
+        assert_eq!(
+            entry.diff_stat.as_deref(),
+            Some("1 file changed, 1 insertion(+)"),
+            "diff_stat should be fetched as part of the same sync that adds the review"
+        );
         assert!(
             entry.workspace.is_none(),
             "sync must not create a workspace on its own"

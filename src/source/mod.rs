@@ -8,6 +8,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+pub mod diffstat;
 pub mod github;
 pub mod moz_phab;
 
@@ -51,6 +52,12 @@ pub struct Review {
     /// updates that require re-syncing the workspace.
     pub version: String,
     pub kind: ReviewKind,
+    /// Diffstat (same summary format `git diff --stat`/`jj diff --stat` print), fetched
+    /// best-effort as part of the same `fetch_queue()` call that built this `Review` - `None` if
+    /// the source couldn't get one (no active diff, a Conduit/API hiccup, etc). Carried straight
+    /// into `state.json`'s `ReviewEntry` so `rq list`'s TUI can show it with no further network
+    /// calls of its own.
+    pub diff_stat: Option<String>,
 }
 
 #[derive(Debug, Clone)]

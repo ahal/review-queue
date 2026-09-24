@@ -42,6 +42,14 @@
 //!   `edge.search` + `differential.revision.search` pair *per depth level* covering every stack
 //!   still in flight, instead of per revision. A 20-revision queue with 3-deep stacks now costs
 //!   ~1 (repos) + 3*2 (stack levels) calls instead of ~20 + 20*(1+2*3).
+//! - Diffstats: `diff_stats_for` resolves every actionable revision's `diffPHID` through one
+//!   batched `differential.diff.search` call, then fetches each resulting diff's raw text via
+//!   `differential.getrawdiff` - unlike the above, this one *is* one call per revision, since
+//!   `getrawdiff` has no batch form; see `diff_stats_for`'s own doc comment for why (and for why
+//!   it's `getrawdiff`, not the more obvious-looking `differential.querydiffs`).
+//!
+//! `fetch_queue` fetches each `Review`'s diffstat itself (via `diff_stats_for`, above) rather than
+//! `rq list`'s TUI fetching it lazily on expand, so the TUI never blocks on Conduit.
 //!
 //! `version` is the comma-joined *`dateModified`* of every revision in the stack (walked via
 //! `edge.search`, same as before), not diff ids - `moz-phab` re-resolves the live diff/base
@@ -104,6 +112,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::config::MozPhabConfig;
+use crate::source::diffstat::{FileChange, format_diffstat};
 use crate::source::{Checkout, Lifecycle, RepoRef, Review, ReviewKey, ReviewKind, ReviewSource};
 
 /// This source's hardcoded id-namespace prefix - see [`crate::state::ReviewKey`].
@@ -280,6 +289,75 @@ impl MozPhabSource {
             chain.reverse();
         }
         Ok(chains)
+    }
+
+    /// Diffstat for every candidate with an active diff, keyed by revision id - fetched as part
+    /// of the same `fetch_queue()` call that builds the `Review`s themselves, not lazily by the
+    /// TUI. Best-effort throughout: any failure just means affected revision(s) get no diffstat,
+    /// never a failed queue fetch.
+    ///
+    /// `differential.querydiffs` (the obvious-looking Conduit call for this - a diff's per-file
+    /// `changes` with line counts) doesn't work against Mozilla's Phabricator: it's missing from
+    /// `moz-phab`'s own `IDEMPOTENT_CONDUIT_METHODS` allowlist, and unlike every other method this
+    /// module calls, `moz-phab`'s source never uses it - confirmed by reading `mozphab/conduit.py`
+    /// rather than by hitting the API live, since this tool has no Phabricator credentials of its
+    /// own to test against. What `moz-phab patch` uses instead to get diff content is
+    /// `differential.getrawdiff {diffID}` (a single diff id, not batchable) - a raw unified diff
+    /// text, the same format `Checkout::Patches`' `Patch::diff` already is elsewhere in this
+    /// codebase - which `parse_unified_diff` below turns into the same per-file stats
+    /// `querydiffs` would have. Every candidate's `diffPHID` is still resolved to a numeric diff
+    /// id via one batched `differential.diff.search` call first (that part *is* confirmed real,
+    /// via `mozphab/conduit.py`'s `get_diffs`); only the raw-diff fetch itself is one call per
+    /// revision, run sequentially (mirrors `moz-phab patch`'s own per-diff `getrawdiff` calls,
+    /// just without its `ThreadPoolExecutor` concurrency).
+    async fn diff_stats_for<'a>(
+        &self,
+        revisions: impl IntoIterator<Item = &'a RevisionItem>,
+    ) -> HashMap<u64, String> {
+        self.diff_stats_for_inner(revisions).await.unwrap_or_default()
+    }
+
+    async fn diff_stats_for_inner<'a>(
+        &self,
+        revisions: impl IntoIterator<Item = &'a RevisionItem>,
+    ) -> Result<HashMap<u64, String>> {
+        let phid_to_rev: HashMap<String, u64> = revisions
+            .into_iter()
+            .filter_map(|r| r.fields.diff_phid.clone().map(|phid| (phid, r.id)))
+            .collect();
+        if phid_to_rev.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Sorted for a deterministic request body, same as `author_phids`/`repo_phids` above.
+        let phids: Vec<String> = phid_to_rev
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let diffs: Vec<DiffItem> = self
+            .search_all(
+                "differential.diff.search",
+                json!({"constraints": {"phids": phids}}),
+            )
+            .await?;
+        let diff_id_to_rev: HashMap<u64, u64> = diffs
+            .into_iter()
+            .filter_map(|d| phid_to_rev.get(&d.phid).map(|&rev_id| (d.id, rev_id)))
+            .collect();
+
+        let mut out = HashMap::new();
+        for (diff_id, revision_id) in diff_id_to_rev {
+            let Ok(raw) = self
+                .call::<String>("differential.getrawdiff", json!({"diffID": diff_id}))
+                .await
+            else {
+                continue; // one revision's diff failing to fetch shouldn't cost the others
+            };
+            out.insert(revision_id, format_diffstat(&parse_unified_diff(&raw)));
+        }
+        Ok(out)
     }
 
     #[cfg(test)]
@@ -479,11 +557,14 @@ impl ReviewSource for MozPhabSource {
             })
             .collect();
         let mut stacks = self.resolve_stacks(seeds).await?;
+        let diff_stats = self
+            .diff_stats_for(candidates.iter().map(|(rev, _, _)| rev))
+            .await;
 
         let mut reviews = Vec::new();
-        for (rev, kind, repository_phid) in candidates {
+        for (rev, kind, repository_phid) in &candidates {
             let repo = repos
-                .get(&repository_phid)
+                .get(repository_phid)
                 .cloned()
                 .with_context(|| format!("repository {repository_phid} not found"))?;
             let stack = stacks.remove(&rev.id).unwrap_or_default();
@@ -503,7 +584,8 @@ impl ReviewSource for MozPhabSource {
                 url: format!("{}/D{}", self.cfg.url.trim_end_matches('/'), rev.id),
                 repo,
                 version,
-                kind,
+                kind: kind.clone(),
+                diff_stat: diff_stats.get(&rev.id).cloned(),
             });
         }
         Ok(reviews)
@@ -766,6 +848,8 @@ struct RevisionFields {
     repository_phid: Option<String>,
     #[serde(rename = "dateModified")]
     date_modified: Option<i64>,
+    #[serde(rename = "diffPHID")]
+    diff_phid: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -796,6 +880,55 @@ struct EdgeItem {
     source_phid: String,
     #[serde(rename = "destinationPHID")]
     destination_phid: String,
+}
+
+/// A `differential.diff.search` result - `id` is what `differential.getrawdiff` (which takes a
+/// diff id, not a PHID) needs; `phid` maps a result back to the revision that requested it, since
+/// `diff_stats_for` batches this search across every candidate's `diffPHID` at once.
+#[derive(Deserialize)]
+struct DiffItem {
+    id: u64,
+    phid: String,
+}
+
+/// Per-file `+`/`-` counts from a unified diff's raw text - the same format `Checkout::Patches`'
+/// `Patch::diff` field already is elsewhere in this codebase (applied via `git apply`/`patch
+/// -p1`), so this is a safe assumption for whatever `differential.getrawdiff` hands back. Only
+/// lines within a hunk that start with `+`/`-` count, not the `+++`/`---` file headers. A rename
+/// with no content change still gets a zero-count entry (from `diff --git` starting a new
+/// section) so it's at least listed.
+fn parse_unified_diff(diff: &str) -> Vec<FileChange> {
+    let mut changes = Vec::new();
+    let mut current: Option<FileChange> = None;
+
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            if let Some(c) = current.take() {
+                changes.push(c);
+            }
+            let path = rest
+                .rsplit_once(" b/")
+                .map_or(rest, |(_, new_path)| new_path)
+                .to_string();
+            current = Some(FileChange {
+                path,
+                additions: 0,
+                deletions: 0,
+            });
+        } else if line.starts_with("+++") || line.starts_with("---") {
+            continue; // file headers, not hunk content
+        } else if let Some(c) = current.as_mut() {
+            if line.starts_with('+') {
+                c.additions += 1;
+            } else if line.starts_with('-') {
+                c.deletions += 1;
+            }
+        }
+    }
+    if let Some(c) = current.take() {
+        changes.push(c);
+    }
+    changes
 }
 
 #[derive(Deserialize)]
@@ -868,6 +1001,7 @@ mod tests {
                 },
                 repository_phid: Some("PHID-REPO-1".into()),
                 date_modified: Some(1700000000),
+                diff_phid: None,
             },
             attachments: Some(RevisionAttachments {
                 reviewers: Some(ReviewersAttachment {
@@ -1275,6 +1409,7 @@ mod tests {
             },
             version: "1".into(),
             kind: ReviewKind::Direct,
+            diff_stat: None,
         };
         let checkout = src.checkout_spec(&review, canon.path()).await.unwrap();
 
@@ -1345,11 +1480,185 @@ mod tests {
             },
             version: "1".into(),
             kind: ReviewKind::Direct,
+            diff_stat: None,
         };
         let err = src.checkout_spec(&review, canon.path()).await.unwrap_err();
         assert!(
             err.to_string().contains("callsign"),
             "unexpected error: {err}"
         );
+    }
+
+    fn revision_with_diff(id: u64, diff_phid: Option<&str>) -> RevisionItem {
+        RevisionItem {
+            id,
+            phid: format!("PHID-DREV-{id}"),
+            fields: RevisionFields {
+                title: "x".into(),
+                author_phid: "a".into(),
+                status: StatusField {
+                    value: "needs-review".into(),
+                },
+                repository_phid: None,
+                date_modified: Some(1),
+                diff_phid: diff_phid.map(String::from),
+            },
+            attachments: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn diff_stats_for_batches_diff_search_then_fetches_each_raw_diff() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/differential.diff.search"))
+            .and(body_string_contains("constraints%5Bphids%5D%5B0%5D=PHID-DIFF-1"))
+            .and(body_string_contains("constraints%5Bphids%5D%5B1%5D=PHID-DIFF-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[
+                json!({"id": 42, "phid": "PHID-DIFF-1"}),
+                json!({"id": 43, "phid": "PHID-DIFF-2"}),
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/differential.getrawdiff"))
+            .and(body_string_contains("diffID=42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(call_response(json!(
+                "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,1 +1,3 @@\n+one\n+two\n-old\n"
+            ))))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/differential.getrawdiff"))
+            .and(body_string_contains("diffID=43"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(call_response(json!(
+                "diff --git a/old.rs b/old.rs\n--- a/old.rs\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-gone\n"
+            ))))
+            .mount(&server)
+            .await;
+
+        let src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
+        let revisions = [
+            revision_with_diff(1, Some("PHID-DIFF-1")),
+            revision_with_diff(2, Some("PHID-DIFF-2")),
+        ];
+        let stats = src.diff_stats_for(revisions.iter()).await;
+
+        assert!(stats[&1].contains("src/main.rs"));
+        assert!(stats[&1].ends_with("1 file changed, 2 insertions(+), 1 deletion(-)"));
+        assert!(stats[&2].contains("old.rs"));
+        assert!(stats[&2].ends_with("1 file changed, 1 deletion(-)"));
+    }
+
+    #[tokio::test]
+    async fn diff_stats_for_skips_revisions_with_no_active_diff() {
+        let server = MockServer::start().await;
+        // No mocks registered for diff.search/getrawdiff - a revision with no `diffPHID` must
+        // never trigger either call.
+        let src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
+        let revisions = [revision_with_diff(1, None)];
+
+        let stats = src.diff_stats_for(revisions.iter()).await;
+
+        assert!(stats.is_empty());
+    }
+
+    #[tokio::test]
+    async fn diff_stats_for_skips_just_the_revision_whose_raw_diff_fetch_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/differential.diff.search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[
+                json!({"id": 42, "phid": "PHID-DIFF-1"}),
+                json!({"id": 43, "phid": "PHID-DIFF-2"}),
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/differential.getrawdiff"))
+            .and(body_string_contains("diffID=42"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/differential.getrawdiff"))
+            .and(body_string_contains("diffID=43"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(call_response(json!(
+                "diff --git a/ok.rs b/ok.rs\n--- a/ok.rs\n+++ b/ok.rs\n@@ -0,0 +1,1 @@\n+ok\n"
+            ))))
+            .mount(&server)
+            .await;
+
+        let src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
+        let revisions = [
+            revision_with_diff(1, Some("PHID-DIFF-1")),
+            revision_with_diff(2, Some("PHID-DIFF-2")),
+        ];
+        let stats = src.diff_stats_for(revisions.iter()).await;
+
+        assert!(!stats.contains_key(&1), "the failing revision should just be skipped");
+        assert!(stats[&2].contains("ok.rs"));
+    }
+
+    #[tokio::test]
+    async fn diff_stats_for_is_best_effort_on_conduit_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/differential.diff.search"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
+        let revisions = [revision_with_diff(1, Some("PHID-DIFF-1"))];
+
+        let stats = src.diff_stats_for(revisions.iter()).await;
+
+        assert!(stats.is_empty(), "a Conduit failure should not panic or propagate");
+    }
+
+    #[test]
+    fn parse_unified_diff_counts_added_and_removed_lines_per_file() {
+        let diff = "diff --git a/a.rs b/a.rs\n\
+             --- a/a.rs\n\
+             +++ b/a.rs\n\
+             @@ -1,2 +1,3 @@\n\
+             +one\n\
+             +two\n\
+             -old\n\
+             diff --git a/b.rs b/b.rs\n\
+             --- a/b.rs\n\
+             +++ b/b.rs\n\
+             @@ -1,1 +1,1 @@\n\
+             -bye\n";
+
+        let changes = parse_unified_diff(diff);
+
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].path, "a.rs");
+        assert_eq!(changes[0].additions, 2);
+        assert_eq!(changes[0].deletions, 1);
+        assert_eq!(changes[1].path, "b.rs");
+        assert_eq!(changes[1].additions, 0);
+        assert_eq!(changes[1].deletions, 1);
+    }
+
+    #[test]
+    fn parse_unified_diff_uses_the_new_path_from_the_diff_git_header() {
+        let diff = "diff --git a/old-name.rs b/new-name.rs\n\
+             --- a/old-name.rs\n\
+             +++ b/new-name.rs\n\
+             @@ -1,1 +1,1 @@\n\
+             +x\n";
+
+        let changes = parse_unified_diff(diff);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "new-name.rs");
+    }
+
+    #[test]
+    fn parse_unified_diff_on_empty_text_finds_no_files() {
+        assert!(parse_unified_diff("").is_empty());
     }
 }
