@@ -349,7 +349,7 @@ fn path(paths: &Paths, id: &str) -> Result<()> {
                 Ok(())
             }
             None => bail!(
-                "`{id}` has no local workspace yet; run `rq fetch {id}` (or press the fetch key in `rq show`)"
+                "`{id}` has no local workspace yet; run `rq fetch {id}` (or press `o` in `rq show`)"
             ),
         },
         many => {

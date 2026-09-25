@@ -53,8 +53,8 @@ pub enum Status {
 }
 
 /// A local worktree/workspace fetched for a review - absent until the user explicitly asks for
-/// one (`rq fetch`, or the fetch hotkey in `rq show`'s TUI), since `sync` no longer creates these
-/// on its own.
+/// one (`rq fetch`, or the open-locally hotkey in `rq show`'s TUI), since `sync` no longer creates
+/// these on its own.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     /// Canonical repo this workspace was created from (may be a tool-managed clone or a

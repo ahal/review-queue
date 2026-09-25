@@ -2,10 +2,13 @@
 //! Up/down and `j`/`k` move the cursor between *reviews*, skipping over an expanded review's
 //! diffstat lines rather than stepping into them (see `move_selection`) - arrow keys are
 //! intercepted via an `OnEventView` since `SelectView`'s own built-in handling would otherwise
-//! land on those lines like any other row. Enter expands/collapses the selected review's diffstat
-//! (fetched by `rq sync` and read straight out of `state.json` - no network calls here), `b`
-//! opens it in a browser, `f` fetches it locally on demand - the same `sync::fetch_local` a plain
-//! `rq fetch <id>` runs. See `crate::sync`'s module docs for why `rq sync` itself never creates
+//! land on those lines like any other row. Left/right (and `h`/`l`) expand/collapse the selected
+//! review's diffstat (fetched by `rq sync` and read straight out of `state.json` - no network
+//! calls here). `o` opens the review in a browser. Enter opens it locally: fetching it on demand
+//! if needed (the same `sync::fetch_local` a plain `rq fetch <id>` runs), then suspending the TUI
+//! to drop the user into a subshell in its worktree, resuming once they exit it - see
+//! `run_event_loop` for why that means tearing down and recreating the whole backend rather than
+//! just toggling raw mode. See `crate::sync`'s module docs for why `rq sync` itself never creates
 //! workspaces.
 
 use std::collections::BTreeSet;
@@ -15,7 +18,7 @@ use anyhow::Result;
 use cursive::event::Key;
 use cursive::traits::*;
 use cursive::views::{Dialog, LinearLayout, OnEventView, SelectView, TextView};
-use cursive::{Cursive, CursiveExt};
+use cursive::Cursive;
 
 use crate::config::{self, Config};
 use crate::paths::Paths;
@@ -24,7 +27,8 @@ use crate::source::ReviewSource;
 use crate::state::{ReviewEntry, ReviewKey, State};
 use crate::sync;
 
-const HELP: &str = "↑/↓ move   enter expand/collapse   b open in browser   f fetch locally   r reload   q quit";
+const HELP: &str =
+    "↑/↓ move   ←/→ expand/collapse   enter open locally   o open in browser   r reload   q quit";
 
 struct Ctx {
     paths: Paths,
@@ -37,10 +41,13 @@ struct Ctx {
     author_w: usize,
     /// Reviews currently expanded to show their diffstat - any number at once, independently.
     expanded: BTreeSet<ReviewKey>,
+    /// Set by `do_open_locally` on a successful fetch; drained by `run_event_loop`, which is the
+    /// only place actually allowed to touch the terminal/backend to suspend into a subshell.
+    pending_shell: Option<(ReviewKey, PathBuf)>,
 }
 
 /// A row in the `reviews` `SelectView`: either a review itself, or one of the diffstat lines
-/// shown underneath it while expanded. Both carry the owning review's key so `b`/fetch/collapse
+/// shown underneath it while expanded. Both carry the owning review's key so opening/collapsing
 /// act on the right review regardless of which line the cursor happens to sit on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Row {
@@ -57,7 +64,8 @@ impl Row {
 }
 
 /// Run the TUI until the user quits. Blocks the current thread; call from within a Tokio runtime
-/// (needed for the fetch hotkey, which drives `sync::fetch_local` to completion synchronously).
+/// (needed for the open-locally hotkey, which drives `sync::fetch_local` to completion
+/// synchronously).
 pub fn run(
     paths: Paths,
     config: Config,
@@ -83,19 +91,23 @@ pub fn run(
         key_w,
         author_w,
         expanded: BTreeSet::new(),
+        pending_shell: None,
     });
 
     let mut select = SelectView::<Row>::new();
     for (label, row) in build_rows(&entries, key_w, author_w, &BTreeSet::new()) {
         select.add_item(label, row);
     }
-    select.set_on_submit(|s, row: &Row| toggle_expand(s, row.key()));
+    select.set_on_submit(|s, row: &Row| open_locally_selected_key(s, row.key().clone()));
 
     // `OnEventView` intercepts the arrow keys before `SelectView`'s own built-in handling sees
-    // them, so they go through `move_selection` too instead of stopping on a diffstat line.
+    // them, so they go through `move_selection`/`set_expanded` too instead of stopping on a
+    // diffstat line or falling through to `SelectView`'s own (unwanted) left/right handling.
     let select = OnEventView::new(select.with_name("reviews"))
         .on_event(Key::Down, |s| move_selection(s, true))
-        .on_event(Key::Up, |s| move_selection(s, false));
+        .on_event(Key::Up, |s| move_selection(s, false))
+        .on_event(Key::Right, |s| set_expanded(s, true))
+        .on_event(Key::Left, |s| set_expanded(s, false));
 
     let layout = LinearLayout::vertical()
         .child(TextView::new(header_line(key_w, author_w)))
@@ -106,16 +118,68 @@ pub fn run(
 
     siv.add_global_callback('q', |s| s.quit());
     siv.add_global_callback(Key::Esc, |s| s.quit());
-    siv.add_global_callback('b', open_in_browser_selected);
-    siv.add_global_callback('f', fetch_selected);
+    siv.add_global_callback('o', open_in_browser_selected);
     siv.add_global_callback('r', reload);
     siv.add_global_callback('j', |s| move_selection(s, true));
     siv.add_global_callback('k', |s| move_selection(s, false));
     siv.add_global_callback('l', |s| set_expanded(s, true));
     siv.add_global_callback('h', |s| set_expanded(s, false));
 
-    siv.run();
-    Ok(())
+    run_event_loop(siv)
+}
+
+/// Drives the event loop by hand instead of the usual `siv.run()`, so an open-locally request can
+/// tear the whole backend down before dropping the user into a subshell, then build a fresh one
+/// on return. `Cursive`'s screen diffing has no way to know the subshell scribbled all over the
+/// terminal, so patching the existing backend back to raw/alternate-screen mode leaves stale
+/// content behind wherever the next frame doesn't happen to differ from the last one drawn before
+/// suspending. Recreating the backend (and with it, a `CursiveRunner` with a blank diff buffer)
+/// sidesteps that entirely - the next `refresh()` is indistinguishable from a fresh start, so it
+/// draws every cell instead of only the ones it thinks changed.
+fn run_event_loop(mut siv: Cursive) -> Result<()> {
+    enum Outcome {
+        Quit,
+        OpenShell(ReviewKey, PathBuf),
+    }
+
+    loop {
+        let backend = cursive::backends::crossterm::Backend::init()?;
+        let outcome = {
+            let mut runner = siv.runner(backend);
+            runner.refresh();
+            loop {
+                runner.step();
+                if let Some((key, path)) =
+                    runner.user_data::<Ctx>().and_then(|ctx| ctx.pending_shell.take())
+                {
+                    break Outcome::OpenShell(key, path);
+                }
+                if !runner.is_running() {
+                    break Outcome::Quit;
+                }
+            }
+            // `runner` drops here, tearing the backend fully down (leaves the alternate screen,
+            // disables raw mode, shows the cursor) before we touch the terminal for anything else.
+        };
+
+        match outcome {
+            Outcome::Quit => return Ok(()),
+            Outcome::OpenShell(key, path) => {
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+                let result = std::process::Command::new(&shell).current_dir(&path).status();
+                match result {
+                    Ok(status) if status.success() => {
+                        set_status(&mut siv, format!("back from {key} ({})", path.display()))
+                    }
+                    Ok(status) => set_status(
+                        &mut siv,
+                        format!("`{shell}` exited with {status} in {}", path.display()),
+                    ),
+                    Err(e) => set_status(&mut siv, format!("failed to launch `{shell}`: {e}")),
+                }
+            }
+        }
+    }
 }
 
 fn load_rows(paths: &Paths, all: bool) -> Result<Vec<ReviewEntry>> {
@@ -235,19 +299,8 @@ fn selected_key(s: &mut Cursive) -> Option<ReviewKey> {
         .map(|row| row.key().clone())
 }
 
-/// Toggle whether `key`'s review is expanded (showing its diffstat) and reload the list to match.
-/// Independent of every other review's expanded state - expanding one never collapses another.
-fn toggle_expand(s: &mut Cursive, key: &ReviewKey) {
-    if let Some(ctx) = s.user_data::<Ctx>()
-        && !ctx.expanded.remove(key)
-    {
-        ctx.expanded.insert(key.clone());
-    }
-    reload(s);
-}
-
-/// `set_expanded(s, true/false)` backs the `l`/`h` vim-style bindings - unlike enter's toggle,
-/// these are directional, so repeating one is idempotent instead of flipping back and forth.
+/// `set_expanded(s, true/false)` backs left/right and the `l`/`h` vim-style bindings - directional
+/// rather than a toggle, so repeating one is idempotent instead of flipping back and forth.
 fn set_expanded(s: &mut Cursive, expand: bool) {
     let Some(key) = selected_key(s) else {
         return;
@@ -284,10 +337,7 @@ fn open_in_browser(s: &mut Cursive, key: &ReviewKey) {
     }
 }
 
-fn fetch_selected(s: &mut Cursive) {
-    let Some(key) = selected_key(s) else {
-        return;
-    };
+fn open_locally_selected_key(s: &mut Cursive, key: ReviewKey) {
     let on_missing = s
         .user_data::<Ctx>()
         .map(|ctx| {
@@ -298,10 +348,10 @@ fn fetch_selected(s: &mut Cursive) {
             }
         })
         .unwrap_or(OnMissing::Ask);
-    do_fetch(s, key, on_missing);
+    do_open_locally(s, key, on_missing);
 }
 
-fn do_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
+fn do_open_locally(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
     let outcome = s.user_data::<Ctx>().map(|ctx| {
         tokio::task::block_in_place(|| {
             ctx.handle.clone().block_on(sync::fetch_local(
@@ -316,9 +366,13 @@ fn do_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
 
     match outcome {
         // Either way `fetch_local` may have written a workspace to state.json (even a failed
-        // apply is recorded, left in place for inspection) - reload to reflect that.
+        // apply is recorded, left in place for inspection) - reload to reflect that. The actual
+        // subshell only gets launched by `run_event_loop`, which alone is allowed to tear down
+        // the backend.
         Some(Ok(path)) => {
-            set_status(s, format!("fetched {key} -> {}", path.display()));
+            if let Some(ctx) = s.user_data::<Ctx>() {
+                ctx.pending_shell = Some((key, path));
+            }
             reload(s);
         }
         Some(Err(e)) => match e.downcast::<NeedsClone>() {
@@ -348,7 +402,7 @@ fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf) {
     })
     .button("Yes", move |s| {
         s.pop_layer();
-        do_fetch(s, yes_key.clone(), OnMissing::Clone);
+        do_open_locally(s, yes_key.clone(), OnMissing::Clone);
     })
     .button("Always", move |s| {
         s.pop_layer();
@@ -363,7 +417,7 @@ fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf) {
             set_status(s, format!("failed to save auto_clone: {e:#}"));
             return;
         }
-        do_fetch(s, always_key.clone(), OnMissing::Clone);
+        do_open_locally(s, always_key.clone(), OnMissing::Clone);
     });
     s.add_layer(dialog);
 }
@@ -475,21 +529,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn toggle_expand_only_collapses_the_review_it_targets() {
+    async fn set_expanded_can_expand_multiple_reviews_independently() {
+        let tmp = tempfile::tempdir().unwrap();
         let mut siv = cursive::dummy();
-        siv.set_user_data(Ctx {
-            paths: crate::paths::Paths::discover().unwrap(),
-            config: Config::default(),
-            config_path: PathBuf::new(),
-            sources: Vec::new(),
-            handle: tokio::runtime::Handle::current(),
-            all: true,
-            key_w: 5,
-            author_w: 6,
-            expanded: BTreeSet::from([ReviewKey::new("moz", "D1")]),
-        });
+        siv.set_user_data(ctx_with_state(
+            tmp.path(),
+            vec![entry("D1", None), entry("D2", None)],
+        ));
+        let mut select = SelectView::<Row>::new();
+        select.add_item("D1", Row::Entry(ReviewKey::new("moz", "D1")));
+        select.add_item("D2", Row::Entry(ReviewKey::new("moz", "D2")));
+        siv.add_layer(select.with_name("reviews"));
 
-        toggle_expand(&mut siv, &ReviewKey::new("moz", "D2"));
+        // Expand D1, then move to D2 (skipping over D1's now-visible detail line, same as any
+        // other navigation) and expand it too - must not collapse D1.
+        set_expanded(&mut siv, true);
+        move_selection(&mut siv, true);
+        set_expanded(&mut siv, true);
 
         let ctx = siv.user_data::<Ctx>().unwrap();
         assert_eq!(
@@ -498,7 +554,9 @@ mod tests {
             "expanding D2 must not collapse the already-expanded D1"
         );
 
-        toggle_expand(&mut siv, &ReviewKey::new("moz", "D1"));
+        // Collapse D1 - must not touch D2.
+        move_selection(&mut siv, false);
+        set_expanded(&mut siv, false);
 
         let ctx = siv.user_data::<Ctx>().unwrap();
         assert_eq!(
@@ -589,8 +647,8 @@ mod tests {
     }
 
     /// A `Ctx` whose `paths` point at a fresh tempdir seeded with `entries` in `state.json`, so
-    /// `reload` (which `set_expanded`/`toggle_expand` both call) has real, stable rows to rebuild
-    /// the `reviews` view from instead of reading whatever's on the real machine's disk.
+    /// `reload` (which `set_expanded` calls) has real, stable rows to rebuild the `reviews` view
+    /// from instead of reading whatever's on the real machine's disk.
     fn ctx_with_state(tmp: &std::path::Path, entries: Vec<ReviewEntry>) -> Ctx {
         let paths = crate::paths::Paths::discover()
             .unwrap()
@@ -610,6 +668,7 @@ mod tests {
             key_w: 5,
             author_w: 6,
             expanded: BTreeSet::new(),
+            pending_shell: None,
         }
     }
 

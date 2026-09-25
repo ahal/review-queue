@@ -16,8 +16,8 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Fetch review queues and update existing workspaces, removing one once its review resolves
-    /// and is clean. Never creates a new workspace - use `rq fetch` (or the fetch hotkey in `rq
-    /// show`) for that.
+    /// and is clean. Never creates a new workspace - use `rq fetch` (or the open-locally hotkey
+    /// in `rq show`) for that.
     Sync {
         /// Only sync the named source ("gh" or "phab").
         #[arg(long)]
@@ -26,9 +26,9 @@ pub enum Command {
         dry_run: bool,
     },
     /// Show tracked reviews. Opens an interactive TUI when stdout is a terminal (arrow keys or
-    /// j/k to move, enter to open the review in your browser, `f` to fetch it locally, `q` to
-    /// quit); prints a plain table otherwise, or with `--plain`. This is the default when no
-    /// subcommand is given.
+    /// j/k to move, enter to open the review locally in a subshell, `o` to open it in your
+    /// browser, `q` to quit); prints a plain table otherwise, or with `--plain`. This is the
+    /// default when no subcommand is given.
     Show {
         #[arg(long)]
         json: bool,
@@ -46,8 +46,8 @@ pub enum Command {
     },
     /// Fetch a review locally: resolve its canonical repo (asking before cloning one, unless
     /// `auto_clone` is set) and create a worktree/workspace for it. `rq sync` never does this on
-    /// its own; use this (or the fetch hotkey in `rq show`) for reviews that actually warrant
-    /// checking out.
+    /// its own; use this (or the open-locally hotkey in `rq show`) for reviews that actually
+    /// warrant checking out.
     Fetch {
         /// A review id, or unique prefix of one (e.g. "D123" or "moz/D123").
         id: String,
