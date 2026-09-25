@@ -308,8 +308,10 @@ fn handle_out_of_queue(
 
 /// Resolve a canonical repo (asking before cloning one, unless `on_missing` says otherwise) and
 /// create a workspace for `key`, a review already tracked by a prior `sync()`. A no-op that
-/// returns the existing path if `key` already has a workspace. This is the on-demand counterpart
-/// to `sync()`'s deliberate refusal to create workspaces on its own - see the module docs.
+/// returns the existing path if `key` already has a `Ready`/`Dirty` workspace; an `ApplyFailed`
+/// one is instead cleaned up and retried, since handing back a broken/empty path again would
+/// just repeat the failure silently. This is the on-demand counterpart to `sync()`'s deliberate
+/// refusal to create workspaces on its own - see the module docs.
 ///
 /// Under `OnMissing::Ask`, a repo with no local checkout surfaces as a `repo::NeedsClone` error
 /// (`downcast_ref` it) rather than cloning - callers should confirm with the user and retry with
@@ -329,7 +331,15 @@ pub async fn fetch_local(
         .with_context(|| format!("`{key}` isn't tracked; run `rq sync` first"))?;
 
     if let Some(ws) = &entry.workspace {
-        return Ok(ws.workspace_path.clone());
+        if ws.status != Status::ApplyFailed {
+            return Ok(ws.workspace_path.clone());
+        }
+        // Retry instead of handing back the broken path: best-effort clean up whatever the
+        // failed attempt left registered/on-disk first, since re-adding a workspace at the same
+        // name/path would otherwise fail again for that reason alone.
+        let stale_vcs = vcs_for(ws.vcs);
+        let _ = stale_vcs.remove_workspace(&ws.repo_path, &ws.workspace_path, &key.slug());
+        let _ = std::fs::remove_dir_all(&ws.workspace_path);
     }
 
     let source = sources
@@ -352,7 +362,7 @@ pub async fn fetch_local(
     let canon = repo_store.resolve(&review.repo, on_missing)?;
     let checkout = source.checkout_spec(&review, &canon.path).await?;
     let vcs = vcs_for(canon.vcs);
-    let ws_path = paths.workspace_dir(&canon.name, &key.slug());
+    let ws_path = paths.workspace_dir(&key.slug());
     if let Some(parent) = ws_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -629,6 +639,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ws_path2, ws_path);
+    }
+
+    #[tokio::test]
+    async fn fetch_local_retries_an_apply_failed_workspace_instead_of_returning_it() {
+        let repos = make_repos();
+        let sha = git_rev_parse(&repos.fork, "HEAD");
+        let server = MockServer::start().await;
+        mount_search(&server, true).await;
+        mount_pull(
+            &server,
+            pull_json("moz", "proj", &repos.upstream, &repos.fork, &sha, "open"),
+        )
+        .await;
+
+        let work_tmp = TempDir::new().unwrap();
+        let paths = paths_in(work_tmp.path());
+        let config = Config::default();
+        let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
+        let key = ReviewKey::new("gh", "moz/proj/1");
+
+        sync(&sources, &paths, None, false).await.unwrap();
+        let ws_path = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone)
+            .await
+            .unwrap();
+
+        // Simulate a previous attempt that left a real, registered worktree behind but got
+        // marked failed (e.g. a later step errored) - a naive retry would otherwise leave this
+        // stuck forever, since `git worktree add`/`jj workspace add` refuse to reuse the path.
+        let mut state = State::load(&paths.state_file()).unwrap();
+        let mut entry = state.get(&key).cloned().unwrap();
+        entry.workspace.as_mut().unwrap().status = Status::ApplyFailed;
+        entry.workspace.as_mut().unwrap().head_id = String::new();
+        state.insert(entry);
+        state.save(&paths.state_file()).unwrap();
+
+        let retried_path = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone)
+            .await
+            .unwrap();
+
+        assert_eq!(retried_path, ws_path);
+        assert!(retried_path.join("pr.txt").exists());
+        let state = State::load(&paths.state_file()).unwrap();
+        let ws = state.get(&key).unwrap().workspace.as_ref().unwrap();
+        assert_eq!(ws.status, Status::Ready);
+        assert_eq!(ws.head_id, sha);
     }
 
     #[tokio::test]

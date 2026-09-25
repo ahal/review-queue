@@ -1,7 +1,7 @@
 //! Canonical repo resolution: every review repo maps to exactly one canonical local repo, which
 //! `sync` never deletes - only the worktrees/workspaces created from it. A canonical repo
 //! is either discovered (an existing checkout found by scanning `Config::workdir`, see
-//! `crate::workdir`) or tool-managed (cloned once under `Paths::repo_source_dir()` and recorded
+//! `crate::workdir`) or tool-managed (cloned once under `Paths::repo_dir()` and recorded
 //! in `repos.json`).
 //!
 //! Lookup order: the workdir scan cache, then the `repos.json` registry, then - if `workdir` is
@@ -28,7 +28,8 @@ pub struct CanonicalRepo {
     pub path: PathBuf,
     pub vcs: VcsKind,
     /// Identifies this repo's directory under `Paths::repos_dir()` - its normalized URL. Stable
-    /// across aliases (origin vs mirror) so a review's workspace always lands in the same place.
+    /// across aliases (origin vs mirror) so a review resolving through a different alias still
+    /// finds the same clone.
     pub name: String,
 }
 
@@ -151,7 +152,7 @@ impl RepoStore {
             .first()
             .context("review's repo has no candidate URLs to clone")?;
         let name = normalize_url(url);
-        let dest = self.repos_dir.join(&name).join("source");
+        let dest = self.repos_dir.join(&name);
 
         if on_missing == OnMissing::Ask {
             return Err(NeedsClone {
@@ -637,7 +638,7 @@ mod tests {
 
         // Simulate the interrupted-prior-run scenario directly: clone to the exact path
         // `resolve()` would use, but never register it.
-        let dest = paths.repo_source_dir(&normalize_url(&url));
+        let dest = paths.repo_dir(&normalize_url(&url));
         std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
         git(tmp.path(), &["clone", "-q", &url, dest.to_str().unwrap()]);
         assert!(!paths.repos_file().exists());

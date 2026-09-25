@@ -11,10 +11,9 @@
 //!
 //! Every remote is read and normalized (`crate::repo::normalize_url`), so any URL form
 //! (`https://`, `git@host:`, `ssh://`) matches. A repo with no remotes at all can't be matched
-//! against anything a review reports, so it's dropped rather than cached. `name` - the id a
-//! discovered repo's workspaces live under (`Paths::repo_dir`) - is `origin`'s normalized URL, or
-//! the first remote if there's no `origin`, so it stays stable regardless of which alias a review
-//! happens to report.
+//! against anything a review reports, so it's dropped rather than cached. `name` - the id used to
+//! match a review's repo against this one - is `origin`'s normalized URL, or the first remote if
+//! there's no `origin`, so it stays stable regardless of which alias a review happens to report.
 //!
 //! The scan result is cached (`WorkdirCache`) so it isn't re-run on every `rq fetch`; see
 //! `RepoStore::resolve` for the rescan-on-miss policy.
@@ -33,7 +32,7 @@ use crate::repo::normalize_url;
 pub struct DiscoveredRepo {
     pub path: PathBuf,
     pub vcs: VcsKind,
-    /// `Paths::repo_dir` id for this repo - `origin`'s normalized URL, or the first remote's.
+    /// This repo's matching id - `origin`'s normalized URL, or the first remote's.
     pub name: String,
     /// Every remote's normalized URL (including `name`'s), for matching a review's repo against.
     pub remotes: Vec<String>,

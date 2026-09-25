@@ -14,7 +14,7 @@ use crate::source::{RepoRef, ReviewKind};
 /// source's name (used to look up its `ReviewSource` impl); `id` is that source's own review id.
 /// Used as the state map key and, via `Paths::workspace_dir`, the workspace directory name - the
 /// full slug (not just `id`) is used there so ids can't collide across sources sharing the same
-/// canonical repo's workspace directory.
+/// canonical repo.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ReviewKey {
     pub source: String,

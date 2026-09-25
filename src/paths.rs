@@ -3,11 +3,11 @@
 //! Layout:
 //! - config: `$XDG_CONFIG_HOME/review-queue/config.toml`
 //! - data: `$XDG_DATA_HOME/review-queue/` — state.json, repos.json, sync.lock, workdir.json (the
-//!   `crate::workdir` scan cache), and `repos/` (every canonical repo, keyed by its normalized
-//!   URL, holding both the tool-managed clone under `source/` and the workspaces built from it
-//!   under `workspaces/{source}/{id}`; keying by the full canonical id (see
-//!   `crate::state::ReviewKey::slug`), not just `id`, is what keeps ids from colliding across
-//!   sources sharing a repo)
+//!   `crate::workdir` scan cache), `repos/` (every tool-managed canonical clone, keyed by its
+//!   normalized URL - discovered repos live wherever the user's workdir put them instead), and
+//!   `workspaces/{id}` (every review's workspace, independent of where its canonical repo lives;
+//!   keyed by the full canonical id - see `crate::state::ReviewKey::slug` - so ids can't collide
+//!   across sources sharing a repo)
 
 use std::path::{Path, PathBuf};
 
@@ -60,31 +60,26 @@ impl Paths {
         self.data_dir.join("workdir.json")
     }
 
-    /// Root of every canonical repo's directory, keyed by name (its normalized URL).
+    /// Root of every tool-managed canonical repo's directory, keyed by name (its normalized URL).
     pub fn repos_dir(&self) -> PathBuf {
         self.data_dir.join("repos")
     }
 
-    /// A single canonical repo's directory: `repos/{name}/`.
+    /// Where a tool-managed canonical clone lives: `repos/{name}`.
     pub fn repo_dir(&self, name: &str) -> PathBuf {
         self.repos_dir().join(name)
     }
 
-    /// Where a tool-managed canonical clone lives: `repos/{name}/source`.
-    pub fn repo_source_dir(&self, name: &str) -> PathBuf {
-        self.repo_dir(name).join("source")
+    /// Root of every review's workspace: `workspaces/`.
+    pub fn workspaces_dir(&self) -> PathBuf {
+        self.data_dir.join("workspaces")
     }
 
-    /// Root of the workspaces built from a given canonical repo: `repos/{name}/workspaces/`.
-    pub fn repo_workspaces_dir(&self, name: &str) -> PathBuf {
-        self.repo_dir(name).join("workspaces")
-    }
-
-    /// Where a specific review's workspace lives: `repos/{name}/workspaces/{slug}`. `slug` should
-    /// be the review's full canonical id (`ReviewKey::slug`, e.g. `gh/owner/repo/42`) so it can't
-    /// collide with another source's workspace under the same canonical repo.
-    pub fn workspace_dir(&self, name: &str, slug: &str) -> PathBuf {
-        self.repo_workspaces_dir(name).join(slug)
+    /// Where a specific review's workspace lives: `workspaces/{slug}`. `slug` should be the
+    /// review's full canonical id (`ReviewKey::slug`, e.g. `gh/owner/repo/42`) so it can't collide
+    /// with another source's workspace built from the same canonical repo.
+    pub fn workspace_dir(&self, slug: &str) -> PathBuf {
+        self.workspaces_dir().join(slug)
     }
 
     pub fn data_dir(&self) -> &Path {
