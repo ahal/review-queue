@@ -16,7 +16,7 @@
 //! Diffstat: `review_from_pull` also fetches (paginated) `GET
 //! /repos/{owner}/{repo}/pulls/{number}/files` for the per-file `filename`/`additions`/
 //! `deletions` breakdown - one extra request per review, paid during `rq sync` rather than by
-//! `rq list`'s TUI. If that call fails (rate limit, permissions), it falls back to the
+//! `rq show`'s TUI. If that call fails (rate limit, permissions), it falls back to the
 //! aggregate-only `additions`/`deletions`/`changed_files` already on the pull object fetched
 //! above (present only on the single-PR fetch, not the search results) rather than showing no
 //! diffstat at all.

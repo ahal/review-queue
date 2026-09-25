@@ -19,7 +19,7 @@
 //!
 //! `fetch_local()` is the on-demand counterpart - resolving a canonical repo (asking before
 //! cloning one, unless told otherwise) and creating a workspace for a single already-tracked
-//! review. It's what `rq fetch` and the fetch hotkey in `rq list`'s TUI call; `sync()` never
+//! review. It's what `rq fetch` and the fetch hotkey in `rq show`'s TUI call; `sync()` never
 //! calls it itself.
 
 use std::collections::{BTreeSet, HashMap};
@@ -367,7 +367,7 @@ pub async fn fetch_local(
     let (status, head_id) = match &outcome {
         Ok(head) => (Status::Ready, head.clone()),
         // Recorded anyway (with the workspace left in place, per the vcs backends' own
-        // contract) so `rq list`/`rq path` can point at it for inspection.
+        // contract) so `rq show`/`rq path` can point at it for inspection.
         Err(_) => (Status::ApplyFailed, String::new()),
     };
     entry.workspace = Some(Workspace {

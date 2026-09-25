@@ -55,7 +55,7 @@ pub struct Review {
     /// Diffstat (same summary format `git diff --stat`/`jj diff --stat` print), fetched
     /// best-effort as part of the same `fetch_queue()` call that built this `Review` - `None` if
     /// the source couldn't get one (no active diff, a Conduit/API hiccup, etc). Carried straight
-    /// into `state.json`'s `ReviewEntry` so `rq list`'s TUI can show it with no further network
+    /// into `state.json`'s `ReviewEntry` so `rq show`'s TUI can show it with no further network
     /// calls of its own.
     pub diff_stat: Option<String>,
 }

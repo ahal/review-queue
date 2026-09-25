@@ -26,8 +26,12 @@ async fn main() -> Result<()> {
     let config = Config::load(&config_path)?;
     let paths = paths.with_overrides(config.data_dir.clone());
 
-    match cli.command {
-        Command::List { json, all, plain } => {
+    match cli.command.unwrap_or(Command::Show {
+        json: false,
+        all: false,
+        plain: false,
+    }) {
+        Command::Show { json, all, plain } => {
             list(&paths, &config, &config_path, json, all, plain).await
         }
         Command::Path { id } => path(&paths, &id),
@@ -223,7 +227,7 @@ fn shell_init_script(shell: Shell) -> &'static str {
 #   eval "$(rq shell-init bash)"   # or: rq shell-init zsh
 rqcd() {
   local line
-  line=$(rq list --json | jq -r '.[] | [(.key.source + "/" + .key.id), .title] | @tsv' | fzf --delimiter='\t' --with-nth=2 | cut -f1)
+  line=$(rq show --json | jq -r '.[] | [(.key.source + "/" + .key.id), .title] | @tsv' | fzf --delimiter='\t' --with-nth=2 | cut -f1)
   [ -n "$line" ] && cd "$(rq path "$line")"
 }"#
         }
@@ -231,7 +235,7 @@ rqcd() {
             r#"# Requires `jq` and `fzf`. Add to your fish config:
 #   rq shell-init fish | source
 function rqcd
-    set -l line (rq list --json | jq -r '.[] | [(.key.source + "/" + .key.id), .title] | @tsv' | fzf --delimiter='\t' --with-nth=2 | cut -f1)
+    set -l line (rq show --json | jq -r '.[] | [(.key.source + "/" + .key.id), .title] | @tsv' | fzf --delimiter='\t' --with-nth=2 | cut -f1)
     if test -n "$line"
         cd (rq path $line)
     end
@@ -339,7 +343,7 @@ fn path(paths: &Paths, id: &str) -> Result<()> {
                 Ok(())
             }
             None => bail!(
-                "`{id}` has no local workspace yet; run `rq fetch {id}` (or press the fetch key in `rq list`)"
+                "`{id}` has no local workspace yet; run `rq fetch {id}` (or press the fetch key in `rq show`)"
             ),
         },
         many => {

@@ -29,7 +29,7 @@
 //!
 //! Author PHIDs are resolved to usernames with one batched `user.search
 //! {constraints:{phids:[...]}}` call over every distinct author in the page, rather than showing
-//! raw PHIDs in `rq list`/`rq path`.
+//! raw PHIDs in `rq show`/`rq path`.
 //!
 //! Every per-revision Conduit lookup after the initial queue fetch is batched across *all*
 //! actionable revisions rather than issued once per revision - a queue of N revisions used to cost
@@ -49,7 +49,7 @@
 //!   it's `getrawdiff`, not the more obvious-looking `differential.querydiffs`).
 //!
 //! `fetch_queue` fetches each `Review`'s diffstat itself (via `diff_stats_for`, above) rather than
-//! `rq list`'s TUI fetching it lazily on expand, so the TUI never blocks on Conduit.
+//! `rq show`'s TUI fetching it lazily on expand, so the TUI never blocks on Conduit.
 //!
 //! `version` is the comma-joined *`dateModified`* of every revision in the stack (walked via
 //! `edge.search`, same as before), not diff ids - `moz-phab` re-resolves the live diff/base
@@ -381,7 +381,7 @@ impl MozPhabSource {
         Ok(chains.remove(&revision_id).unwrap_or_default())
     }
 
-    /// Resolve author PHIDs to usernames for display (`rq list`/`rq path` show `moz-phab`-style
+    /// Resolve author PHIDs to usernames for display (`rq show`/`rq path` show `moz-phab`-style
     /// usernames, not raw PHIDs). Falls back to the PHID itself for any that don't resolve,
     /// rather than failing the whole queue fetch over a display nicety.
     async fn resolve_usernames(&self, phids: &[String]) -> Result<HashMap<String, String>> {

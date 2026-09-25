@@ -1,4 +1,4 @@
-//! `rq list`'s interactive TUI: a `cursive` (crossterm backend) `SelectView` of tracked reviews.
+//! `rq show`'s interactive TUI: a `cursive` (crossterm backend) `SelectView` of tracked reviews.
 //! Up/down and `j`/`k` move the cursor between *reviews*, skipping over an expanded review's
 //! diffstat lines rather than stepping into them (see `move_selection`) - arrow keys are
 //! intercepted via an `OnEventView` since `SelectView`'s own built-in handling would otherwise
