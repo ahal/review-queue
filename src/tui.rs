@@ -9,7 +9,8 @@
 //! to drop the user into a subshell in its worktree, resuming once they exit it - see
 //! `run_event_loop` for why that means tearing down and recreating the whole backend rather than
 //! just toggling raw mode. See `crate::sync`'s module docs for why `rq sync` itself never creates
-//! workspaces.
+//! workspaces. `d` deletes the selected review's workspace (`sync::remove_workspace`), confirming
+//! first and, if it has local changes, confirming again before discarding them.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -27,8 +28,8 @@ use crate::source::ReviewSource;
 use crate::state::{ReviewEntry, ReviewKey, State};
 use crate::sync;
 
-const HELP: &str =
-    "↑/↓ move   ←/→ expand/collapse   enter open locally   o open in browser   r reload   q quit";
+const HELP: &str = "↑/↓ move   ←/→ expand/collapse   enter open locally   o open in browser   \
+d delete workspace   r reload   q quit";
 
 struct Ctx {
     paths: Paths,
@@ -119,6 +120,7 @@ pub fn run(
     siv.add_global_callback('q', |s| s.quit());
     siv.add_global_callback(Key::Esc, |s| s.quit());
     siv.add_global_callback('o', open_in_browser_selected);
+    siv.add_global_callback('d', delete_workspace_selected);
     siv.add_global_callback('r', reload);
     siv.add_global_callback('j', |s| move_selection(s, true));
     siv.add_global_callback('k', |s| move_selection(s, false));
@@ -334,6 +336,63 @@ fn open_in_browser(s: &mut Cursive, key: &ReviewKey) {
             Err(e) => set_status(s, format!("failed to open {url}: {e}")),
         },
         None => set_status(s, format!("`{key}` is no longer tracked")),
+    }
+}
+
+fn delete_workspace_selected(s: &mut Cursive) {
+    let Some(key) = selected_key(s) else {
+        return;
+    };
+    let workspace_path = s.user_data::<Ctx>().and_then(|ctx| {
+        State::load(&ctx.paths.state_file())
+            .ok()
+            .and_then(|st| st.get(&key).and_then(|e| e.workspace.as_ref()).cloned())
+            .map(|ws| ws.workspace_path)
+    });
+    match workspace_path {
+        Some(path) => prompt_delete_workspace(s, key, path, false),
+        None => set_status(s, format!("`{key}` has no local workspace")),
+    }
+}
+
+/// Confirms before deleting a workspace - `force` (retried after a `WorkspaceDirty` error) warns
+/// that local changes will be discarded instead of just naming the path.
+fn prompt_delete_workspace(s: &mut Cursive, key: ReviewKey, path: PathBuf, force: bool) {
+    let (title, text) = if force {
+        (
+            "Discard local changes?",
+            format!("{} has local changes.\nDelete it anyway, discarding them?", path.display()),
+        )
+    } else {
+        ("Delete workspace?", format!("Delete workspace at {}?", path.display()))
+    };
+    let yes_key = key.clone();
+    let dialog = Dialog::text(text)
+        .title(title)
+        .button("No", |s| {
+            s.pop_layer();
+        })
+        .button("Yes", move |s| {
+            s.pop_layer();
+            do_delete_workspace(s, yes_key.clone(), path.clone(), force);
+        });
+    s.add_layer(dialog);
+}
+
+fn do_delete_workspace(s: &mut Cursive, key: ReviewKey, path: PathBuf, force: bool) {
+    let outcome = s
+        .user_data::<Ctx>()
+        .map(|ctx| sync::remove_workspace(&ctx.paths, &key, force));
+    match outcome {
+        Some(Ok(())) => {
+            set_status(s, format!("deleted workspace for {key}"));
+            reload(s);
+        }
+        Some(Err(e)) => match e.downcast::<sync::WorkspaceDirty>() {
+            Ok(_) => prompt_delete_workspace(s, key, path, true),
+            Err(e) => set_status(s, format!("failed to delete workspace for {key}: {e:#}")),
+        },
+        None => {}
     }
 }
 

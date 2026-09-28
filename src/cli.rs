@@ -27,8 +27,8 @@ pub enum Command {
     },
     /// Show tracked reviews. Opens an interactive TUI when stdout is a terminal (arrow keys or
     /// j/k to move, enter to open the review locally in a subshell, `o` to open it in your
-    /// browser, `q` to quit); prints a plain table otherwise, or with `--plain`. This is the
-    /// default when no subcommand is given.
+    /// browser, `d` to delete its local workspace, `q` to quit); prints a plain table otherwise,
+    /// or with `--plain`. This is the default when no subcommand is given.
     Show {
         #[arg(long)]
         json: bool,

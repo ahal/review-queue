@@ -23,8 +23,9 @@
 //! calls it itself.
 
 use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::config::{Config, VcsKind};
 use crate::paths::Paths;
@@ -391,6 +392,59 @@ pub async fn fetch_local(
     state.save(&paths.state_file())?;
     repo_store.save()?;
     outcome.map(|_| ws_path)
+}
+
+/// Returned by `remove_workspace` when the workspace has local changes and `force` wasn't set.
+/// Callers should confirm with the user and retry with `force: true` if they agree to discard
+/// them.
+#[derive(Debug, thiserror::Error)]
+#[error("workspace at {} has local changes", path.display())]
+pub struct WorkspaceDirty {
+    pub path: PathBuf,
+}
+
+/// Delete a review's local workspace on demand - the `d` hotkey in `rq show`'s TUI. Acts
+/// regardless of `resolved`/`in_queue`, unlike `sync()`'s own resolved-and-clean removal path.
+///
+/// A dirty workspace is left untouched and surfaces as `WorkspaceDirty` (`downcast_ref` it)
+/// unless `force` is set, in which case whatever the backend's own `remove_workspace` can't clean
+/// up on a dirty worktree (it assumes a clean one) is finished off with a raw directory removal.
+pub fn remove_workspace(paths: &Paths, key: &ReviewKey, force: bool) -> Result<()> {
+    let mut state = State::load(&paths.state_file())?;
+    let mut entry = state
+        .get(key)
+        .cloned()
+        .with_context(|| format!("`{key}` isn't tracked"))?;
+    let Some(ws) = entry.workspace.clone() else {
+        bail!("`{key}` has no local workspace");
+    };
+
+    if ws.workspace_path.exists() {
+        let vcs = vcs_for(ws.vcs);
+        if !force && vcs.is_dirty(&ws.workspace_path, &ws.head_id).unwrap_or(true) {
+            return Err(WorkspaceDirty {
+                path: ws.workspace_path.clone(),
+            }
+            .into());
+        }
+        if vcs
+            .remove_workspace(&ws.repo_path, &ws.workspace_path, &key.slug())
+            .is_err()
+        {
+            if !force {
+                bail!(
+                    "failed to remove workspace at {}",
+                    ws.workspace_path.display()
+                );
+            }
+            std::fs::remove_dir_all(&ws.workspace_path)
+                .with_context(|| format!("removing {}", ws.workspace_path.display()))?;
+        }
+    }
+
+    entry.workspace = None;
+    state.insert(entry);
+    state.save(&paths.state_file())
 }
 
 #[cfg(test)]
@@ -888,6 +942,131 @@ mod tests {
             ws_path.join("untracked.txt").exists(),
             "local edit must survive untouched"
         );
+    }
+
+    #[tokio::test]
+    async fn remove_workspace_deletes_a_clean_one() {
+        let repos = make_repos();
+        let sha = git_rev_parse(&repos.fork, "HEAD");
+        let server = MockServer::start().await;
+        mount_search(&server, true).await;
+        mount_pull(
+            &server,
+            pull_json("moz", "proj", &repos.upstream, &repos.fork, &sha, "open"),
+        )
+        .await;
+
+        let work_tmp = TempDir::new().unwrap();
+        let paths = paths_in(work_tmp.path());
+        let config = Config::default();
+        let key = ReviewKey::new("gh", "moz/proj/1");
+        let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
+        sync(&sources, &paths, None, false).await.unwrap();
+        let ws_path = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone)
+            .await
+            .unwrap();
+
+        remove_workspace(&paths, &key, false).unwrap();
+
+        assert!(!ws_path.exists());
+        let entry = State::load(&paths.state_file()).unwrap();
+        let entry = entry.get(&key).unwrap();
+        assert!(
+            entry.workspace.is_none(),
+            "review stays tracked, just without a workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_workspace_refuses_a_dirty_one_without_force() {
+        let repos = make_repos();
+        let sha = git_rev_parse(&repos.fork, "HEAD");
+        let server = MockServer::start().await;
+        mount_search(&server, true).await;
+        mount_pull(
+            &server,
+            pull_json("moz", "proj", &repos.upstream, &repos.fork, &sha, "open"),
+        )
+        .await;
+
+        let work_tmp = TempDir::new().unwrap();
+        let paths = paths_in(work_tmp.path());
+        let config = Config::default();
+        let key = ReviewKey::new("gh", "moz/proj/1");
+        let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
+        sync(&sources, &paths, None, false).await.unwrap();
+        let ws_path = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone)
+            .await
+            .unwrap();
+        std::fs::write(ws_path.join("untracked.txt"), "local edit\n").unwrap();
+
+        let err = remove_workspace(&paths, &key, false).unwrap_err();
+
+        assert!(err.downcast_ref::<WorkspaceDirty>().is_some());
+        assert!(ws_path.exists(), "must not touch a dirty workspace");
+        let entry = State::load(&paths.state_file()).unwrap();
+        assert!(entry.get(&key).unwrap().workspace.is_some());
+    }
+
+    #[tokio::test]
+    async fn remove_workspace_with_force_discards_local_changes() {
+        let repos = make_repos();
+        let sha = git_rev_parse(&repos.fork, "HEAD");
+        let server = MockServer::start().await;
+        mount_search(&server, true).await;
+        mount_pull(
+            &server,
+            pull_json("moz", "proj", &repos.upstream, &repos.fork, &sha, "open"),
+        )
+        .await;
+
+        let work_tmp = TempDir::new().unwrap();
+        let paths = paths_in(work_tmp.path());
+        let config = Config::default();
+        let key = ReviewKey::new("gh", "moz/proj/1");
+        let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
+        sync(&sources, &paths, None, false).await.unwrap();
+        let ws_path = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone)
+            .await
+            .unwrap();
+        std::fs::write(ws_path.join("untracked.txt"), "local edit\n").unwrap();
+
+        remove_workspace(&paths, &key, true).unwrap();
+
+        assert!(!ws_path.exists());
+        let entry = State::load(&paths.state_file()).unwrap();
+        assert!(entry.get(&key).unwrap().workspace.is_none());
+    }
+
+    #[test]
+    fn remove_workspace_errors_when_review_has_none() {
+        let work_tmp = TempDir::new().unwrap();
+        let paths = paths_in(work_tmp.path());
+        let key = ReviewKey::new("gh", "moz/proj/1");
+        let mut state = State::default();
+        state.insert(ReviewEntry {
+            key: key.clone(),
+            title: "Fix the thing".into(),
+            author: "someone".into(),
+            url: "https://example.com/1".into(),
+            repo: crate::source::RepoRef {
+                urls: vec!["https://example.com/o/r".into()],
+                display_name: "o/r".into(),
+            },
+            kind: crate::source::ReviewKind::Direct,
+            version: "1".into(),
+            in_queue: true,
+            resolved: false,
+            last_synced: chrono::Utc::now(),
+            workspace: None,
+            diff_stat: None,
+        });
+        state.save(&paths.state_file()).unwrap();
+
+        let err = remove_workspace(&paths, &key, false).unwrap_err();
+
+        assert!(err.downcast_ref::<WorkspaceDirty>().is_none());
+        assert!(format!("{err:#}").contains("no local workspace"));
     }
 
     #[tokio::test]
