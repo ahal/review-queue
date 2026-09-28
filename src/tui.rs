@@ -11,9 +11,21 @@
 //! just toggling raw mode. See `crate::sync`'s module docs for why `rq sync` itself never creates
 //! workspaces. `d` deletes the selected review's workspace (`sync::remove_workspace`), confirming
 //! first and, if it has local changes, confirming again before discarding them.
+//!
+//! Fetching a review with no local worktree yet asks to confirm first (`prompt_confirm_fetch`) -
+//! `fetch_local` may clone a repo or shell out to a source's checkout command, either of which
+//! can take a while. Once confirmed, `begin_fetch` runs it on a background thread so the event
+//! loop stays responsive: a spinner ticks via `Cursive::cb_sink`, and `Cancel` stays clickable
+//! throughout. The underlying `git`/`jj` calls have no cancellation points of their own, so
+//! cancelling doesn't interrupt them - it just detaches from the operation, which keeps running;
+//! `finish_fetch` still runs when it completes, and removes whatever workspace it created instead
+//! of opening a shell into it.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use cursive::event::Key;
@@ -28,6 +40,9 @@ use crate::source::ReviewSource;
 use crate::state::{ReviewEntry, ReviewKey, State};
 use crate::sync;
 
+/// Frames for the spinner shown while a review is fetched on a background thread.
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 const HELP: &str = "↑/↓ move   ←/→ expand/collapse   enter open locally   o open in browser   \
 d delete workspace   r reload   q quit";
 
@@ -35,7 +50,7 @@ struct Ctx {
     paths: Paths,
     config: Config,
     config_path: PathBuf,
-    sources: Vec<Box<dyn ReviewSource>>,
+    sources: Arc<Vec<Box<dyn ReviewSource>>>,
     handle: tokio::runtime::Handle,
     all: bool,
     key_w: usize,
@@ -45,6 +60,10 @@ struct Ctx {
     /// Set by `do_open_locally` on a successful fetch; drained by `run_event_loop`, which is the
     /// only place actually allowed to touch the terminal/backend to suspend into a subshell.
     pending_shell: Option<(ReviewKey, PathBuf)>,
+    /// Reviews `begin_fetch` currently has a background fetch running for - guards against
+    /// pressing `enter` on the same review again (and racing two `fetch_local` calls against the
+    /// same workspace path) while its own confirm/progress dialog is already up.
+    fetching: BTreeSet<ReviewKey>,
 }
 
 /// A row in the `reviews` `SelectView`: either a review itself, or one of the diffstat lines
@@ -86,13 +105,14 @@ pub fn run(
         paths,
         config,
         config_path,
-        sources,
+        sources: Arc::new(sources),
         handle: tokio::runtime::Handle::current(),
         all,
         key_w,
         author_w,
         expanded: BTreeSet::new(),
         pending_shell: None,
+        fetching: BTreeSet::new(),
     });
 
     let mut select = SelectView::<Row>::new();
@@ -397,17 +417,196 @@ fn do_delete_workspace(s: &mut Cursive, key: ReviewKey, path: PathBuf, force: bo
 }
 
 fn open_locally_selected_key(s: &mut Cursive, key: ReviewKey) {
-    let on_missing = s
-        .user_data::<Ctx>()
-        .map(|ctx| {
-            if ctx.config.auto_clone {
-                OnMissing::Clone
-            } else {
-                OnMissing::Ask
-            }
+    let Some(ctx) = s.user_data::<Ctx>() else {
+        return;
+    };
+    let on_missing = if ctx.config.auto_clone {
+        OnMissing::Clone
+    } else {
+        OnMissing::Ask
+    };
+    if ctx.fetching.contains(&key) {
+        set_status(s, format!("already fetching {key}"));
+        return;
+    }
+    let has_workspace = State::load(&ctx.paths.state_file())
+        .ok()
+        .and_then(|st| st.get(&key).map(|e| e.workspace.is_some()))
+        .unwrap_or(false);
+
+    if has_workspace {
+        // Already fetched - `fetch_local` is a fast, local no-op in this case, so there's
+        // nothing worth showing a confirmation or progress dialog for.
+        do_open_locally(s, key, on_missing);
+    } else {
+        prompt_confirm_fetch(s, key, on_missing);
+    }
+}
+
+/// Per-fetch view names, namespaced by review key - two reviews can be fetching at once (the TUI
+/// stays responsive while a fetch runs), so a bare `"fetch_dialog"`/`"fetch_spinner"` would let
+/// one's dialog get mistaken for the other's.
+fn fetch_dialog_name(key: &ReviewKey) -> String {
+    format!("fetch_dialog::{key}")
+}
+fn fetch_spinner_name(key: &ReviewKey) -> String {
+    format!("fetch_spinner::{key}")
+}
+
+/// Confirms before fetching a review that has no local worktree yet, since `fetch_local` may
+/// clone a repo or run a source's checkout command - either can take a while. `Proceed` hands off
+/// to `begin_fetch`; `Cancel` also flips `cancelled`, though it's a no-op at this point since
+/// nothing is running yet - the same flag is threaded through to `finish_fetch` in case the user
+/// cancels again once the fetch is actually in flight.
+fn prompt_confirm_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_flag = cancelled.clone();
+    let proceed_key = key.clone();
+    let dialog = Dialog::text(format!("No local worktree for `{key}` yet.\nFetch it now?"))
+        .title("Fetch review?")
+        .button("Cancel", move |s| {
+            cancel_flag.store(true, Ordering::SeqCst);
+            s.pop_layer();
         })
-        .unwrap_or(OnMissing::Ask);
-    do_open_locally(s, key, on_missing);
+        .button("Proceed", move |s| {
+            begin_fetch(s, proceed_key.clone(), on_missing, cancelled.clone());
+        })
+        .with_name(fetch_dialog_name(&key));
+    s.add_layer(dialog);
+}
+
+/// Kicks off `sync::fetch_local` on a background thread and shows progress while it runs. If
+/// `s` has a `fetch_dialog` layer already up (the `prompt_confirm_fetch` dialog, `Proceed` just
+/// pressed), it's reused: `Proceed` is disabled - greyed out and unclickable - rather than
+/// removed, and `Cancel` (already wired to `cancelled`) is left alone so it keeps working exactly
+/// as it did before the fetch started. Otherwise (e.g. after confirming a clone from
+/// `prompt_clone`, which has no preceding fetch dialog to repurpose) a fresh one is built with
+/// just `Cancel`.
+fn begin_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing, cancelled: Arc<AtomicBool>) {
+    let dialog_name = fetch_dialog_name(&key);
+    let spinner_name = fetch_spinner_name(&key);
+    let reused = s
+        .call_on_name(&dialog_name, |d: &mut Dialog| {
+            if let Some(btn) = d.buttons_mut().nth(1) {
+                btn.disable();
+            }
+            d.set_content(TextView::new(spinner_line(&key, 0)).with_name(spinner_name.clone()));
+        })
+        .is_some();
+    if !reused {
+        let cancel_flag = cancelled.clone();
+        let dialog = Dialog::around(TextView::new(spinner_line(&key, 0)).with_name(spinner_name))
+            .title("Fetching...")
+            .button("Cancel", move |s| {
+                cancel_flag.store(true, Ordering::SeqCst);
+                s.pop_layer();
+            })
+            .with_name(dialog_name);
+        s.add_layer(dialog);
+    }
+
+    let Some(ctx) = s.user_data::<Ctx>() else {
+        return;
+    };
+    ctx.fetching.insert(key.clone());
+    let sources = ctx.sources.clone();
+    let paths = ctx.paths.clone();
+    let config = ctx.config.clone();
+    let handle = ctx.handle.clone();
+
+    let done = Arc::new(AtomicBool::new(false));
+    spawn_spinner_ticker(s, key.clone(), done.clone());
+
+    let cb_sink = s.cb_sink().clone();
+    let worker_key = key.clone();
+    std::thread::spawn(move || {
+        let result =
+            handle.block_on(sync::fetch_local(&sources, &paths, &config, &worker_key, on_missing));
+        done.store(true, Ordering::SeqCst);
+        let _ = cb_sink.send(Box::new(move |s| finish_fetch(s, worker_key, result, cancelled)));
+    });
+}
+
+fn spinner_line(key: &ReviewKey, frame: usize) -> String {
+    format!("{} fetching `{key}`...", SPINNER_FRAMES[frame % SPINNER_FRAMES.len()])
+}
+
+/// Ticks `key`'s spinner text view roughly every 120ms until `done` is set, so `begin_fetch`'s
+/// background fetch has some visible sign of life instead of a frozen-looking dialog.
+fn spawn_spinner_ticker(s: &Cursive, key: ReviewKey, done: Arc<AtomicBool>) {
+    let cb_sink = s.cb_sink().clone();
+    let spinner_name = fetch_spinner_name(&key);
+    std::thread::spawn(move || {
+        let mut frame = 0usize;
+        loop {
+            std::thread::sleep(Duration::from_millis(120));
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            frame = frame.wrapping_add(1);
+            let tick_key = key.clone();
+            let name = spinner_name.clone();
+            if cb_sink
+                .send(Box::new(move |s| {
+                    s.call_on_name(&name, |v: &mut TextView| {
+                        v.set_content(spinner_line(&tick_key, frame));
+                    });
+                }))
+                .is_err()
+            {
+                break; // UI gone.
+            }
+        }
+    });
+}
+
+/// Runs once `begin_fetch`'s background thread finishes, back on the main thread via `cb_sink`.
+/// If `cancelled` was flipped in the meantime, the operation itself was never interrupted (see the
+/// module docs), so a successful fetch's workspace is removed here instead of being opened;
+/// nothing needs cleaning up on a failed one.
+fn finish_fetch(s: &mut Cursive, key: ReviewKey, result: Result<PathBuf>, cancelled: Arc<AtomicBool>) {
+    if let Some(ctx) = s.user_data::<Ctx>() {
+        ctx.fetching.remove(&key);
+    }
+    // By name and not `pop_layer()` - the user is free to open other dialogs (e.g. `d`) while a
+    // fetch runs in the background, which would otherwise end up on top of this one and get
+    // popped by mistake instead of it.
+    if let Some(pos) = s.screen_mut().find_layer_from_name(&fetch_dialog_name(&key)) {
+        s.screen_mut().remove_layer(pos);
+    }
+
+    if cancelled.load(Ordering::SeqCst) {
+        let status = match &result {
+            Ok(_) => match s
+                .user_data::<Ctx>()
+                .map(|ctx| sync::remove_workspace(&ctx.paths, &key, true))
+            {
+                Some(Ok(())) => format!("cancelled fetching {key}; workspace cleaned up"),
+                Some(Err(e)) => format!("cancelled fetching {key}; cleanup failed: {e:#}"),
+                None => format!("cancelled fetching {key}"),
+            },
+            Err(_) => format!("cancelled fetching {key}"),
+        };
+        set_status(s, status);
+        reload(s);
+        return;
+    }
+
+    match result {
+        Ok(path) => {
+            if let Some(ctx) = s.user_data::<Ctx>() {
+                ctx.pending_shell = Some((key, path));
+            }
+            reload(s);
+        }
+        Err(e) => match e.downcast::<NeedsClone>() {
+            Ok(needs_clone) => prompt_clone(s, key, needs_clone.url, needs_clone.dest),
+            Err(e) => {
+                set_status(s, format!("error fetching {key}: {e:#}"));
+                reload(s);
+            }
+        },
+    }
 }
 
 fn do_open_locally(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
@@ -461,7 +660,7 @@ fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf) {
     })
     .button("Yes", move |s| {
         s.pop_layer();
-        do_open_locally(s, yes_key.clone(), OnMissing::Clone);
+        begin_fetch(s, yes_key.clone(), OnMissing::Clone, Arc::new(AtomicBool::new(false)));
     })
     .button("Always", move |s| {
         s.pop_layer();
@@ -476,7 +675,7 @@ fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf) {
             set_status(s, format!("failed to save auto_clone: {e:#}"));
             return;
         }
-        do_open_locally(s, always_key.clone(), OnMissing::Clone);
+        begin_fetch(s, always_key.clone(), OnMissing::Clone, Arc::new(AtomicBool::new(false)));
     });
     s.add_layer(dialog);
 }
@@ -721,13 +920,14 @@ mod tests {
             paths,
             config: Config::default(),
             config_path: PathBuf::new(),
-            sources: Vec::new(),
+            sources: Arc::new(Vec::new()),
             handle: tokio::runtime::Handle::current(),
             all: true,
             key_w: 5,
             author_w: 6,
             expanded: BTreeSet::new(),
             pending_shell: None,
+            fetching: BTreeSet::new(),
         }
     }
 
