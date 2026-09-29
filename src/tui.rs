@@ -49,8 +49,17 @@ use crate::sync;
 /// Frames for the spinner shown while a review is fetched on a background thread.
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-const HELP: &str = "↑/↓ move   ←/→ expand/collapse   enter open locally   f fetch   o open in browser   \
-d delete workspace   r reload   q quit";
+const HELP: &str = "[Q]uit   [?]";
+
+const HELP_DIALOG: &str = "↑/↓ or j/k    move
+←/→ or h/l    expand/collapse
+enter         open locally
+f             fetch
+o             open in browser
+d             delete workspace
+r             reload
+q / esc       quit
+?             show this help";
 
 struct Ctx {
     paths: Paths,
@@ -174,6 +183,7 @@ pub fn run(
     siv.add_fullscreen_layer(layout);
 
     siv.add_global_callback('q', |s| s.quit());
+    siv.add_global_callback('?', show_help);
     siv.add_global_callback(Key::Esc, |s| s.quit());
     siv.add_global_callback('o', open_in_browser_selected);
     siv.add_global_callback('d', delete_workspace_selected);
@@ -499,6 +509,22 @@ fn vim_keys(dialog: Dialog) -> OnEventView<Dialog> {
         })
         .on_pre_event_inner(Event::Char('j'), |_, _| Some(EventResult::consumed()))
         .on_pre_event_inner(Event::Char('k'), |_, _| Some(EventResult::consumed()))
+}
+
+fn show_help(s: &mut Cursive) {
+    let dialog = Dialog::text(HELP_DIALOG).title("Shortcuts").button("Close", |s| {
+        s.pop_layer();
+    });
+    // Esc would otherwise fall through to the global quit callback.
+    s.add_layer(
+        vim_keys(dialog)
+            .on_event(Key::Esc, |s| {
+                s.pop_layer();
+            })
+            .on_event('?', |s| {
+                s.pop_layer();
+            }),
+    );
 }
 
 fn open_in_browser_selected(s: &mut Cursive) {
