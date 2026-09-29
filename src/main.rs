@@ -98,7 +98,10 @@ async fn sync_cmd(
         && !sources.iter().any(|s| s.name() == name)
     {
         let known: Vec<&str> = sources.iter().map(|s| s.name()).collect();
-        bail!("no such source `{name}` (known sources: {})", known.join(", "));
+        bail!(
+            "no such source `{name}` (known sources: {})",
+            known.join(", ")
+        );
     }
     let report = sync::sync(&sources, paths, only_source, dry_run).await?;
     print_sync_report(&report, dry_run);

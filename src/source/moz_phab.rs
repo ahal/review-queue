@@ -314,7 +314,9 @@ impl MozPhabSource {
         &self,
         revisions: impl IntoIterator<Item = &'a RevisionItem>,
     ) -> HashMap<u64, String> {
-        self.diff_stats_for_inner(revisions).await.unwrap_or_default()
+        self.diff_stats_for_inner(revisions)
+            .await
+            .unwrap_or_default()
     }
 
     async fn diff_stats_for_inner<'a>(
@@ -1512,8 +1514,12 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/differential.diff.search"))
-            .and(body_string_contains("constraints%5Bphids%5D%5B0%5D=PHID-DIFF-1"))
-            .and(body_string_contains("constraints%5Bphids%5D%5B1%5D=PHID-DIFF-2"))
+            .and(body_string_contains(
+                "constraints%5Bphids%5D%5B0%5D=PHID-DIFF-1",
+            ))
+            .and(body_string_contains(
+                "constraints%5Bphids%5D%5B1%5D=PHID-DIFF-2",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[
                 json!({"id": 42, "phid": "PHID-DIFF-1"}),
                 json!({"id": 43, "phid": "PHID-DIFF-2"}),
@@ -1583,9 +1589,11 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/differential.getrawdiff"))
             .and(body_string_contains("diffID=43"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(call_response(json!(
-                "diff --git a/ok.rs b/ok.rs\n--- a/ok.rs\n+++ b/ok.rs\n@@ -0,0 +1,1 @@\n+ok\n"
-            ))))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(call_response(json!(
+                    "diff --git a/ok.rs b/ok.rs\n--- a/ok.rs\n+++ b/ok.rs\n@@ -0,0 +1,1 @@\n+ok\n"
+                ))),
+            )
             .mount(&server)
             .await;
 
@@ -1596,7 +1604,10 @@ mod tests {
         ];
         let stats = src.diff_stats_for(revisions.iter()).await;
 
-        assert!(!stats.contains_key(&1), "the failing revision should just be skipped");
+        assert!(
+            !stats.contains_key(&1),
+            "the failing revision should just be skipped"
+        );
         assert!(stats[&2].contains("ok.rs"));
     }
 
@@ -1614,7 +1625,10 @@ mod tests {
 
         let stats = src.diff_stats_for(revisions.iter()).await;
 
-        assert!(stats.is_empty(), "a Conduit failure should not panic or propagate");
+        assert!(
+            stats.is_empty(),
+            "a Conduit failure should not panic or propagate"
+        );
     }
 
     #[test]

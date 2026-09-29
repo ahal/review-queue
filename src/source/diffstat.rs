@@ -30,7 +30,11 @@ pub fn format_diffstat(changes: &[FileChange]) -> String {
     }
 
     let shown = &changes[..changes.len().min(MAX_FILES_SHOWN)];
-    let name_w = shown.iter().map(|c| c.path.chars().count()).max().unwrap_or(0);
+    let name_w = shown
+        .iter()
+        .map(|c| c.path.chars().count())
+        .max()
+        .unwrap_or(0);
     let max_total = shown
         .iter()
         .map(|c| c.additions + c.deletions)
@@ -50,7 +54,9 @@ pub fn format_diffstat(changes: &[FileChange]) -> String {
 
         let bar_len = ((total as f64 / max_total as f64) * MAX_BAR_WIDTH as f64).round() as usize;
         let bar_len = if total > 0 { bar_len.max(1) } else { 0 };
-        let plus_len = (bar_len as u64 * c.additions).checked_div(total).unwrap_or(0) as usize;
+        let plus_len = (bar_len as u64 * c.additions)
+            .checked_div(total)
+            .unwrap_or(0) as usize;
         let minus_len = bar_len.saturating_sub(plus_len);
 
         lines.push(format!(

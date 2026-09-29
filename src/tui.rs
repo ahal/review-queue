@@ -23,21 +23,23 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
-use cursive::event::Key;
-use cursive::traits::*;
-use cursive::views::{Dialog, LinearLayout, OnEventView, SelectView, TextView};
 use cursive::Cursive;
+use cursive::event::Key;
+use cursive::theme::{BaseColor, Color, Effect, Theme};
+use cursive::traits::*;
+use cursive::utils::markup::StyledString;
+use cursive::views::{Dialog, LinearLayout, OnEventView, SelectView, TextView};
 
 use crate::config::{self, Config};
 use crate::paths::Paths;
 use crate::repo::{NeedsClone, OnMissing};
 use crate::source::ReviewSource;
-use crate::state::{ReviewEntry, ReviewKey, State};
+use crate::state::{ReviewEntry, ReviewKey, State, Status};
 use crate::sync;
 
 /// Frames for the spinner shown while a review is fetched on a background thread.
@@ -101,6 +103,9 @@ pub fn run(
     let (key_w, author_w) = column_widths(&entries);
 
     let mut siv = Cursive::new();
+    // Inherit the terminal's own colors. The palette's `Highlight` styles already use reverse video,
+    // so the selected row stays visible without hardcoding any colors.
+    siv.set_theme(Theme::terminal_default());
     siv.set_user_data(Ctx {
         paths,
         config,
@@ -131,10 +136,13 @@ pub fn run(
         .on_event(Key::Left, |s| set_expanded(s, false));
 
     let layout = LinearLayout::vertical()
-        .child(TextView::new(header_line(key_w, author_w)))
+        .child(TextView::new(StyledString::styled(
+            header_line(key_w, author_w),
+            Effect::Bold,
+        )))
         .child(select.scrollable().full_height())
         .child(TextView::new("").with_name("status"))
-        .child(TextView::new(HELP));
+        .child(TextView::new(StyledString::styled(HELP, Effect::Dim)));
     siv.add_fullscreen_layer(layout);
 
     siv.add_global_callback('q', |s| s.quit());
@@ -171,8 +179,9 @@ fn run_event_loop(mut siv: Cursive) -> Result<()> {
             runner.refresh();
             loop {
                 runner.step();
-                if let Some((key, path)) =
-                    runner.user_data::<Ctx>().and_then(|ctx| ctx.pending_shell.take())
+                if let Some((key, path)) = runner
+                    .user_data::<Ctx>()
+                    .and_then(|ctx| ctx.pending_shell.take())
                 {
                     break Outcome::OpenShell(key, path);
                 }
@@ -188,7 +197,9 @@ fn run_event_loop(mut siv: Cursive) -> Result<()> {
             Outcome::Quit => return Ok(()),
             Outcome::OpenShell(key, path) => {
                 let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-                let result = std::process::Command::new(&shell).current_dir(&path).status();
+                let result = std::process::Command::new(&shell)
+                    .current_dir(&path)
+                    .status();
                 match result {
                     Ok(status) if status.success() => {
                         set_status(&mut siv, format!("back from {key} ({})", path.display()))
@@ -245,21 +256,76 @@ fn header_line(key_w: usize, author_w: usize) -> String {
     )
 }
 
-fn row_label(e: &ReviewEntry, key_w: usize, author_w: usize, expanded: bool) -> String {
+fn ansi(c: BaseColor) -> Color {
+    Color::Dark(c)
+}
+
+fn row_label(e: &ReviewEntry, key_w: usize, author_w: usize, expanded: bool) -> StyledString {
     let marker = if expanded { '\u{25be}' } else { '\u{25b8}' };
-    let fetched = if e.workspace.is_some() { "yes" } else { "no" };
-    let status = match &e.workspace {
-        Some(ws) => format!("{:?}", ws.status),
-        None if e.resolved => "resolved".to_string(),
-        None if e.in_queue => "queued".to_string(),
-        None => "waiting".to_string(),
+    let (fetched, fetched_color) = if e.workspace.is_some() {
+        ("yes", ansi(BaseColor::Green))
+    } else {
+        ("no", Color::TerminalDefault)
     };
-    format!(
-        "{marker} {:<key_w$}  {fetched:<3}  {status:<9}  {}  {}",
-        e.key.slug(),
-        truncate(&e.author, author_w),
-        e.title,
-    )
+    let (status, status_color) = match &e.workspace {
+        Some(ws) => (
+            format!("{:?}", ws.status),
+            match ws.status {
+                Status::Ready => ansi(BaseColor::Green),
+                Status::ApplyFailed => ansi(BaseColor::Red),
+                Status::Dirty => ansi(BaseColor::Yellow),
+            },
+        ),
+        None if e.resolved => ("resolved".to_string(), ansi(BaseColor::Magenta)),
+        None if e.in_queue => ("queued".to_string(), ansi(BaseColor::Blue)),
+        None => ("waiting".to_string(), Color::TerminalDefault),
+    };
+
+    let mut out = StyledString::styled(format!("{marker} "), Effect::Dim);
+    out.append_styled(format!("{:<key_w$}", e.key.slug()), ansi(BaseColor::Cyan));
+    out.append_plain("  ");
+    out.append_styled(format!("{fetched:<3}"), fetched_color);
+    out.append_plain("  ");
+    out.append_styled(format!("{status:<9}"), status_color);
+    out.append_plain("  ");
+    out.append_plain(truncate(&e.author, author_w));
+    out.append_plain("  ");
+    out.append_plain(&e.title);
+    out
+}
+
+/// Colors a diffstat line: the `+`/`-` graph after a file's `|` becomes green/red, and in the
+/// `N insertions(+), M deletions(-)` summary the matching segments get the same treatment.
+fn style_detail(line: &str) -> StyledString {
+    let mut out = StyledString::new();
+    if let Some((name, graph)) = line.split_once('|') {
+        out.append_plain(format!("{name}|"));
+        if graph.contains("Bin ") {
+            out.append_plain(graph);
+            return out;
+        }
+        for c in graph.chars() {
+            match c {
+                '+' => out.append_styled(c.to_string(), ansi(BaseColor::Green)),
+                '-' => out.append_styled(c.to_string(), ansi(BaseColor::Red)),
+                _ => out.append_plain(c.to_string()),
+            }
+        }
+    } else {
+        for (i, part) in line.split(',').enumerate() {
+            if i > 0 {
+                out.append_plain(",");
+            }
+            if part.ends_with("(+)") {
+                out.append_styled(part, ansi(BaseColor::Green));
+            } else if part.ends_with("(-)") {
+                out.append_styled(part, ansi(BaseColor::Red));
+            } else {
+                out.append_plain(part);
+            }
+        }
+    }
+    out
 }
 
 /// The diffstat lines shown under an expanded review - `rq sync` fetches this from the review's
@@ -277,7 +343,7 @@ fn build_rows(
     key_w: usize,
     author_w: usize,
     expanded: &BTreeSet<ReviewKey>,
-) -> Vec<(String, Row)> {
+) -> Vec<(StyledString, Row)> {
     let mut rows = Vec::new();
     for e in entries {
         let is_expanded = expanded.contains(&e.key);
@@ -287,7 +353,7 @@ fn build_rows(
         ));
         if is_expanded {
             for line in detail_lines(e) {
-                rows.push((line, Row::Detail(e.key.clone())));
+                rows.push((style_detail(&line), Row::Detail(e.key.clone())));
             }
         }
     }
@@ -304,7 +370,11 @@ fn move_selection(s: &mut Cursive, down: bool) {
     s.call_on_name("reviews", |v: &mut SelectView<Row>| {
         loop {
             let before = v.selected_id();
-            let _ = if down { v.select_down(1) } else { v.select_up(1) };
+            let _ = if down {
+                v.select_down(1)
+            } else {
+                v.select_up(1)
+            };
             if v.selected_id() == before {
                 break; // hit the top/bottom of the list; nowhere left to go
             }
@@ -381,10 +451,16 @@ fn prompt_delete_workspace(s: &mut Cursive, key: ReviewKey, path: PathBuf, force
     let (title, text) = if force {
         (
             "Discard local changes?",
-            format!("{} has local changes.\nDelete it anyway, discarding them?", path.display()),
+            format!(
+                "{} has local changes.\nDelete it anyway, discarding them?",
+                path.display()
+            ),
         )
     } else {
-        ("Delete workspace?", format!("Delete workspace at {}?", path.display()))
+        (
+            "Delete workspace?",
+            format!("Delete workspace at {}?", path.display()),
+        )
     };
     let yes_key = key.clone();
     let dialog = Dialog::text(text)
@@ -520,15 +596,25 @@ fn begin_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing, cancelled
     let cb_sink = s.cb_sink().clone();
     let worker_key = key.clone();
     std::thread::spawn(move || {
-        let result =
-            handle.block_on(sync::fetch_local(&sources, &paths, &config, &worker_key, on_missing));
+        let result = handle.block_on(sync::fetch_local(
+            &sources,
+            &paths,
+            &config,
+            &worker_key,
+            on_missing,
+        ));
         done.store(true, Ordering::SeqCst);
-        let _ = cb_sink.send(Box::new(move |s| finish_fetch(s, worker_key, result, cancelled)));
+        let _ = cb_sink.send(Box::new(move |s| {
+            finish_fetch(s, worker_key, result, cancelled)
+        }));
     });
 }
 
 fn spinner_line(key: &ReviewKey, frame: usize) -> String {
-    format!("{} fetching `{key}`...", SPINNER_FRAMES[frame % SPINNER_FRAMES.len()])
+    format!(
+        "{} fetching `{key}`...",
+        SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]
+    )
 }
 
 /// Ticks `key`'s spinner text view roughly every 120ms until `done` is set, so `begin_fetch`'s
@@ -564,14 +650,22 @@ fn spawn_spinner_ticker(s: &Cursive, key: ReviewKey, done: Arc<AtomicBool>) {
 /// If `cancelled` was flipped in the meantime, the operation itself was never interrupted (see the
 /// module docs), so a successful fetch's workspace is removed here instead of being opened;
 /// nothing needs cleaning up on a failed one.
-fn finish_fetch(s: &mut Cursive, key: ReviewKey, result: Result<PathBuf>, cancelled: Arc<AtomicBool>) {
+fn finish_fetch(
+    s: &mut Cursive,
+    key: ReviewKey,
+    result: Result<PathBuf>,
+    cancelled: Arc<AtomicBool>,
+) {
     if let Some(ctx) = s.user_data::<Ctx>() {
         ctx.fetching.remove(&key);
     }
     // By name and not `pop_layer()` - the user is free to open other dialogs (e.g. `d`) while a
     // fetch runs in the background, which would otherwise end up on top of this one and get
     // popped by mistake instead of it.
-    if let Some(pos) = s.screen_mut().find_layer_from_name(&fetch_dialog_name(&key)) {
+    if let Some(pos) = s
+        .screen_mut()
+        .find_layer_from_name(&fetch_dialog_name(&key))
+    {
         s.screen_mut().remove_layer(pos);
     }
 
@@ -660,7 +754,12 @@ fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf) {
     })
     .button("Yes", move |s| {
         s.pop_layer();
-        begin_fetch(s, yes_key.clone(), OnMissing::Clone, Arc::new(AtomicBool::new(false)));
+        begin_fetch(
+            s,
+            yes_key.clone(),
+            OnMissing::Clone,
+            Arc::new(AtomicBool::new(false)),
+        );
     })
     .button("Always", move |s| {
         s.pop_layer();
@@ -675,7 +774,12 @@ fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf) {
             set_status(s, format!("failed to save auto_clone: {e:#}"));
             return;
         }
-        begin_fetch(s, always_key.clone(), OnMissing::Clone, Arc::new(AtomicBool::new(false)));
+        begin_fetch(
+            s,
+            always_key.clone(),
+            OnMissing::Clone,
+            Arc::new(AtomicBool::new(false)),
+        );
     });
     s.add_layer(dialog);
 }
@@ -707,8 +811,8 @@ fn reload(s: &mut Cursive) {
             v.add_item(label, row);
         }
         if let Some(selected) = selected
-            && let Some(idx) = (0..v.len())
-                .find(|&i| v.get_item(i).is_some_and(|(_, row)| *row.key() == selected))
+            && let Some(idx) =
+                (0..v.len()).find(|&i| v.get_item(i).is_some_and(|(_, row)| *row.key() == selected))
         {
             v.set_selection(idx);
         }

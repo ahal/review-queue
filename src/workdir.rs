@@ -50,8 +50,8 @@ impl WorkdirCache {
         if !path.exists() {
             return Ok(None);
         }
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         if text.trim().is_empty() {
             return Ok(None);
         }
@@ -332,13 +332,19 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let repo = tmp.path().join("repo");
         git_repo_with_remote(&repo, "https://example.com/fork/r");
-        git(&repo, &["remote", "add", "upstream", "https://example.com/o/r"]);
+        git(
+            &repo,
+            &["remote", "add", "upstream", "https://example.com/o/r"],
+        );
 
         let found = scan(tmp.path(), Path::new("/nonexistent"));
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name, "example.com/fork/r");
         assert_eq!(
-            found[0].remotes.iter().collect::<std::collections::HashSet<_>>(),
+            found[0]
+                .remotes
+                .iter()
+                .collect::<std::collections::HashSet<_>>(),
             std::collections::HashSet::from([
                 &"example.com/fork/r".to_string(),
                 &"example.com/o/r".to_string(),

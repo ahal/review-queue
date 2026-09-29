@@ -288,12 +288,11 @@ impl RepoStore {
     /// at it.
     pub fn remove(&mut self, url: &str, state: &State) -> Result<()> {
         let normalized = normalize_url(url);
-        if self.workdir_cache.as_ref().is_some_and(|cache| {
-            cache
-                .repos
-                .iter()
-                .any(|r| r.remotes.contains(&normalized))
-        }) {
+        if self
+            .workdir_cache
+            .as_ref()
+            .is_some_and(|cache| cache.repos.iter().any(|r| r.remotes.contains(&normalized)))
+        {
             bail!(
                 "`{url}` is a discovered repo in your workdir; rq never deletes those - remove the checkout yourself if you want it forgotten"
             );
@@ -444,7 +443,10 @@ mod tests {
         let owned = tmp.path().join("dev/owned");
         std::fs::create_dir_all(&owned).unwrap();
         git(&owned, &["init", "-q"]);
-        git(&owned, &["remote", "add", "origin", "git@github.com:o/r.git"]);
+        git(
+            &owned,
+            &["remote", "add", "origin", "git@github.com:o/r.git"],
+        );
 
         let config = config_with_workdir(&tmp.path().join("dev"));
         let mut store = RepoStore::load(&paths_in(tmp.path()), &config).unwrap();
@@ -483,7 +485,10 @@ mod tests {
         let repo = dev.join("owned");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-q"]);
-        git(&repo, &["remote", "add", "origin", "https://example.com/o/r"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", "https://example.com/o/r"],
+        );
         backdate_cache(&paths);
 
         let mut store2 = RepoStore::load(&paths, &config).unwrap();
@@ -541,7 +546,10 @@ mod tests {
         let repo = old_dev.join("owned");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-q"]);
-        git(&repo, &["remote", "add", "origin", "https://example.com/o/r"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", "https://example.com/o/r"],
+        );
 
         let cache = WorkdirCache {
             workdir: old_dev,
@@ -682,7 +690,10 @@ mod tests {
         let owned = tmp.path().join("dev/owned");
         std::fs::create_dir_all(&owned).unwrap();
         git(&owned, &["init", "-q"]);
-        git(&owned, &["remote", "add", "origin", "https://example.com/o/r"]);
+        git(
+            &owned,
+            &["remote", "add", "origin", "https://example.com/o/r"],
+        );
 
         let config = config_with_workdir(&tmp.path().join("dev"));
         let paths = paths_in(tmp.path());
@@ -705,7 +716,10 @@ mod tests {
         let owned = tmp.path().join("dev/owned");
         std::fs::create_dir_all(&owned).unwrap();
         git(&owned, &["init", "-q"]);
-        git(&owned, &["remote", "add", "origin", "https://example.com/o/r"]);
+        git(
+            &owned,
+            &["remote", "add", "origin", "https://example.com/o/r"],
+        );
 
         let config = config_with_workdir(&tmp.path().join("dev"));
         let paths = paths_in(tmp.path());

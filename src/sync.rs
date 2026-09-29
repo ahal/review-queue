@@ -421,7 +421,11 @@ pub fn remove_workspace(paths: &Paths, key: &ReviewKey, force: bool) -> Result<(
 
     if ws.workspace_path.exists() {
         let vcs = vcs_for(ws.vcs);
-        if !force && vcs.is_dirty(&ws.workspace_path, &ws.head_id).unwrap_or(true) {
+        if !force
+            && vcs
+                .is_dirty(&ws.workspace_path, &ws.head_id)
+                .unwrap_or(true)
+        {
             return Err(WorkspaceDirty {
                 path: ws.workspace_path.clone(),
             }
