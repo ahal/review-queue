@@ -681,6 +681,7 @@ mod tests {
                 status: crate::state::Status::Ready,
             }),
             diff_stat: None,
+            description: None,
         }
     }
 

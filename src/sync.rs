@@ -152,6 +152,7 @@ fn add_new(review: &Review, state: &mut State, dry_run: bool, report: &mut SyncR
         last_synced: chrono::Utc::now(),
         workspace: None,
         diff_stat: review.diff_stat.clone(),
+        description: review.description.clone(),
     });
 }
 
@@ -171,6 +172,7 @@ async fn update_existing(
     entry.in_queue = true;
     entry.resolved = false;
     entry.diff_stat = review.diff_stat.clone();
+    entry.description = review.description.clone();
 
     let Some(mut ws) = entry.workspace.clone() else {
         // Not fetched locally - nothing on disk to update, just keep the tracked metadata
@@ -357,6 +359,7 @@ pub async fn fetch_local(
         version: entry.version.clone(),
         kind: entry.kind.clone(),
         diff_stat: entry.diff_stat.clone(),
+        description: entry.description.clone(),
     };
 
     let mut repo_store = RepoStore::load(paths, config)?;
@@ -1064,6 +1067,7 @@ mod tests {
             last_synced: chrono::Utc::now(),
             workspace: None,
             diff_stat: None,
+            description: None,
         });
         state.save(&paths.state_file()).unwrap();
 

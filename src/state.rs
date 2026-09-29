@@ -92,6 +92,10 @@ pub struct ReviewEntry {
     /// --stat`/`jj diff --stat` print) - `None` if the source couldn't produce one. Refreshed on
     /// every `rq sync`, independent of whether a local workspace exists.
     pub diff_stat: Option<String>,
+    /// PR description / revision summary as of `last_synced`, refreshed on every `rq sync`. `None`
+    /// for entries synced before this was tracked, or if the source has none.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -197,6 +201,7 @@ mod tests {
                 status: Status::Ready,
             }),
             diff_stat: None,
+            description: None,
         }
     }
 

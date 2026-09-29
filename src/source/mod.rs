@@ -58,6 +58,10 @@ pub struct Review {
     /// into `state.json`'s `ReviewEntry` so `rq show`'s TUI can show it with no further network
     /// calls of its own.
     pub diff_stat: Option<String>,
+    /// The PR description / Phabricator revision summary (the commit message body - the title is
+    /// carried separately in `title`). Carried into `state.json` alongside `diff_stat` so the TUI
+    /// can show it with no network calls of its own.
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone)]

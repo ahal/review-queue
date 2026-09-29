@@ -164,6 +164,7 @@ impl GithubSource {
             version: pr.head.sha.clone(),
             kind: ReviewKind::Direct,
             diff_stat: Some(diff_stat),
+            description: pr.body.clone(),
         })
     }
 
@@ -386,6 +387,8 @@ struct PullRequest {
     title: String,
     html_url: String,
     state: String,
+    #[serde(default)]
+    body: Option<String>,
     user: GhUser,
     head: PrSide,
     base: PrSide,
@@ -696,6 +699,7 @@ mod tests {
             version: "deadbeef".into(),
             kind: ReviewKind::Direct,
             diff_stat: None,
+            description: None,
         };
         let checkout = src
             .checkout_spec(&review, std::path::Path::new("/tmp/unused"))
@@ -745,6 +749,7 @@ mod tests {
             version: "deadbeef".into(),
             kind: ReviewKind::Direct,
             diff_stat: None,
+            description: None,
         };
         let Checkout::Ref { fork, .. } = src
             .checkout_spec(&review, std::path::Path::new("/tmp/unused"))
@@ -783,6 +788,7 @@ mod tests {
             version: "deadbeef".into(),
             kind: ReviewKind::Direct,
             diff_stat: None,
+            description: None,
         };
         let Checkout::Ref { fork, .. } = src
             .checkout_spec(&review, std::path::Path::new("/tmp/unused"))

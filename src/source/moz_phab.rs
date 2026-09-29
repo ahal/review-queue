@@ -588,6 +588,7 @@ impl ReviewSource for MozPhabSource {
                 version,
                 kind: kind.clone(),
                 diff_stat: diff_stats.get(&rev.id).cloned(),
+                description: rev.fields.summary.clone(),
             });
         }
         Ok(reviews)
@@ -852,6 +853,8 @@ struct RevisionFields {
     date_modified: Option<i64>,
     #[serde(rename = "diffPHID")]
     diff_phid: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1004,6 +1007,7 @@ mod tests {
                 repository_phid: Some("PHID-REPO-1".into()),
                 date_modified: Some(1700000000),
                 diff_phid: None,
+                summary: None,
             },
             attachments: Some(RevisionAttachments {
                 reviewers: Some(ReviewersAttachment {
@@ -1412,6 +1416,7 @@ mod tests {
             version: "1".into(),
             kind: ReviewKind::Direct,
             diff_stat: None,
+            description: None,
         };
         let checkout = src.checkout_spec(&review, canon.path()).await.unwrap();
 
@@ -1483,6 +1488,7 @@ mod tests {
             version: "1".into(),
             kind: ReviewKind::Direct,
             diff_stat: None,
+            description: None,
         };
         let err = src.checkout_spec(&review, canon.path()).await.unwrap_err();
         assert!(
@@ -1504,6 +1510,7 @@ mod tests {
                 repository_phid: None,
                 date_modified: Some(1),
                 diff_phid: diff_phid.map(String::from),
+                summary: None,
             },
             attachments: None,
         }

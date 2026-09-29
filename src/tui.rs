@@ -121,7 +121,7 @@ pub fn run(
     });
 
     let mut select = SelectView::<Row>::new();
-    for (label, row) in build_rows(&entries, key_w, author_w, &BTreeSet::new()) {
+    for (label, row) in build_rows(&entries, key_w, author_w, &BTreeSet::new(), terminal_width()) {
         select.add_item(label, row);
     }
     select.set_on_submit(|s, row: &Row| open_locally_selected_key(s, row.key().clone()));
@@ -311,11 +311,67 @@ fn detail_lines(e: &ReviewEntry) -> Vec<String> {
     }
 }
 
+/// Indent for the expanded lines under a review (matches the diffstat).
+const DETAIL_INDENT: &str = "      ";
+
+/// Width to wrap at when the terminal size can't be read.
+const DEFAULT_WIDTH: usize = 100;
+
+/// The terminal's current width. `SelectView` rows are single-line and can't wrap themselves, so
+/// expanded text is wrapped up front to fit; a resize is picked up the next time rows are rebuilt.
+fn terminal_width() -> usize {
+    cursive::backends::crossterm::crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(DEFAULT_WIDTH)
+}
+
+/// Word-wraps `text` to `width` columns, keeping blank lines and each line's leading indent.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for raw in text.lines() {
+        let raw = raw.trim_end();
+        let indent = raw.len() - raw.trim_start().len();
+        let mut line = " ".repeat(indent);
+        let mut has_word = false;
+        for word in raw.split_whitespace() {
+            if has_word && line.chars().count() + 1 + word.chars().count() > width {
+                lines.push(std::mem::replace(&mut line, " ".repeat(indent)));
+                has_word = false;
+            }
+            if has_word {
+                line.push(' ');
+            }
+            line.push_str(word);
+            has_word = true;
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+/// The full title, then the PR description / commit message, shown under an expanded review.
+/// The title is repeated in full since the review's own row truncates it to the terminal width.
+/// Wrapped to `width` and each block followed by a blank line.
+fn description_lines(e: &ReviewEntry, width: usize) -> Vec<String> {
+    let wrap = width.saturating_sub(DETAIL_INDENT.len() + 2).max(20);
+    let mut lines = wrap_text(&e.title, wrap);
+    lines.push(String::new());
+    if let Some(desc) = e.description.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        lines.extend(wrap_text(desc, wrap));
+        lines.push(String::new());
+    }
+    lines
+        .into_iter()
+        .map(|l| format!("{DETAIL_INDENT}{l}"))
+        .collect()
+}
+
 fn build_rows(
     entries: &[ReviewEntry],
     key_w: usize,
     author_w: usize,
     expanded: &BTreeSet<ReviewKey>,
+    width: usize,
 ) -> Vec<(StyledString, Row)> {
     let mut rows = Vec::new();
     for e in entries {
@@ -325,6 +381,9 @@ fn build_rows(
             Row::Entry(e.key.clone()),
         ));
         if is_expanded {
+            for line in description_lines(e, width) {
+                rows.push((StyledString::plain(line), Row::Detail(e.key.clone())));
+            }
             for line in detail_lines(e) {
                 rows.push((style_detail(&line), Row::Detail(e.key.clone())));
             }
@@ -780,7 +839,7 @@ fn reload(s: &mut Cursive) {
     s.call_on_name("reviews", |v: &mut SelectView<Row>| {
         let selected = v.selection().map(|row| row.key().clone());
         v.clear();
-        for (label, row) in build_rows(&entries, key_w, author_w, &expanded) {
+        for (label, row) in build_rows(&entries, key_w, author_w, &expanded, terminal_width()) {
             v.add_item(label, row);
         }
         if let Some(selected) = selected
@@ -814,13 +873,14 @@ mod tests {
             last_synced: chrono::Utc::now(),
             workspace: None,
             diff_stat: diff_stat.map(String::from),
+            description: None,
         }
     }
 
     #[test]
     fn collapsed_entries_produce_one_row_each() {
         let entries = vec![entry("D1", None), entry("D2", None)];
-        let rows = build_rows(&entries, 5, 6, &BTreeSet::new());
+        let rows = build_rows(&entries, 5, 6, &BTreeSet::new(), 100);
         assert_eq!(rows.len(), 2);
         assert!(matches!(&rows[0].1, Row::Entry(k) if k.id == "D1"));
         assert!(matches!(&rows[1].1, Row::Entry(k) if k.id == "D2"));
@@ -833,15 +893,15 @@ mod tests {
             entry("D2", None),
         ];
         let expanded = ReviewKey::new("moz", "D1");
-        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([expanded.clone()]));
+        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([expanded.clone()]), 100);
 
-        // D1's entry row, its two detail lines, then D2's entry row.
-        assert_eq!(rows.len(), 4);
+        // D1's entry row, its title + blank line, its two diffstat lines, then D2's entry row.
+        assert_eq!(rows.len(), 6);
         assert!(matches!(&rows[0].1, Row::Entry(k) if *k == expanded));
-        for (_, row) in &rows[1..3] {
+        for (_, row) in &rows[1..5] {
             assert_eq!(row, &Row::Detail(expanded.clone()));
         }
-        assert!(matches!(&rows[3].1, Row::Entry(k) if k.id == "D2"));
+        assert!(matches!(&rows[5].1, Row::Entry(k) if k.id == "D2"));
     }
 
     #[test]
@@ -852,15 +912,19 @@ mod tests {
         ];
         let d1 = ReviewKey::new("moz", "D1");
         let d2 = ReviewKey::new("moz", "D2");
-        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([d1.clone(), d2.clone()]));
+        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([d1.clone(), d2.clone()]), 100);
 
-        // D1's entry + its detail line, then D2's entry + its detail line - expanding D2 must
+        // D1's entry + title/blank + its diffstat line, then the same for D2 - expanding D2 must
         // not have collapsed D1.
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 8);
         assert!(matches!(&rows[0].1, Row::Entry(k) if *k == d1));
-        assert_eq!(rows[1].1, Row::Detail(d1));
-        assert!(matches!(&rows[2].1, Row::Entry(k) if *k == d2));
-        assert_eq!(rows[3].1, Row::Detail(d2));
+        for (_, row) in &rows[1..4] {
+            assert_eq!(row, &Row::Detail(d1.clone()));
+        }
+        assert!(matches!(&rows[4].1, Row::Entry(k) if *k == d2));
+        for (_, row) in &rows[5..8] {
+            assert_eq!(row, &Row::Detail(d2.clone()));
+        }
     }
 
     #[tokio::test]
@@ -899,6 +963,43 @@ mod tests {
             BTreeSet::from([ReviewKey::new("moz", "D2")]),
             "collapsing D1 must not touch D2"
         );
+    }
+
+    #[test]
+    fn expanding_a_review_shows_title_and_wrapped_description_before_the_diffstat() {
+        let mut e = entry("D1", Some("a.rs | 1 +"));
+        e.description = Some(format!("first para\n\n{}", "word ".repeat(60)));
+        let lines = description_lines(&e, 100);
+
+        assert_eq!(lines[0], "      Fix the thing");
+        assert_eq!(lines[1], "      ");
+        assert_eq!(lines[2], "      first para");
+        assert_eq!(lines[3], "      ");
+        assert!(lines.len() > 6, "long paragraph should wrap: {lines:?}");
+        assert!(lines.iter().all(|l| l.chars().count() <= 100));
+        assert_eq!(lines.last().unwrap(), "      ");
+
+        let expanded = BTreeSet::from([e.key.clone()]);
+        let rows = build_rows(&[e], 5, 6, &expanded, 100);
+        // entry + title/description lines + diffstat line
+        assert_eq!(rows.len(), 1 + lines.len() + 1);
+    }
+
+    #[test]
+    fn a_long_title_is_wrapped_in_full_to_the_given_width() {
+        let mut e = entry("D1", None);
+        e.title = "word ".repeat(30);
+        let lines = description_lines(&e, 40);
+        assert!(lines.len() > 4, "{lines:?}");
+        assert!(lines.iter().all(|l| l.chars().count() <= 40));
+        assert_eq!(lines[..lines.len() - 1].join(" ").split_whitespace().count(), 30);
+    }
+
+    #[test]
+    fn a_review_without_a_description_still_shows_its_title() {
+        let mut e = entry("D1", None);
+        e.description = Some("  \n".into());
+        assert_eq!(description_lines(&e, 100), vec!["      Fix the thing", "      "]);
     }
 
     #[test]
@@ -947,7 +1048,7 @@ mod tests {
         ];
         let mut select = SelectView::<Row>::new();
         let expanded = ReviewKey::new("moz", "D1");
-        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded])) {
+        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded]), 100) {
             select.add_item(label, row);
         }
         siv.add_layer(select.with_name("reviews"));
@@ -968,7 +1069,7 @@ mod tests {
         let entries = vec![entry("D1", Some("a.rs | 1 +"))];
         let mut select = SelectView::<Row>::new();
         let expanded = ReviewKey::new("moz", "D1");
-        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded])) {
+        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded]), 100) {
             select.add_item(label, row);
         }
         siv.add_layer(select.with_name("reviews"));
