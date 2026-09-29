@@ -39,7 +39,7 @@ use crate::config::{self, Config};
 use crate::paths::Paths;
 use crate::repo::{NeedsClone, OnMissing};
 use crate::source::ReviewSource;
-use crate::state::{ReviewEntry, ReviewKey, State, Status};
+use crate::state::{ReviewEntry, ReviewKey, State};
 use crate::sync;
 
 /// Frames for the spinner shown while a review is fetched on a background thread.
@@ -136,10 +136,6 @@ pub fn run(
         .on_event(Key::Left, |s| set_expanded(s, false));
 
     let layout = LinearLayout::vertical()
-        .child(TextView::new(StyledString::styled(
-            header_line(key_w, author_w),
-            Effect::Bold,
-        )))
         .child(select.scrollable().full_height())
         .child(TextView::new("").with_name("status"))
         .child(TextView::new(StyledString::styled(HELP, Effect::Dim)));
@@ -249,44 +245,21 @@ fn truncate(s: &str, width: usize) -> String {
     }
 }
 
-fn header_line(key_w: usize, author_w: usize) -> String {
-    format!(
-        "  {:<key_w$}  {:<3}  {:<9}  {:<author_w$}  TITLE",
-        "KEY", "GOT", "STATUS", "AUTHOR"
-    )
-}
-
 fn ansi(c: BaseColor) -> Color {
     Color::Dark(c)
 }
 
 fn row_label(e: &ReviewEntry, key_w: usize, author_w: usize, expanded: bool) -> StyledString {
     let marker = if expanded { '\u{25be}' } else { '\u{25b8}' };
-    let (fetched, fetched_color) = if e.workspace.is_some() {
-        ("yes", ansi(BaseColor::Green))
-    } else {
-        ("no", Color::TerminalDefault)
-    };
-    let (status, status_color) = match &e.workspace {
-        Some(ws) => (
-            format!("{:?}", ws.status),
-            match ws.status {
-                Status::Ready => ansi(BaseColor::Green),
-                Status::ApplyFailed => ansi(BaseColor::Red),
-                Status::Dirty => ansi(BaseColor::Yellow),
-            },
-        ),
-        None if e.resolved => ("resolved".to_string(), ansi(BaseColor::Magenta)),
-        None if e.in_queue => ("queued".to_string(), ansi(BaseColor::Blue)),
-        None => ("waiting".to_string(), Color::TerminalDefault),
-    };
 
     let mut out = StyledString::styled(format!("{marker} "), Effect::Dim);
+    if e.workspace.is_some() {
+        out.append_styled("\u{2913}", ansi(BaseColor::Cyan));
+    } else {
+        out.append_plain(" ");
+    }
+    out.append_plain(" ");
     out.append_styled(format!("{:<key_w$}", e.key.slug()), ansi(BaseColor::Cyan));
-    out.append_plain("  ");
-    out.append_styled(format!("{fetched:<3}"), fetched_color);
-    out.append_plain("  ");
-    out.append_styled(format!("{status:<9}"), status_color);
     out.append_plain("  ");
     out.append_plain(truncate(&e.author, author_w));
     out.append_plain("  ");
