@@ -10,7 +10,9 @@
 //! `run_event_loop` for why that means tearing down and recreating the whole backend rather than
 //! just toggling raw mode. See `crate::sync`'s module docs for why `rq sync` itself never creates
 //! workspaces. `d` deletes the selected review's workspace (`sync::remove_workspace`), confirming
-//! first and, if it has local changes, confirming again before discarding them.
+//! first and, if it has local changes, confirming again before discarding them. Once confirmed the
+//! dialog closes and the deletion runs on a background thread (`begin_delete`) with the same row
+//! spinner as a fetch.
 //!
 //! Fetching a review with no local worktree yet asks to confirm first (`prompt_confirm_fetch`) -
 //! `fetch_local` may clone a repo or shell out to a source's checkout command, either of which
@@ -20,7 +22,8 @@
 //! `git`/`jj` calls have no cancellation points of their own, so cancelling doesn't interrupt
 //! them - it just detaches from the operation, which keeps running (spinner turns red);
 //! `finish_fetch` still runs when it completes, and removes whatever workspace it created instead
-//! of opening a shell into it.
+//! of opening a shell into it. `f` skips both the confirmation and the subshell: it just fetches
+//! (or refreshes) the selected review in the background.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -46,7 +49,7 @@ use crate::sync;
 /// Frames for the spinner shown while a review is fetched on a background thread.
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-const HELP: &str = "↑/↓ move   ←/→ expand/collapse   enter open locally   o open in browser   \
+const HELP: &str = "↑/↓ move   ←/→ expand/collapse   enter open locally   f fetch   o open in browser   \
 d delete workspace   r reload   q quit";
 
 struct Ctx {
@@ -76,6 +79,9 @@ struct Fetch {
     /// tells `finish_fetch` to clean up instead of opening the workspace.
     cancelled: Arc<AtomicBool>,
     frame: usize,
+    /// A workspace deletion (`begin_delete`) rather than a fetch - shares the spinner but can't
+    /// be cancelled.
+    deleting: bool,
 }
 
 /// What `row_label` needs to draw a fetch's spinner in place of the workspace icon.
@@ -171,6 +177,7 @@ pub fn run(
     siv.add_global_callback(Key::Esc, |s| s.quit());
     siv.add_global_callback('o', open_in_browser_selected);
     siv.add_global_callback('d', delete_workspace_selected);
+    siv.add_global_callback('f', fetch_selected);
     siv.add_global_callback('r', reload);
     siv.add_global_callback('j', |s| move_selection(s, true));
     siv.add_global_callback('k', |s| move_selection(s, false));
@@ -562,26 +569,86 @@ fn prompt_delete_workspace(s: &mut Cursive, key: ReviewKey, path: PathBuf, force
         })
         .button("Yes", move |s| {
             s.pop_layer();
-            do_delete_workspace(s, yes_key.clone(), path.clone(), force);
+            begin_delete(s, yes_key.clone(), path.clone(), force);
         });
     s.add_layer(vim_keys(dialog));
 }
 
-fn do_delete_workspace(s: &mut Cursive, key: ReviewKey, path: PathBuf, force: bool) {
-    let outcome = s
-        .user_data::<Ctx>()
-        .map(|ctx| sync::remove_workspace(&ctx.paths, &key, force));
-    match outcome {
-        Some(Ok(())) => {
+/// Runs `sync::remove_workspace` on a background thread, showing the same row spinner as a fetch
+/// while it works (deleting a big worktree can take a while). A dirty workspace re-prompts with
+/// `force` once it finishes, back on the main thread.
+fn begin_delete(s: &mut Cursive, key: ReviewKey, path: PathBuf, force: bool) {
+    let Some(ctx) = s.user_data::<Ctx>() else {
+        return;
+    };
+    ctx.fetching.insert(
+        key.clone(),
+        Fetch {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            frame: 0,
+            deleting: true,
+        },
+    );
+    let paths = ctx.paths.clone();
+    reload(s);
+
+    let done = Arc::new(AtomicBool::new(false));
+    spawn_spinner_ticker(s, key.clone(), done.clone());
+
+    let cb_sink = s.cb_sink().clone();
+    std::thread::spawn(move || {
+        let result = sync::remove_workspace(&paths, &key, force);
+        done.store(true, Ordering::SeqCst);
+        let _ = cb_sink.send(Box::new(move |s| finish_delete(s, key, path, force, result)));
+    });
+}
+
+fn finish_delete(s: &mut Cursive, key: ReviewKey, path: PathBuf, force: bool, result: Result<()>) {
+    if let Some(ctx) = s.user_data::<Ctx>() {
+        ctx.fetching.remove(&key);
+    }
+    match result {
+        Ok(()) => {
             set_status(s, format!("deleted workspace for {key}"));
             reload(s);
         }
-        Some(Err(e)) => match e.downcast::<sync::WorkspaceDirty>() {
-            Ok(_) => prompt_delete_workspace(s, key, path, true),
-            Err(e) => set_status(s, format!("failed to delete workspace for {key}: {e:#}")),
+        Err(e) => match e.downcast::<sync::WorkspaceDirty>() {
+            Ok(_) if !force => {
+                reload(s);
+                prompt_delete_workspace(s, key, path, true);
+            }
+            Ok(e) => {
+                set_status(s, format!("failed to delete workspace for {key}: {e:#}"));
+                reload(s);
+            }
+            Err(e) => {
+                set_status(s, format!("failed to delete workspace for {key}: {e:#}"));
+                reload(s);
+            }
         },
-        None => {}
     }
+}
+
+/// `f`: fetches (or refreshes) the selected review in the background with no confirmation and
+/// without opening a shell - unlike Enter, which confirms first and then opens the workspace.
+fn fetch_selected(s: &mut Cursive) {
+    let Some(key) = selected_key(s) else {
+        return;
+    };
+    let Some(ctx) = s.user_data::<Ctx>() else {
+        return;
+    };
+    let on_missing = if ctx.config.auto_clone {
+        OnMissing::Clone
+    } else {
+        OnMissing::Ask
+    };
+    if let Some(f) = ctx.fetching.get(&key) {
+        let msg = busy_message(&key, f);
+        set_status(s, msg);
+        return;
+    }
+    begin_fetch(s, key, on_missing, false);
 }
 
 fn open_locally_selected_key(s: &mut Cursive, key: ReviewKey) {
@@ -593,8 +660,9 @@ fn open_locally_selected_key(s: &mut Cursive, key: ReviewKey) {
     } else {
         OnMissing::Ask
     };
-    if ctx.fetching.contains_key(&key) {
-        set_status(s, format!("already fetching {key}"));
+    if let Some(f) = ctx.fetching.get(&key) {
+        let msg = busy_message(&key, f);
+        set_status(s, msg);
         return;
     }
     let has_workspace = State::load(&ctx.paths.state_file())
@@ -622,15 +690,16 @@ fn prompt_confirm_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) 
         })
         .button("Proceed", move |s| {
             s.pop_layer();
-            begin_fetch(s, key.clone(), on_missing);
+            begin_fetch(s, key.clone(), on_missing, true);
         });
     s.add_layer(vim_keys(dialog));
 }
 
-/// Kicks off `sync::fetch_local` on a background thread. Progress is a spinner in the review's
+/// Kicks off `sync::fetch_local` on a background thread; `open_shell` says whether to drop into a
+/// subshell in the workspace once it's done (Enter) or just leave it fetched (`f`). Progress is a spinner in the review's
 /// row where the workspace icon goes (see `row_label`), so the rest of the UI stays usable; `d`
 /// on that row cancels (`cancel_fetch`).
-fn begin_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
+fn begin_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing, open_shell: bool) {
     let cancelled = Arc::new(AtomicBool::new(false));
     let Some(ctx) = s.user_data::<Ctx>() else {
         return;
@@ -640,12 +709,17 @@ fn begin_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
         Fetch {
             cancelled: cancelled.clone(),
             frame: 0,
+            deleting: false,
         },
     );
     let sources = ctx.sources.clone();
     let paths = ctx.paths.clone();
     let config = ctx.config.clone();
     let handle = ctx.handle.clone();
+    let had_workspace = State::load(&ctx.paths.state_file())
+        .ok()
+        .and_then(|st| st.get(&key).map(|e| e.workspace.is_some()))
+        .unwrap_or(false);
     reload(s);
 
     let done = Arc::new(AtomicBool::new(false));
@@ -663,7 +737,7 @@ fn begin_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
         ));
         done.store(true, Ordering::SeqCst);
         let _ = cb_sink.send(Box::new(move |s| {
-            finish_fetch(s, worker_key, result, cancelled)
+            finish_fetch(s, worker_key, result, cancelled, open_shell, had_workspace)
         }));
     });
 }
@@ -672,7 +746,22 @@ fn begin_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
 /// `fetch_local`'s `git`/`jj` calls have no cancellation points, so the operation keeps running in
 /// the background: the spinner turns red until it completes, and `finish_fetch` then removes
 /// whatever workspace it created.
+fn busy_message(key: &ReviewKey, f: &Fetch) -> String {
+    if f.deleting {
+        format!("{key} is being deleted")
+    } else {
+        format!("already fetching {key}")
+    }
+}
+
 fn cancel_fetch(s: &mut Cursive, key: &ReviewKey) {
+    if s.user_data::<Ctx>()
+        .and_then(|ctx| ctx.fetching.get(key))
+        .is_some_and(|f| f.deleting)
+    {
+        set_status(s, format!("{key} is being deleted - can't cancel"));
+        return;
+    }
     let flagged = s
         .user_data::<Ctx>()
         .and_then(|ctx| ctx.fetching.get(key))
@@ -722,13 +811,16 @@ fn spawn_spinner_ticker(s: &Cursive, key: ReviewKey, done: Arc<AtomicBool>) {
 
 /// Runs once `begin_fetch`'s background thread finishes, back on the main thread via `cb_sink`.
 /// If `cancelled` was flipped in the meantime, the operation itself was never interrupted (see the
-/// module docs), so a successful fetch's workspace is removed here instead of being opened;
-/// nothing needs cleaning up on a failed one.
+/// module docs), so a successful fetch's workspace is removed here instead of being opened -
+/// unless it already existed before the fetch (`had_workspace`), in which case it's the user's and
+/// is left alone; nothing needs cleaning up on a failed one.
 fn finish_fetch(
     s: &mut Cursive,
     key: ReviewKey,
     result: Result<PathBuf>,
     cancelled: Arc<AtomicBool>,
+    open_shell: bool,
+    had_workspace: bool,
 ) {
     if let Some(ctx) = s.user_data::<Ctx>() {
         ctx.fetching.remove(&key);
@@ -736,6 +828,7 @@ fn finish_fetch(
 
     if cancelled.load(Ordering::SeqCst) {
         let status = match &result {
+            Ok(_) if had_workspace => format!("cancelled fetching {key}; existing workspace kept"),
             Ok(_) => match s
                 .user_data::<Ctx>()
                 .map(|ctx| sync::remove_workspace(&ctx.paths, &key, true))
@@ -753,13 +846,17 @@ fn finish_fetch(
 
     match result {
         Ok(path) => {
-            if let Some(ctx) = s.user_data::<Ctx>() {
-                ctx.pending_shell = Some((key, path));
+            if open_shell {
+                if let Some(ctx) = s.user_data::<Ctx>() {
+                    ctx.pending_shell = Some((key, path));
+                }
+            } else {
+                set_status(s, format!("fetched {key} ({})", path.display()));
             }
             reload(s);
         }
         Err(e) => match e.downcast::<NeedsClone>() {
-            Ok(needs_clone) => prompt_clone(s, key, needs_clone.url, needs_clone.dest),
+            Ok(needs_clone) => prompt_clone(s, key, needs_clone.url, needs_clone.dest, open_shell),
             Err(e) => {
                 set_status(s, format!("error fetching {key}: {e:#}"));
                 reload(s);
@@ -793,7 +890,7 @@ fn do_open_locally(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
             reload(s);
         }
         Some(Err(e)) => match e.downcast::<NeedsClone>() {
-            Ok(needs_clone) => prompt_clone(s, key, needs_clone.url, needs_clone.dest),
+            Ok(needs_clone) => prompt_clone(s, key, needs_clone.url, needs_clone.dest, true),
             Err(e) => {
                 set_status(s, format!("error fetching {key}: {e:#}"));
                 reload(s);
@@ -805,7 +902,7 @@ fn do_open_locally(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
 
 /// Raw stdin can't be read while cursive owns the screen, so the CLI's `Y/n/always` prompt
 /// becomes a dialog here instead.
-fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf) {
+fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf, open_shell: bool) {
     let yes_key = key.clone();
     let always_key = key.clone();
     let dialog = Dialog::text(format!(
@@ -819,7 +916,7 @@ fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf) {
     })
     .button("Yes", move |s| {
         s.pop_layer();
-        begin_fetch(s, yes_key.clone(), OnMissing::Clone);
+        begin_fetch(s, yes_key.clone(), OnMissing::Clone, open_shell);
     })
     .button("Always", move |s| {
         s.pop_layer();
@@ -834,7 +931,7 @@ fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf) {
             set_status(s, format!("failed to save auto_clone: {e:#}"));
             return;
         }
-        begin_fetch(s, always_key.clone(), OnMissing::Clone);
+        begin_fetch(s, always_key.clone(), OnMissing::Clone, open_shell);
     });
     s.add_layer(vim_keys(dialog));
 }
@@ -1054,6 +1151,7 @@ mod tests {
             Fetch {
                 cancelled: flag.clone(),
                 frame: 0,
+                deleting: false,
             },
         );
 
