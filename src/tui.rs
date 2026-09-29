@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use cursive::Cursive;
-use cursive::event::Key;
+use cursive::event::{Event, EventResult, Key};
 use cursive::theme::{BaseColor, Color, Effect, Theme};
 use cursive::traits::*;
 use cursive::utils::markup::StyledString;
@@ -479,6 +479,21 @@ fn set_expanded(s: &mut Cursive, expand: bool) {
     reload(s);
 }
 
+/// Lets `h`/`l` move between a dialog's buttons like Left/Right do. Without this the dialog
+/// ignores them and they fall through to the global callbacks, moving the review list behind it.
+/// `j`/`k` are swallowed for the same reason - a dialog has nothing to scroll.
+fn vim_keys(dialog: Dialog) -> OnEventView<Dialog> {
+    OnEventView::new(dialog)
+        .on_pre_event_inner(Event::Char('h'), |d, _| {
+            Some(d.on_event(Event::Key(Key::Left)))
+        })
+        .on_pre_event_inner(Event::Char('l'), |d, _| {
+            Some(d.on_event(Event::Key(Key::Right)))
+        })
+        .on_pre_event_inner(Event::Char('j'), |_, _| Some(EventResult::consumed()))
+        .on_pre_event_inner(Event::Char('k'), |_, _| Some(EventResult::consumed()))
+}
+
 fn open_in_browser_selected(s: &mut Cursive) {
     let Some(key) = selected_key(s) else {
         return;
@@ -549,7 +564,7 @@ fn prompt_delete_workspace(s: &mut Cursive, key: ReviewKey, path: PathBuf, force
             s.pop_layer();
             do_delete_workspace(s, yes_key.clone(), path.clone(), force);
         });
-    s.add_layer(dialog);
+    s.add_layer(vim_keys(dialog));
 }
 
 fn do_delete_workspace(s: &mut Cursive, key: ReviewKey, path: PathBuf, force: bool) {
@@ -609,7 +624,7 @@ fn prompt_confirm_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) 
             s.pop_layer();
             begin_fetch(s, key.clone(), on_missing);
         });
-    s.add_layer(dialog);
+    s.add_layer(vim_keys(dialog));
 }
 
 /// Kicks off `sync::fetch_local` on a background thread. Progress is a spinner in the review's
@@ -821,7 +836,7 @@ fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf) {
         }
         begin_fetch(s, always_key.clone(), OnMissing::Clone);
     });
-    s.add_layer(dialog);
+    s.add_layer(vim_keys(dialog));
 }
 
 fn reload(s: &mut Cursive) {
@@ -1046,6 +1061,47 @@ mod tests {
         assert!(!flag.load(Ordering::SeqCst));
         cancel_fetch(&mut siv, &key);
         assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn h_and_l_move_between_dialog_buttons_without_touching_the_list() {
+        use cursive::views::DialogFocus;
+
+        let mut siv = cursive::dummy();
+        let mut select = SelectView::<Row>::new();
+        select.add_item("D1", Row::Entry(ReviewKey::new("moz", "D1")));
+        select.add_item("D2", Row::Entry(ReviewKey::new("moz", "D2")));
+        siv.add_layer(select.with_name("reviews"));
+        siv.add_global_callback('j', |s| move_selection(s, true));
+        siv.add_global_callback('l', |s| set_expanded(s, true));
+        siv.add_layer(
+            vim_keys(
+                Dialog::text("x")
+                    .button("No", |_| {})
+                    .button("Yes", |_| {})
+                    .button("Always", |_| {}),
+            )
+            .with_name("dlg"),
+        );
+        let focus = |siv: &mut Cursive| {
+            siv.call_on_name("dlg", |v: &mut OnEventView<Dialog>| {
+                v.get_inner().focus()
+            })
+            .unwrap()
+        };
+
+        siv.runner().refresh(); // lay the dialog out so its buttons have areas to move between
+        assert_eq!(focus(&mut siv), DialogFocus::Button(0));
+        siv.on_event(Event::Char('l'));
+        assert_eq!(focus(&mut siv), DialogFocus::Button(1));
+        siv.on_event(Event::Char('l'));
+        assert_eq!(focus(&mut siv), DialogFocus::Button(2));
+        siv.on_event(Event::Char('h'));
+        assert_eq!(focus(&mut siv), DialogFocus::Button(1));
+
+        // `j` must not reach the global callback and move the list underneath.
+        siv.on_event(Event::Char('j'));
+        assert!(matches!(selected_row(&mut siv), Row::Entry(k) if k.id == "D1"));
     }
 
     #[test]
