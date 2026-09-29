@@ -322,7 +322,7 @@ async fn list(
     table.load_preset(UTF8_FULL_CONDENSED);
     table.set_header(vec!["KEY", "TITLE", "AUTHOR", "STATUS", "PATH"]);
     for e in entries {
-        let (status, path) = match &e.workspace {
+        let (status, path) = match state.workspace_of(e) {
             Some(ws) => (
                 format!("{:?}", ws.status),
                 ws.workspace_path.display().to_string(),
@@ -346,7 +346,7 @@ fn path(paths: &Paths, id: &str) -> Result<()> {
     let matches = state.find_by_prefix(id);
     match matches.as_slice() {
         [] => bail!("no tracked review matches `{id}`"),
-        [entry] => match &entry.workspace {
+        [entry] => match state.workspace_of(entry) {
             Some(ws) => {
                 println!("{}", ws.workspace_path.display());
                 Ok(())

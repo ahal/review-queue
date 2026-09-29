@@ -570,6 +570,12 @@ impl ReviewSource for MozPhabSource {
                 .cloned()
                 .with_context(|| format!("repository {repository_phid} not found"))?;
             let stack = stacks.remove(&rev.id).unwrap_or_default();
+            // `stack` is bottom-first and ends with the revision itself.
+            let ancestors: Vec<ReviewKey> = stack
+                .iter()
+                .filter(|m| m.revision_id != rev.id)
+                .map(|m| ReviewKey::new(NAME, format!("D{}", m.revision_id)))
+                .collect();
             let version = stack
                 .iter()
                 .map(|m| m.date_modified.to_string())
@@ -589,6 +595,7 @@ impl ReviewSource for MozPhabSource {
                 kind: kind.clone(),
                 diff_stat: diff_stats.get(&rev.id).cloned(),
                 description: rev.fields.summary.clone(),
+                ancestors,
             });
         }
         Ok(reviews)
@@ -617,6 +624,10 @@ impl ReviewSource for MozPhabSource {
         })
     }
 
+    fn is_commit_for(&self, review: &ReviewKey, message: &str) -> bool {
+        commit_message_is_for(message, &review.id)
+    }
+
     async fn fetch_status(&self, ids: &[String]) -> Result<Vec<(String, Lifecycle)>> {
         let numeric_ids: Vec<u64> = ids.iter().map(|s| parse_id(s)).collect::<Result<_>>()?;
         let revisions: Vec<RevisionItem> = self
@@ -640,6 +651,17 @@ impl ReviewSource for MozPhabSource {
         }
         Ok(out)
     }
+}
+
+/// `moz-phab patch` leaves a `Differential Revision: https://.../D123` trailer in each commit
+/// message it creates; `id` is `D123`.
+fn commit_message_is_for(message: &str, id: &str) -> bool {
+    message.lines().any(|line| {
+        line.trim()
+            .strip_prefix("Differential Revision:")
+            .and_then(|url| url.trim().rsplit('/').next())
+            == Some(id)
+    })
 }
 
 fn is_closed(status: &str) -> bool {
@@ -1380,6 +1402,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_queue_reports_each_reviews_ancestors_bottom_first() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/user.whoami"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(call_response(json!({"phid": ME, "userName": "ahal"}))),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/project.search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[])))
+            .mount(&server)
+            .await;
+        let d1 = json!({
+            "id": 1, "phid": "PHID-DREV-1",
+            "fields": {"title": "D1", "authorPHID": "PHID-USER-other", "status": {"value": "needs-review"}, "repositoryPHID": "PHID-REPO-1", "dateModified": 1},
+            "attachments": {"reviewers": {"reviewers": [{"reviewerPHID": ME, "status": "added"}]}},
+        });
+        let d2 = json!({
+            "id": 2, "phid": "PHID-DREV-2",
+            "fields": {"title": "D2", "authorPHID": "PHID-USER-other", "status": {"value": "needs-review"}, "repositoryPHID": "PHID-REPO-1", "dateModified": 2},
+            "attachments": {"reviewers": {"reviewers": [{"reviewerPHID": ME, "status": "added"}]}},
+        });
+        Mock::given(method("POST"))
+            .and(path("/api/differential.revision.search"))
+            .and(body_string_contains("queryKey=active"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(search_response(&[d1.clone(), d2])),
+            )
+            .mount(&server)
+            .await;
+        // Parent lookup for D2's stack.
+        Mock::given(method("POST"))
+            .and(path("/api/differential.revision.search"))
+            .and(body_string_contains("constraints%5Bphids%5D%5B0%5D=PHID-DREV-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[d1])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/edge.search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[
+                json!({"sourcePHID": "PHID-DREV-2", "destinationPHID": "PHID-DREV-1"}),
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/diffusion.repository.search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[json!({
+                "phid": "PHID-REPO-1", "fields": {"shortName": "proj", "callsign": "PROJ"},
+                "attachments": {"uris": {"uris": [{"fields": {"uri": {"effective": "https://phab.example.com/source/proj.git"}}}]}},
+            })])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/user.search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[
+                json!({"phid": "PHID-USER-other", "fields": {"username": "alice"}}),
+            ])))
+            .mount(&server)
+            .await;
+
+        let src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
+        let mut reviews = src.fetch_queue().await.unwrap();
+        reviews.sort_by(|a, b| a.key.id.cmp(&b.key.id));
+
+        assert!(reviews[0].ancestors.is_empty());
+        assert_eq!(reviews[1].ancestors, vec![ReviewKey::new("phab", "D1")]);
+    }
+
+    #[test]
+    fn commit_message_is_matched_by_its_differential_revision_trailer() {
+        let msg = "Bug 1 - Fix it r=me\n\nDifferential Revision: https://phabricator.services.mozilla.com/D123\n";
+        assert!(commit_message_is_for(msg, "D123"));
+        assert!(!commit_message_is_for(msg, "D12"));
+        assert!(!commit_message_is_for(msg, "D1234"));
+        assert!(!commit_message_is_for("Bug 1 - no trailer", "D123"));
+    }
+
+    #[tokio::test]
     async fn checkout_spec_writes_arcconfig_and_builds_moz_phab_command() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1417,6 +1520,7 @@ mod tests {
             kind: ReviewKind::Direct,
             diff_stat: None,
             description: None,
+            ancestors: Vec::new(),
         };
         let checkout = src.checkout_spec(&review, canon.path()).await.unwrap();
 
@@ -1489,6 +1593,7 @@ mod tests {
             kind: ReviewKind::Direct,
             diff_stat: None,
             description: None,
+            ancestors: Vec::new(),
         };
         let err = src.checkout_spec(&review, canon.path()).await.unwrap_err();
         assert!(

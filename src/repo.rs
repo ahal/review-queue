@@ -253,8 +253,8 @@ impl RepoStore {
         if let Some(cache) = &self.workdir_cache {
             for r in &cache.repos {
                 let workspace_count = state
-                    .iter()
-                    .filter(|e| e.workspace.as_ref().is_some_and(|w| w.repo_path == r.path))
+                    .workspaces()
+                    .filter(|(_, w)| w.repo_path == r.path)
                     .count();
                 out.push(RepoListEntry {
                     url: r.name.clone(),
@@ -266,12 +266,8 @@ impl RepoStore {
         }
         for (url, entry) in &self.registry.repos {
             let workspace_count = state
-                .iter()
-                .filter(|e| {
-                    e.workspace
-                        .as_ref()
-                        .is_some_and(|w| w.repo_path == entry.path)
-                })
+                .workspaces()
+                .filter(|(_, w)| w.repo_path == entry.path)
                 .count();
             out.push(RepoListEntry {
                 url: url.clone(),
@@ -300,11 +296,7 @@ impl RepoStore {
         let Some(entry) = self.registry.repos.get(&normalized).cloned() else {
             bail!("no tool-managed clone registered for `{url}` (see `rq repo list`)");
         };
-        if state.iter().any(|e| {
-            e.workspace
-                .as_ref()
-                .is_some_and(|w| w.repo_path == entry.path)
-        }) {
+        if state.workspaces().any(|(_, w)| w.repo_path == entry.path) {
             bail!(
                 "{} still has workspaces using it; wait for `rq sync` to clean up resolved \
                  ones, or remove them by hand first",
@@ -658,7 +650,27 @@ mod tests {
         assert!(canon.path.join(".git").exists());
     }
 
-    fn entry_using(repo_path: &Path) -> crate::state::ReviewEntry {
+    fn state_using(repo_path: &Path) -> crate::state::State {
+        let mut state = crate::state::State::default();
+        let mut entry = entry_using();
+        entry.stack_id = Some("phab/D1".into());
+        state.insert(entry);
+        state.insert_workspace(
+            "phab/D1".into(),
+            crate::state::Workspace {
+                repo_path: repo_path.to_path_buf(),
+                vcs: VcsKind::Git,
+                workspace_path: PathBuf::from("/tmp/ws/D1"),
+                head_id: "abc".into(),
+                status: crate::state::Status::Ready,
+                tip: crate::state::ReviewKey::new("phab", "D1"),
+                version: "1".into(),
+            },
+        );
+        state
+    }
+
+    fn entry_using() -> crate::state::ReviewEntry {
         crate::state::ReviewEntry {
             key: crate::state::ReviewKey::new("phab", "D1"),
             title: "x".into(),
@@ -673,13 +685,8 @@ mod tests {
             in_queue: true,
             resolved: false,
             last_synced: chrono::Utc::now(),
-            workspace: Some(crate::state::Workspace {
-                repo_path: repo_path.to_path_buf(),
-                vcs: VcsKind::Git,
-                workspace_path: PathBuf::from("/tmp/ws/D1"),
-                head_id: "abc".into(),
-                status: crate::state::Status::Ready,
-            }),
+            stack_id: None,
+            ancestors: Vec::new(),
             diff_stat: None,
             description: None,
         }
@@ -702,8 +709,7 @@ mod tests {
         // Force a scan so `list()` has something to report.
         store.rescan().unwrap();
 
-        let mut state = crate::state::State::default();
-        state.insert(entry_using(&owned));
+        let state = state_using(&owned);
 
         let repos = store.list(&state);
         assert_eq!(repos.len(), 1);
@@ -751,8 +757,7 @@ mod tests {
         let mut store = RepoStore::load(&paths, &config).unwrap();
         let canon = store.resolve(&repo_ref(&[&url]), OnMissing::Clone).unwrap();
 
-        let mut state = crate::state::State::default();
-        state.insert(entry_using(&canon.path));
+        let state = state_using(&canon.path);
 
         let err = store.remove(&url, &state).unwrap_err();
         assert!(

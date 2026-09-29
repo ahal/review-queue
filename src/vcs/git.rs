@@ -7,7 +7,9 @@
 //!   Every `add_workspace`/`update_workspace` call pins its resulting head under
 //!   `refs/review-queue/<name>/<version>` (`git update-ref`, never overwritten), so a prior
 //!   version stays reachable once a later call moves the workspace on.
-//! - `is_dirty`: `git status --porcelain` is non-empty, or HEAD doesn't match the expected id.
+//! - `is_dirty`: `git status --porcelain` is non-empty, or HEAD isn't the expected id (the stack
+//!   tip) or one of its ancestors.
+//! - `position`: `git checkout --detach <commit>`, to sit on one patch of a stack.
 //! - `remove_workspace`: `git worktree remove`, plus every `refs/review-queue/<name>/*` ref.
 //!
 //! A failed patch application leaves the workspace in place (the caller should record
@@ -252,7 +254,38 @@ impl Vcs for GitVcs {
             return Ok(true);
         }
         let head = self.run(ws, &["rev-parse", "HEAD"])?;
-        Ok(head != expected_head)
+        if head == expected_head {
+            return Ok(false);
+        }
+        // Positioned on an earlier patch of the stack is fine; anything else isn't.
+        let is_ancestor = Command::new("git")
+            .current_dir(ws)
+            .args(["merge-base", "--is-ancestor", &head, expected_head])
+            .output()
+            .with_context(|| format!("running `git merge-base` in {}", ws.display()))?
+            .status
+            .success();
+        Ok(!is_ancestor)
+    }
+
+    fn position(&self, ws: &Path, commit: &str) -> Result<()> {
+        self.run(ws, &["checkout", "--detach", commit])
+            .with_context(|| format!("checking out {commit} in {}", ws.display()))?;
+        Ok(())
+    }
+
+    fn commits(&self, ws: &Path, tip: &str, limit: usize) -> Result<Vec<(String, String)>> {
+        let raw = self.run(
+            ws,
+            &[
+                "log",
+                "-n",
+                &limit.to_string(),
+                "--format=%H%x1f%B%x1e",
+                tip,
+            ],
+        )?;
+        Ok(super::parse_commit_records(&raw))
     }
 
     fn remove_workspace(&self, repo: &Path, ws: &Path, name: &str) -> Result<()> {
@@ -425,6 +458,57 @@ mod tests {
         // Two new commits over base.
         assert_eq!(rev_parse(&ws, "HEAD~2"), f.base);
         assert_eq!(rev_parse(&f.canon, "refs/review-queue/moz/D1/1"), head);
+    }
+
+    #[test]
+    fn position_moves_within_a_stack_without_counting_as_dirty() {
+        let f = fixture();
+        let checkout = Checkout::Patches {
+            base: Some(f.base.clone()),
+            patches: vec![
+                add_file_patch("add a", "a.txt", "aaa\n"),
+                add_file_patch("add b", "b.txt", "bbb\n"),
+            ],
+        };
+        let vcs = GitVcs;
+        let ws = f._tmp.path().join("ws");
+        let tip = vcs
+            .add_workspace(&f.canon, &ws, &checkout, "moz/D1", "1")
+            .unwrap();
+
+        let commits = vcs.commits(&ws, &tip, 10).unwrap();
+        assert_eq!(commits[0].0, tip);
+        assert_eq!(commits[0].1.trim(), "add b");
+        assert_eq!(commits[1].1.trim(), "add a");
+
+        vcs.position(&ws, &commits[1].0).unwrap();
+        assert!(!ws.join("b.txt").exists());
+        assert!(!vcs.is_dirty(&ws, &tip).unwrap());
+
+        vcs.position(&ws, &tip).unwrap();
+        assert!(ws.join("b.txt").exists());
+    }
+
+    #[test]
+    fn a_commit_outside_the_stack_is_dirty() {
+        let f = fixture();
+        let checkout = Checkout::Patches {
+            base: Some(f.base.clone()),
+            patches: vec![add_file_patch("add a", "a.txt", "aaa\n")],
+        };
+        let vcs = GitVcs;
+        let ws = f._tmp.path().join("ws");
+        let tip = vcs
+            .add_workspace(&f.canon, &ws, &checkout, "moz/D1", "1")
+            .unwrap();
+
+        git(&ws, &["config", "user.name", "test"]);
+        git(&ws, &["config", "user.email", "test@example.com"]);
+        fs::write(ws.join("mine.txt"), "x\n").unwrap();
+        git(&ws, &["add", "mine.txt"]);
+        git(&ws, &["commit", "-q", "-m", "local"]);
+
+        assert!(vcs.is_dirty(&ws, &tip).unwrap());
     }
 
     #[test]

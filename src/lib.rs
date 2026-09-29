@@ -3,6 +3,7 @@ pub mod config;
 pub mod paths;
 pub mod repo;
 pub mod source;
+pub mod stacks;
 pub mod state;
 pub mod sync;
 pub mod tui;

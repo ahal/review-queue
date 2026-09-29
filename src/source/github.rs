@@ -165,6 +165,7 @@ impl GithubSource {
             kind: ReviewKind::Direct,
             diff_stat: Some(diff_stat),
             description: pr.body.clone(),
+            ancestors: Vec::new(),
         })
     }
 
@@ -700,6 +701,7 @@ mod tests {
             kind: ReviewKind::Direct,
             diff_stat: None,
             description: None,
+            ancestors: Vec::new(),
         };
         let checkout = src
             .checkout_spec(&review, std::path::Path::new("/tmp/unused"))
@@ -750,6 +752,7 @@ mod tests {
             kind: ReviewKind::Direct,
             diff_stat: None,
             description: None,
+            ancestors: Vec::new(),
         };
         let Checkout::Ref { fork, .. } = src
             .checkout_spec(&review, std::path::Path::new("/tmp/unused"))
@@ -789,6 +792,7 @@ mod tests {
             kind: ReviewKind::Direct,
             diff_stat: None,
             description: None,
+            ancestors: Vec::new(),
         };
         let Checkout::Ref { fork, .. } = src
             .checkout_spec(&review, std::path::Path::new("/tmp/unused"))

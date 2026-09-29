@@ -43,6 +43,7 @@ use crate::config::{self, Config};
 use crate::paths::Paths;
 use crate::repo::{NeedsClone, OnMissing};
 use crate::source::ReviewSource;
+use crate::stacks;
 use crate::state::{ReviewEntry, ReviewKey, State};
 use crate::sync;
 
@@ -52,7 +53,7 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 const HELP: &str = "[Q]uit   [?]";
 
 const HELP_DIALOG: &str = "↑/↓ or j/k    move
-←/→ or h/l    expand/collapse
+←/→ or h/l    expand/collapse (a stack's header folds its reviews)
 enter         open locally
 f             fetch
 o             open in browser
@@ -72,6 +73,8 @@ struct Ctx {
     author_w: usize,
     /// Reviews currently expanded to show their diffstat - any number at once, independently.
     expanded: BTreeSet<ReviewKey>,
+    /// Stacks (by tip) whose member reviews are folded away under their header.
+    collapsed: BTreeSet<ReviewKey>,
     /// Set by `do_open_locally` on a successful fetch; drained by `run_event_loop`, which is the
     /// only place actually allowed to touch the terminal/backend to suspend into a subshell.
     pending_shell: Option<(ReviewKey, PathBuf)>,
@@ -109,12 +112,15 @@ type Spinners = BTreeMap<ReviewKey, Spin>;
 enum Row {
     Entry(ReviewKey),
     Detail(ReviewKey),
+    /// The header above a stack of two or more reviews, carrying the stack's tip: acting on it
+    /// (open, fetch, delete) acts on the tip, whose workspace is the stack's.
+    Stack(ReviewKey),
 }
 
 impl Row {
     fn key(&self) -> &ReviewKey {
         match self {
-            Row::Entry(k) | Row::Detail(k) => k,
+            Row::Entry(k) | Row::Detail(k) | Row::Stack(k) => k,
         }
     }
 }
@@ -150,6 +156,7 @@ pub fn run(
         key_w,
         author_w,
         expanded: BTreeSet::new(),
+        collapsed: BTreeSet::new(),
         pending_shell: None,
         fetching: BTreeMap::new(),
     });
@@ -159,6 +166,7 @@ pub fn run(
         &entries,
         key_w,
         author_w,
+        &BTreeSet::new(),
         &BTreeSet::new(),
         terminal_width(),
         &Spinners::new(),
@@ -256,17 +264,52 @@ fn run_event_loop(mut siv: Cursive) -> Result<()> {
 
 fn load_rows(paths: &Paths, all: bool) -> Result<Vec<ReviewEntry>> {
     let state = State::load(&paths.state_file())?;
-    Ok(state
-        .iter()
-        .filter(|e| all || e.in_queue)
-        .cloned()
-        .collect())
+    Ok(order_by_stack(
+        state
+            .iter()
+            .filter(|e| all || e.in_queue)
+            .cloned()
+            .collect(),
+    ))
+}
+
+/// Reorders `entries` so every stack's reviews sit together, bottom-most first. A stack shows up
+/// where its first member did, so unstacked reviews keep their relative order.
+fn order_by_stack(entries: Vec<ReviewEntry>) -> Vec<ReviewEntry> {
+    let stacks = stacks::group(entries.iter());
+    let mut by_key: BTreeMap<ReviewKey, ReviewEntry> =
+        entries.iter().map(|e| (e.key.clone(), e.clone())).collect();
+    let mut emitted: BTreeSet<ReviewKey> = BTreeSet::new();
+    let mut out = Vec::with_capacity(entries.len());
+    for e in &entries {
+        if emitted.contains(&e.key) {
+            continue;
+        }
+        let members = stacks::stack_containing(&stacks, &e.key)
+            .map(|s| s.members.clone())
+            .unwrap_or_else(|| vec![e.key.clone()]);
+        for key in members {
+            if emitted.insert(key.clone())
+                && let Some(entry) = by_key.remove(&key)
+            {
+                out.push(entry);
+            }
+        }
+    }
+    out
 }
 
 fn column_widths(entries: &[ReviewEntry]) -> (usize, usize) {
+    // A stacked review's key is indented, and its author/title still line up with everyone
+    // else's, so the column has to be wide enough for the indent too.
+    let stacked: BTreeSet<ReviewKey> = stacks::group(entries.iter())
+        .into_iter()
+        .filter(|s| s.members.len() > 1)
+        .flat_map(|s| s.members)
+        .collect();
     let key_w = entries
         .iter()
-        .map(|e| e.key.slug().len())
+        .map(|e| e.key.slug().len() + if stacked.contains(&e.key) { STACK_INDENT.len() } else { 0 })
         .max()
         .unwrap_or(3)
         .max(3);
@@ -288,6 +331,9 @@ fn truncate(s: &str, width: usize) -> String {
     }
 }
 
+/// How far in a stack's member reviews sit from its header (and from unstacked reviews).
+const STACK_INDENT: &str = "  ";
+
 fn ansi(c: BaseColor) -> Color {
     Color::Dark(c)
 }
@@ -297,11 +343,18 @@ fn row_label(
     key_w: usize,
     author_w: usize,
     expanded: bool,
+    stacked: bool,
     spin: Option<Spin>,
 ) -> StyledString {
     let marker = if expanded { '\u{25be}' } else { '\u{25b8}' };
 
-    let mut out = StyledString::styled(format!("{marker} "), Effect::Dim);
+    let mut out = StyledString::new();
+    if stacked {
+        // One level in from unstacked reviews; the header above owns the workspace icon and
+        // spinner, since the workspace is shared.
+        out.append_plain(STACK_INDENT);
+    }
+    out.append_styled(format!("{marker} "), Effect::Dim);
     if let Some(spin) = spin {
         let color = if spin.cancelling {
             BaseColor::Red
@@ -309,12 +362,14 @@ fn row_label(
             BaseColor::Yellow
         };
         out.append_styled(SPINNER_FRAMES[spin.frame % SPINNER_FRAMES.len()], ansi(color));
-    } else if e.workspace.is_some() {
+    } else if e.stack_id.is_some() && !stacked {
         out.append_styled("\u{2913}", ansi(BaseColor::Cyan));
     } else {
         out.append_plain(" ");
     }
     out.append_plain(" ");
+    // The indent comes out of the key column so the author and title stay aligned.
+    let key_w = if stacked { key_w.saturating_sub(STACK_INDENT.len()) } else { key_w };
     out.append_styled(format!("{:<key_w$}", e.key.slug()), ansi(BaseColor::Cyan));
     out.append_plain("  ");
     out.append_plain(truncate(&e.author, author_w));
@@ -422,19 +477,98 @@ fn description_lines(e: &ReviewEntry, width: usize) -> Vec<String> {
         .collect()
 }
 
+/// The header above a stack. A stack has no title or author of its own - it can span authors,
+/// bugs and repos - so it only says how many revisions it holds; the rest stays on member rows.
+fn stack_header_label(
+    members: &[&ReviewEntry],
+    collapsed: bool,
+    has_workspace: bool,
+    spin: Option<Spin>,
+) -> StyledString {
+    let marker = if collapsed { '\u{25b8}' } else { '\u{25be}' };
+    let mut out = StyledString::styled(format!("{marker} "), Effect::Dim);
+    if let Some(spin) = spin {
+        let color = if spin.cancelling {
+            BaseColor::Red
+        } else {
+            BaseColor::Yellow
+        };
+        out.append_styled(SPINNER_FRAMES[spin.frame % SPINNER_FRAMES.len()], ansi(color));
+    } else if has_workspace {
+        out.append_styled("\u{2913}", ansi(BaseColor::Cyan));
+    } else {
+        out.append_plain(" ");
+    }
+    out.append_plain(" ");
+
+    out.append_styled(
+        format!("stack of {} revisions", members.len()),
+        ansi(BaseColor::Cyan),
+    );
+    out
+}
+
 fn build_rows(
     entries: &[ReviewEntry],
     key_w: usize,
     author_w: usize,
     expanded: &BTreeSet<ReviewKey>,
+    collapsed: &BTreeSet<ReviewKey>,
     width: usize,
     spinners: &Spinners,
 ) -> Vec<(StyledString, Row)> {
+    // Which multi-review stack (by index into `stacks`) each review belongs to. A lone review
+    // isn't drawn as a stack.
+    let stacks: Vec<_> = stacks::group(entries.iter())
+        .into_iter()
+        .filter(|s| s.members.len() > 1)
+        .collect();
+    let by_key: BTreeMap<&ReviewKey, &ReviewEntry> = entries.iter().map(|e| (&e.key, e)).collect();
+    let stack_of: BTreeMap<&ReviewKey, usize> = stacks
+        .iter()
+        .enumerate()
+        .flat_map(|(i, s)| s.members.iter().map(move |k| (k, i)))
+        .collect();
+
     let mut rows = Vec::new();
+    let mut headed: BTreeSet<usize> = BTreeSet::new();
     for e in entries {
+        let stack = stack_of.get(&e.key).copied();
+        if let Some(i) = stack
+            && headed.insert(i)
+        {
+            let stack = &stacks[i];
+            let members: Vec<&ReviewEntry> = stack
+                .members
+                .iter()
+                .filter_map(|k| by_key.get(k).copied())
+                .collect();
+            let is_collapsed = collapsed.contains(&stack.tip);
+            let has_workspace = members.iter().any(|m| m.stack_id.is_some());
+            rows.push((
+                stack_header_label(
+                    &members,
+                    is_collapsed,
+                    has_workspace,
+                    spinners.get(&stack.tip).copied(),
+                ),
+                Row::Stack(stack.tip.clone()),
+            ));
+        }
+        if let Some(i) = stack
+            && collapsed.contains(&stacks[i].tip)
+        {
+            continue;
+        }
+
         let is_expanded = expanded.contains(&e.key);
+        let spin = if stack.is_some() {
+            None
+        } else {
+            spinners.get(&e.key).copied()
+        };
         rows.push((
-            row_label(e, key_w, author_w, is_expanded, spinners.get(&e.key).copied()),
+            row_label(e, key_w, author_w, is_expanded, stack.is_some(), spin),
             Row::Entry(e.key.clone()),
         ));
         if is_expanded {
@@ -474,23 +608,39 @@ fn move_selection(s: &mut Cursive, down: bool) {
     });
 }
 
-fn selected_key(s: &mut Cursive) -> Option<ReviewKey> {
+fn selected_row(s: &mut Cursive) -> Option<Row> {
     s.call_on_name("reviews", |v: &mut SelectView<Row>| v.selection())
         .flatten()
-        .map(|row| row.key().clone())
+        .map(|row| (*row).clone())
+}
+
+fn selected_key(s: &mut Cursive) -> Option<ReviewKey> {
+    selected_row(s).map(|row| row.key().clone())
 }
 
 /// `set_expanded(s, true/false)` backs left/right and the `l`/`h` vim-style bindings - directional
 /// rather than a toggle, so repeating one is idempotent instead of flipping back and forth.
 fn set_expanded(s: &mut Cursive, expand: bool) {
-    let Some(key) = selected_key(s) else {
+    let Some(row) = selected_row(s) else {
         return;
     };
     if let Some(ctx) = s.user_data::<Ctx>() {
-        if expand {
-            ctx.expanded.insert(key);
-        } else {
-            ctx.expanded.remove(&key);
+        match row {
+            // On a stack's header, folds/unfolds the stack's member reviews.
+            Row::Stack(tip) => {
+                if expand {
+                    ctx.collapsed.remove(&tip);
+                } else {
+                    ctx.collapsed.insert(tip);
+                }
+            }
+            Row::Entry(key) | Row::Detail(key) => {
+                if expand {
+                    ctx.expanded.insert(key);
+                } else {
+                    ctx.expanded.remove(&key);
+                }
+            }
         }
     }
     reload(s);
@@ -554,17 +704,22 @@ fn delete_workspace_selected(s: &mut Cursive) {
         return;
     };
     // Nothing to delete yet while it's still being fetched - `d` cancels it instead.
-    if s.user_data::<Ctx>().is_some_and(|ctx| ctx.fetching.contains_key(&key)) {
-        cancel_fetch(s, &key);
+    let guard = fetch_guard(s, &key);
+    if s.user_data::<Ctx>().is_some_and(|ctx| ctx.fetching.contains_key(&guard)) {
+        cancel_fetch(s, &guard);
         return;
     }
-    let has_workspace = s
+    // A workspace is shared by every review in its stack, so deleting it takes them all along.
+    let sharing = s
         .user_data::<Ctx>()
         .and_then(|ctx| State::load(&ctx.paths.state_file()).ok())
-        .and_then(|st| st.get(&key).map(|e| e.workspace.is_some()))
-        .unwrap_or(false);
-    if has_workspace {
-        prompt_delete_workspace(s, key);
+        .and_then(|st| {
+            let id = st.get(&key)?.stack_id.clone()?;
+            st.workspace(&id)?;
+            Some(st.members_of(&id).len())
+        });
+    if let Some(sharing) = sharing {
+        prompt_delete_workspace(s, key, sharing);
     } else {
         set_status(s, format!("`{key}` has no local workspace"));
     }
@@ -572,8 +727,13 @@ fn delete_workspace_selected(s: &mut Cursive) {
 
 /// Confirms before deleting a workspace. Local changes are always discarded - there's no second
 /// prompt for a dirty workspace.
-fn prompt_delete_workspace(s: &mut Cursive, key: ReviewKey) {
-    let dialog = Dialog::text(format!("Delete workspace for {key}?"))
+fn prompt_delete_workspace(s: &mut Cursive, key: ReviewKey, sharing: usize) {
+    let text = if sharing > 1 {
+        format!("Delete the workspace for {key} and the {} other reviews in its stack?", sharing - 1)
+    } else {
+        format!("Delete workspace for {key}?")
+    };
+    let dialog = Dialog::text(text)
         .title("Delete workspace?")
         .button("No", |s| {
             s.pop_layer();
@@ -589,11 +749,12 @@ fn prompt_delete_workspace(s: &mut Cursive, key: ReviewKey) {
 /// showing the same row spinner as a fetch while it works - deleting a big worktree can take a
 /// while.
 fn begin_delete(s: &mut Cursive, key: ReviewKey) {
+    let guard = fetch_guard(s, &key);
     let Some(ctx) = s.user_data::<Ctx>() else {
         return;
     };
     ctx.fetching.insert(
-        key.clone(),
+        guard.clone(),
         Fetch {
             cancelled: Arc::new(AtomicBool::new(false)),
             frame: 0,
@@ -604,19 +765,19 @@ fn begin_delete(s: &mut Cursive, key: ReviewKey) {
     reload(s);
 
     let done = Arc::new(AtomicBool::new(false));
-    spawn_spinner_ticker(s, key.clone(), done.clone());
+    spawn_spinner_ticker(s, guard.clone(), done.clone());
 
     let cb_sink = s.cb_sink().clone();
     std::thread::spawn(move || {
         let result = sync::remove_workspace(&paths, &key, true);
         done.store(true, Ordering::SeqCst);
-        let _ = cb_sink.send(Box::new(move |s| finish_delete(s, key, result)));
+        let _ = cb_sink.send(Box::new(move |s| finish_delete(s, key, guard, result)));
     });
 }
 
-fn finish_delete(s: &mut Cursive, key: ReviewKey, result: Result<()>) {
+fn finish_delete(s: &mut Cursive, key: ReviewKey, guard: ReviewKey, result: Result<()>) {
     if let Some(ctx) = s.user_data::<Ctx>() {
-        ctx.fetching.remove(&key);
+        ctx.fetching.remove(&guard);
     }
     match result {
         Ok(()) => set_status(s, format!("deleted workspace for {key}")),
@@ -631,6 +792,7 @@ fn fetch_selected(s: &mut Cursive) {
     let Some(key) = selected_key(s) else {
         return;
     };
+    let guard = fetch_guard(s, &key);
     let Some(ctx) = s.user_data::<Ctx>() else {
         return;
     };
@@ -639,8 +801,8 @@ fn fetch_selected(s: &mut Cursive) {
     } else {
         OnMissing::Ask
     };
-    if let Some(f) = ctx.fetching.get(&key) {
-        let msg = busy_message(&key, f);
+    if let Some(f) = ctx.fetching.get(&guard) {
+        let msg = busy_message(&guard, f);
         set_status(s, msg);
         return;
     }
@@ -648,6 +810,7 @@ fn fetch_selected(s: &mut Cursive) {
 }
 
 fn open_locally_selected_key(s: &mut Cursive, key: ReviewKey) {
+    let guard = fetch_guard(s, &key);
     let Some(ctx) = s.user_data::<Ctx>() else {
         return;
     };
@@ -656,15 +819,14 @@ fn open_locally_selected_key(s: &mut Cursive, key: ReviewKey) {
     } else {
         OnMissing::Ask
     };
-    if let Some(f) = ctx.fetching.get(&key) {
-        let msg = busy_message(&key, f);
+    if let Some(f) = ctx.fetching.get(&guard) {
+        let msg = busy_message(&guard, f);
         set_status(s, msg);
         return;
     }
     let has_workspace = State::load(&ctx.paths.state_file())
         .ok()
-        .and_then(|st| st.get(&key).map(|e| e.workspace.is_some()))
-        .unwrap_or(false);
+        .is_some_and(|st| st.workspace_for(&key).is_some());
 
     if has_workspace {
         // Already fetched - `fetch_local` is a fast, local no-op in this case, so there's
@@ -697,11 +859,12 @@ fn prompt_confirm_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) 
 /// on that row cancels (`cancel_fetch`).
 fn begin_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing, open_shell: bool) {
     let cancelled = Arc::new(AtomicBool::new(false));
+    let guard = fetch_guard(s, &key);
     let Some(ctx) = s.user_data::<Ctx>() else {
         return;
     };
     ctx.fetching.insert(
-        key.clone(),
+        guard.clone(),
         Fetch {
             cancelled: cancelled.clone(),
             frame: 0,
@@ -714,12 +877,11 @@ fn begin_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing, open_shel
     let handle = ctx.handle.clone();
     let had_workspace = State::load(&ctx.paths.state_file())
         .ok()
-        .and_then(|st| st.get(&key).map(|e| e.workspace.is_some()))
-        .unwrap_or(false);
+        .is_some_and(|st| st.workspace_for(&key).is_some());
     reload(s);
 
     let done = Arc::new(AtomicBool::new(false));
-    spawn_spinner_ticker(s, key.clone(), done.clone());
+    spawn_spinner_ticker(s, guard.clone(), done.clone());
 
     let cb_sink = s.cb_sink().clone();
     let worker_key = key.clone();
@@ -733,9 +895,22 @@ fn begin_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing, open_shel
         ));
         done.store(true, Ordering::SeqCst);
         let _ = cb_sink.send(Box::new(move |s| {
-            finish_fetch(s, worker_key, result, cancelled, open_shell, had_workspace)
+            finish_fetch(s, worker_key, guard, result, cancelled, open_shell, had_workspace)
         }));
     });
+}
+
+/// The `Ctx::fetching` key for `key`'s operations: its stack's tip, since a stack shares one
+/// workspace and so one in-flight fetch/delete - starting a second on another member of the same
+/// stack would race the first.
+fn fetch_guard(s: &mut Cursive, key: &ReviewKey) -> ReviewKey {
+    s.user_data::<Ctx>()
+        .and_then(|ctx| State::load(&ctx.paths.state_file()).ok())
+        .and_then(|st| {
+            let stacks = stacks::group(st.iter());
+            stacks::stack_containing(&stacks, key).map(|stack| stack.tip.clone())
+        })
+        .unwrap_or_else(|| key.clone())
 }
 
 /// Cancels a review's in-flight fetch (`d` on its row, see `delete_workspace_selected`).
@@ -813,13 +988,14 @@ fn spawn_spinner_ticker(s: &Cursive, key: ReviewKey, done: Arc<AtomicBool>) {
 fn finish_fetch(
     s: &mut Cursive,
     key: ReviewKey,
+    guard: ReviewKey,
     result: Result<PathBuf>,
     cancelled: Arc<AtomicBool>,
     open_shell: bool,
     had_workspace: bool,
 ) {
     if let Some(ctx) = s.user_data::<Ctx>() {
-        ctx.fetching.remove(&key);
+        ctx.fetching.remove(&guard);
     }
 
     if cancelled.load(Ordering::SeqCst) {
@@ -939,6 +1115,7 @@ fn reload(s: &mut Cursive) {
             ctx.key_w,
             ctx.author_w,
             ctx.expanded.clone(),
+            ctx.collapsed.clone(),
             ctx.fetching
                 .iter()
                 .map(|(k, f)| {
@@ -951,7 +1128,7 @@ fn reload(s: &mut Cursive) {
                 .collect::<Spinners>(),
         )
     });
-    let Some((loaded, key_w, author_w, expanded, spinners)) = loaded else {
+    let Some((loaded, key_w, author_w, expanded, collapsed, spinners)) = loaded else {
         return;
     };
     let entries = match loaded {
@@ -963,14 +1140,24 @@ fn reload(s: &mut Cursive) {
     };
 
     s.call_on_name("reviews", |v: &mut SelectView<Row>| {
-        let selected = v.selection().map(|row| row.key().clone());
+        let selected = v.selection().map(|row| (*row).clone());
         v.clear();
-        for (label, row) in build_rows(&entries, key_w, author_w, &expanded, terminal_width(), &spinners) {
+        let rows = build_rows(
+            &entries,
+            key_w,
+            author_w,
+            &expanded,
+            &collapsed,
+            terminal_width(),
+            &spinners,
+        );
+        for (label, row) in rows {
             v.add_item(label, row);
         }
+        // Compare whole rows, not just keys: a stack's header and its tip share a key.
         if let Some(selected) = selected
             && let Some(idx) =
-                (0..v.len()).find(|&i| v.get_item(i).is_some_and(|(_, row)| *row.key() == selected))
+                (0..v.len()).find(|&i| v.get_item(i).is_some_and(|(_, row)| *row == selected))
         {
             v.set_selection(idx);
         }
@@ -997,16 +1184,103 @@ mod tests {
             in_queue: true,
             resolved: false,
             last_synced: chrono::Utc::now(),
-            workspace: None,
+            stack_id: None,
+            ancestors: Vec::new(),
             diff_stat: diff_stat.map(String::from),
             description: None,
         }
     }
 
+    fn stacked(id: &str, ancestors: &[&str]) -> ReviewEntry {
+        let mut e = entry(id, None);
+        e.ancestors = ancestors.iter().map(|a| ReviewKey::new("moz", *a)).collect();
+        e
+    }
+
+    #[test]
+    fn a_stack_is_grouped_bottom_first_where_its_first_member_sat() {
+        // D2 sorts between D1 and D3 but belongs with D3's stack; D1 is on its own.
+        let entries = vec![
+            stacked("D1", &[]),
+            stacked("D2", &[]),
+            stacked("D3", &["D2"]),
+            stacked("D4", &[]),
+        ];
+        let ordered = order_by_stack(entries);
+        let ids: Vec<_> = ordered.iter().map(|e| e.key.id.as_str()).collect();
+        assert_eq!(ids, ["D1", "D2", "D3", "D4"]);
+
+        let entries = vec![stacked("D1", &["D9"]), stacked("D2", &[]), stacked("D9", &[])];
+        let ordered = order_by_stack(entries);
+        let ids: Vec<_> = ordered.iter().map(|e| e.key.id.as_str()).collect();
+        assert_eq!(ids, ["D9", "D1", "D2"], "D9 is D1's parent, so it comes first");
+    }
+
+    #[test]
+    fn a_stack_gets_a_header_with_flat_indented_members() {
+        let entries = order_by_stack(vec![
+            stacked("D1", &[]),
+            stacked("D3", &["D1"]),
+            stacked("D9", &[]),
+        ]);
+        let spinners = Spinners::from([(
+            ReviewKey::new("moz", "D3"),
+            Spin {
+                frame: 0,
+                cancelling: false,
+            },
+        )]);
+        let rows = build_rows(&entries, 5, 6, &BTreeSet::new(), &BTreeSet::new(), 100, &spinners);
+
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(&rows[0].1, Row::Stack(k) if k.id == "D3"), "header carries the tip");
+        assert!(matches!(&rows[1].1, Row::Entry(k) if k.id == "D1"));
+        assert!(matches!(&rows[2].1, Row::Entry(k) if k.id == "D3"));
+        assert!(matches!(&rows[3].1, Row::Entry(k) if k.id == "D9"));
+
+        let plain = |i: usize| rows[i].0.source().to_string();
+        assert!(plain(0).contains("stack of 2 revisions"));
+        // Members sit at the same single indent, unlike the unstacked review below.
+        assert!(plain(1).starts_with(STACK_INDENT));
+        assert!(plain(2).starts_with(STACK_INDENT));
+        assert!(!plain(3).starts_with(STACK_INDENT));
+        // The stack's spinner is on the header only.
+        assert!(plain(0).contains(SPINNER_FRAMES[0]));
+        assert!(!plain(1).contains(SPINNER_FRAMES[0]));
+        assert!(!plain(2).contains(SPINNER_FRAMES[0]));
+    }
+
+    #[test]
+    fn stacked_and_unstacked_rows_keep_author_and_title_aligned() {
+        let entries = order_by_stack(vec![
+            stacked("D1", &[]),
+            stacked("D2", &["D1"]),
+            stacked("D3", &[]),
+        ]);
+        let (key_w, author_w) = column_widths(&entries);
+        let rows = build_rows(&entries, key_w, author_w, &BTreeSet::new(), &BTreeSet::new(), 100, &Spinners::new());
+        let author_col: Vec<usize> = rows
+            .iter()
+            .filter(|(_, r)| matches!(r, Row::Entry(_)))
+            .map(|(l, _)| l.source().find("someone").unwrap())
+            .collect();
+        assert_eq!(author_col.len(), 3);
+        assert!(author_col.iter().all(|c| *c == author_col[0]), "{author_col:?}");
+    }
+
+    #[test]
+    fn a_collapsed_stack_shows_only_its_header() {
+        let entries = order_by_stack(vec![stacked("D1", &[]), stacked("D2", &["D1"])]);
+        let collapsed = BTreeSet::from([ReviewKey::new("moz", "D2")]);
+        let rows = build_rows(&entries, 5, 6, &BTreeSet::new(), &collapsed, 100, &Spinners::new());
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(&rows[0].1, Row::Stack(_)));
+    }
+
     #[test]
     fn collapsed_entries_produce_one_row_each() {
         let entries = vec![entry("D1", None), entry("D2", None)];
-        let rows = build_rows(&entries, 5, 6, &BTreeSet::new(), 100, &Spinners::new());
+        let rows = build_rows(&entries, 5, 6, &BTreeSet::new(), &BTreeSet::new(), 100, &Spinners::new());
         assert_eq!(rows.len(), 2);
         assert!(matches!(&rows[0].1, Row::Entry(k) if k.id == "D1"));
         assert!(matches!(&rows[1].1, Row::Entry(k) if k.id == "D2"));
@@ -1019,7 +1293,7 @@ mod tests {
             entry("D2", None),
         ];
         let expanded = ReviewKey::new("moz", "D1");
-        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([expanded.clone()]), 100, &Spinners::new());
+        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([expanded.clone()]), &BTreeSet::new(), 100, &Spinners::new());
 
         // D1's entry row, its title + blank line, its two diffstat lines, then D2's entry row.
         assert_eq!(rows.len(), 6);
@@ -1038,7 +1312,7 @@ mod tests {
         ];
         let d1 = ReviewKey::new("moz", "D1");
         let d2 = ReviewKey::new("moz", "D2");
-        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([d1.clone(), d2.clone()]), 100, &Spinners::new());
+        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([d1.clone(), d2.clone()]), &BTreeSet::new(), 100, &Spinners::new());
 
         // D1's entry + title/blank + its diffstat line, then the same for D2 - expanding D2 must
         // not have collapsed D1.
@@ -1106,7 +1380,7 @@ mod tests {
         assert_eq!(lines.last().unwrap(), "      ");
 
         let expanded = BTreeSet::from([e.key.clone()]);
-        let rows = build_rows(&[e], 5, 6, &expanded, 100, &Spinners::new());
+        let rows = build_rows(&[e], 5, 6, &expanded, &BTreeSet::new(), 100, &Spinners::new());
         // entry + title/description lines + diffstat line
         assert_eq!(rows.len(), 1 + lines.len() + 1);
     }
@@ -1124,12 +1398,12 @@ mod tests {
     #[test]
     fn a_fetching_row_shows_a_spinner_instead_of_the_workspace_icon() {
         let e = entry("D1", None);
-        let plain = row_label(&e, 5, 6, false, None).source().to_string();
+        let plain = row_label(&e, 5, 6, false, false, None).source().to_string();
         let spin = Spin {
             frame: 0,
             cancelling: false,
         };
-        let spinning = row_label(&e, 5, 6, false, Some(spin)).source().to_string();
+        let spinning = row_label(&e, 5, 6, false, false, Some(spin)).source().to_string();
         assert!(spinning.contains(SPINNER_FRAMES[0]));
         assert!(!plain.contains(SPINNER_FRAMES[0]));
         assert_eq!(plain.chars().count(), spinning.chars().count());
@@ -1251,7 +1525,7 @@ mod tests {
         ];
         let mut select = SelectView::<Row>::new();
         let expanded = ReviewKey::new("moz", "D1");
-        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded]), 100, &Spinners::new()) {
+        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded]), &BTreeSet::new(), 100, &Spinners::new()) {
             select.add_item(label, row);
         }
         siv.add_layer(select.with_name("reviews"));
@@ -1272,7 +1546,7 @@ mod tests {
         let entries = vec![entry("D1", Some("a.rs | 1 +"))];
         let mut select = SelectView::<Row>::new();
         let expanded = ReviewKey::new("moz", "D1");
-        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded]), 100, &Spinners::new()) {
+        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded]), &BTreeSet::new(), 100, &Spinners::new()) {
             select.add_item(label, row);
         }
         siv.add_layer(select.with_name("reviews"));
@@ -1307,6 +1581,7 @@ mod tests {
             key_w: 5,
             author_w: 6,
             expanded: BTreeSet::new(),
+            collapsed: BTreeSet::new(),
             pending_shell: None,
             fetching: BTreeMap::new(),
         }

@@ -62,6 +62,9 @@ pub struct Review {
     /// carried separately in `title`). Carried into `state.json` alongside `diff_stat` so the TUI
     /// can show it with no network calls of its own.
     pub description: Option<String>,
+    /// This review's ancestors within its stack, bottom-most first, excluding itself and any
+    /// already-landed ones (those are part of the base). Empty for a review that isn't stacked.
+    pub ancestors: Vec<ReviewKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,4 +140,11 @@ pub trait ReviewSource: Send + Sync {
     /// Refresh the lifecycle of reviews that are no longer in the queue (e.g. changes were
     /// requested, or the reviewer was removed) so `sync` knows whether to keep the workspace.
     async fn fetch_status(&self, ids: &[String]) -> Result<Vec<(String, Lifecycle)>>;
+
+    /// Whether `message` (a commit message from a workspace built for a stack containing
+    /// `review`) is the commit that carries `review`'s patch. Lets a stack workspace be
+    /// positioned at one member's patch. Sources that don't stack reviews never need this.
+    fn is_commit_for(&self, _review: &ReviewKey, _message: &str) -> bool {
+        false
+    }
 }

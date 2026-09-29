@@ -1,26 +1,32 @@
 //! The sync engine: source-agnostic glue between `ReviewSource`, `RepoStore`, and the `Vcs`
 //! backends.
 //!
+//! Workspaces are per *stack*, not per review: reviews whose `ancestors` chain them together (a
+//! Phabricator stack) share one workspace, built from the stack's tip, and a lone review is just a
+//! stack of one. See `stacks` for how reviews are grouped.
+//!
 //! `rq sync` (this module's `sync()`) only ever tracks metadata and updates/removes *existing*
 //! workspaces - it never creates one. Per source, per run:
 //! 1. `fetch_queue()` - reviews currently waiting on you.
-//! 2. New reviews are recorded with no workspace (see `fetch_local()` for that).
-//! 3. Reviews already tracked whose `version` changed get their workspace (if any) updated in
-//!    place if clean (`update_workspace`); dirty ones are flagged instead of touched.
-//! 4. Reviews still in the queue but otherwise unchanged just get `in_queue` refreshed.
+//! 2. New reviews are recorded with no workspace (see `fetch_local()` for that); tracked ones get
+//!    their metadata (including `version` and `ancestors`) refreshed.
 //!
 //! Then, once per source, for tracked reviews that weren't in this run's queue (you acted on
 //! them - approved, requested changes - so they dropped out): `fetch_status()` tells us whether
-//! the review itself resolved (landed/closed/abandoned/merged). A resolved review with no
-//! workspace, or one whose workspace directory is already gone from disk, is just dropped. A
-//! resolved review with a clean workspace has the workspace removed too. Either way, if dirty,
-//! it's kept - and re-checked on every later sync, so it clears out on its own once the local
-//! changes are gone. This is the only workspace-removal path; there's no separate prune step.
+//! the review itself resolved (landed/closed/abandoned/merged). A resolved review that isn't part
+//! of a workspace is just dropped.
+//!
+//! Finally each existing workspace is reconciled against its stack: reviews newly chained onto a
+//! checked-out stack join its workspace; a workspace whose tip or tip `version` changed is
+//! updated in place if clean (`update_workspace`), or flagged if dirty; one whose reviews have
+//! all resolved is removed if clean (dirty ones are kept, and re-checked on every later sync, so
+//! they clear out on their own once the local changes are gone). This is the only
+//! workspace-removal path; there's no separate prune step.
 //!
 //! `fetch_local()` is the on-demand counterpart - resolving a canonical repo (asking before
 //! cloning one, unless told otherwise) and creating a workspace for a single already-tracked
-//! review. It's what `rq fetch` and the fetch hotkey in `rq show`'s TUI call; `sync()` never
-//! calls it itself.
+//! review's stack, or, if it already has one, moving it to that review's patch. It's what `rq
+//! fetch` and the fetch hotkey in `rq show`'s TUI call; `sync()` never calls it itself.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -31,10 +37,15 @@ use crate::config::{Config, VcsKind};
 use crate::paths::Paths;
 use crate::repo::{OnMissing, RepoStore};
 use crate::source::{Lifecycle, Review, ReviewSource};
+use crate::stacks::{self, Stack};
 use crate::state::{ReviewEntry, ReviewKey, State, Status, Workspace};
 use crate::vcs::Vcs;
 use crate::vcs::git::GitVcs;
 use crate::vcs::jj::JjVcs;
+
+/// How far back from a stack's tip to look for a member's commit; comfortably deeper than any
+/// realistic stack.
+const STACK_SCAN_DEPTH: usize = 200;
 
 #[derive(Debug, Default)]
 pub struct SyncReport {
@@ -74,11 +85,7 @@ pub async fn sync(
             .with_context(|| format!("fetching queue from `{}`", source.name()))?;
         for review in queue {
             seen.insert(review.key.clone());
-            if let Err(e) =
-                sync_one(source.as_ref(), &review, &mut state, dry_run, &mut report).await
-            {
-                report.errors.push((review.key.clone(), e.to_string()));
-            }
+            record_review(&review, &mut state, &mut report);
         }
     }
 
@@ -108,9 +115,11 @@ pub async fn sync(
             .with_context(|| format!("checking status from `{source_name}`"))?;
         for (id, lifecycle) in statuses {
             let key = ReviewKey::new(source_name.clone(), id);
-            handle_out_of_queue(&key, lifecycle, &mut state, dry_run, &mut report)?;
+            handle_out_of_queue(&key, lifecycle, &mut state, &mut report);
         }
     }
+
+    reconcile_workspaces(sources, only_source, &mut state, dry_run, &mut report).await;
 
     if !dry_run {
         state.save(&paths.state_file())?;
@@ -118,141 +127,54 @@ pub async fn sync(
     Ok(report)
 }
 
-async fn sync_one(
-    source: &dyn ReviewSource,
-    review: &Review,
-    state: &mut State,
-    dry_run: bool,
-    report: &mut SyncReport,
-) -> Result<()> {
-    match state.get(&review.key).cloned() {
+/// Record a review from this run's queue: new ones are added with no workspace, tracked ones
+/// have their metadata refreshed. Never touches a workspace - see `reconcile_workspaces`.
+fn record_review(review: &Review, state: &mut State, report: &mut SyncReport) {
+    let mut entry = match state.get(&review.key).cloned() {
+        Some(entry) => entry,
         None => {
-            add_new(review, state, dry_run, report);
-            Ok(())
+            report.added.push(review.key.clone());
+            ReviewEntry {
+                key: review.key.clone(),
+                title: String::new(),
+                author: String::new(),
+                url: String::new(),
+                repo: review.repo.clone(),
+                kind: review.kind.clone(),
+                version: String::new(),
+                in_queue: true,
+                resolved: false,
+                last_synced: chrono::Utc::now(),
+                stack_id: None,
+                ancestors: Vec::new(),
+                diff_stat: None,
+                description: None,
+            }
         }
-        Some(entry) => update_existing(source, review, entry, state, dry_run, report).await,
-    }
-}
-
-fn add_new(review: &Review, state: &mut State, dry_run: bool, report: &mut SyncReport) {
-    report.added.push(review.key.clone());
-    if dry_run {
-        return;
-    }
-    state.insert(ReviewEntry {
-        key: review.key.clone(),
-        title: review.title.clone(),
-        author: review.author.clone(),
-        url: review.url.clone(),
-        repo: review.repo.clone(),
-        kind: review.kind.clone(),
-        version: review.version.clone(),
-        in_queue: true,
-        resolved: false,
-        last_synced: chrono::Utc::now(),
-        workspace: None,
-        diff_stat: review.diff_stat.clone(),
-        description: review.description.clone(),
-    });
-}
-
-async fn update_existing(
-    source: &dyn ReviewSource,
-    review: &Review,
-    mut entry: ReviewEntry,
-    state: &mut State,
-    dry_run: bool,
-    report: &mut SyncReport,
-) -> Result<()> {
+    };
     entry.title = review.title.clone();
     entry.author = review.author.clone();
     entry.url = review.url.clone();
     entry.repo = review.repo.clone();
     entry.kind = review.kind.clone();
+    entry.version = review.version.clone();
+    entry.ancestors = review.ancestors.clone();
     entry.in_queue = true;
     entry.resolved = false;
     entry.diff_stat = review.diff_stat.clone();
     entry.description = review.description.clone();
-
-    let Some(mut ws) = entry.workspace.clone() else {
-        // Not fetched locally - nothing on disk to update, just keep the tracked metadata
-        // (including `version`) current for a later `rq fetch`.
-        entry.version = review.version.clone();
-        entry.last_synced = chrono::Utc::now();
-        if !dry_run {
-            state.insert(entry);
-        }
-        return Ok(());
-    };
-
-    if entry.version == review.version {
-        entry.last_synced = chrono::Utc::now();
-        if !dry_run {
-            state.insert(entry);
-        }
-        return Ok(());
-    }
-
-    let vcs = vcs_for(ws.vcs);
-    if vcs
-        .is_dirty(&ws.workspace_path, &ws.head_id)
-        .unwrap_or(true)
-    {
-        ws.status = Status::Dirty;
-        entry.workspace = Some(ws);
-        entry.last_synced = chrono::Utc::now();
-        report.flagged.push((
-            review.key.clone(),
-            "local changes; not updated to the new version".into(),
-        ));
-        if !dry_run {
-            state.insert(entry);
-        }
-        return Ok(());
-    }
-
-    if dry_run {
-        report.updated.push(review.key.clone());
-        return Ok(());
-    }
-
-    let checkout = source.checkout_spec(review, &ws.repo_path).await?;
-    match vcs.update_workspace(
-        &ws.repo_path,
-        &ws.workspace_path,
-        &checkout,
-        &review.key.slug(),
-        &review.version,
-    ) {
-        Ok(head) => {
-            entry.version = review.version.clone();
-            ws.head_id = head;
-            ws.status = Status::Ready;
-            entry.workspace = Some(ws);
-            entry.last_synced = chrono::Utc::now();
-            state.insert(entry);
-            report.updated.push(review.key.clone());
-        }
-        Err(e) => {
-            ws.status = Status::ApplyFailed;
-            entry.workspace = Some(ws);
-            entry.last_synced = chrono::Utc::now();
-            state.insert(entry);
-            report.errors.push((review.key.clone(), e.to_string()));
-        }
-    }
-    Ok(())
+    entry.last_synced = chrono::Utc::now();
+    state.insert(entry);
 }
 
 fn handle_out_of_queue(
     key: &ReviewKey,
     lifecycle: Lifecycle,
     state: &mut State,
-    dry_run: bool,
     report: &mut SyncReport,
-) -> Result<()> {
+) {
     let Some(mut entry) = state.get(key).cloned() else {
-        return Ok(());
+        return;
     };
     entry.in_queue = false;
     entry.last_synced = chrono::Utc::now();
@@ -260,61 +182,207 @@ fn handle_out_of_queue(
     match lifecycle {
         Lifecycle::Open => {
             entry.resolved = false;
-            if !dry_run {
-                state.insert(entry);
-            }
+            state.insert(entry);
         }
         Lifecycle::Resolved => {
             entry.resolved = true;
-            let Some(ws) = entry.workspace.clone() else {
-                // Nothing local to preserve for inspection - just forget it.
-                if !dry_run {
-                    state.remove(key);
-                }
-                report.removed.push(key.clone());
-                return Ok(());
-            };
-
-            if !ws.workspace_path.exists() {
-                // Already gone from disk (e.g. removed by hand) - nothing left to clean up,
-                // just stop tracking it rather than flagging it as dirty forever.
-                if !dry_run {
-                    state.remove(key);
-                }
-                report.removed.push(key.clone());
-                return Ok(());
-            }
-
-            let vcs = vcs_for(ws.vcs);
-            if vcs
-                .is_dirty(&ws.workspace_path, &ws.head_id)
-                .unwrap_or(true)
-            {
-                report.flagged.push((
-                    key.clone(),
-                    "resolved but has local changes; workspace kept".into(),
-                ));
-                if !dry_run {
-                    state.insert(entry);
-                }
+            let has_workspace = state.workspace_of(&entry).is_some();
+            if has_workspace {
+                // Kept while its stack's workspace lives; `reconcile_workspaces` drops it along
+                // with the workspace.
+                state.insert(entry);
             } else {
-                if !dry_run {
-                    vcs.remove_workspace(&ws.repo_path, &ws.workspace_path, &key.slug())?;
-                    state.remove(key);
-                }
+                // Nothing local to preserve for inspection - just forget it.
+                state.remove(key);
                 report.removed.push(key.clone());
             }
         }
     }
-    Ok(())
+}
+
+/// Make every review in a stack that's checked out share that stack's workspace. Also settles
+/// the case of one stack whose members were fetched separately (older per-review workspaces, or
+/// a review re-parented onto another's stack): the tip's workspace wins and the rest are left
+/// orphaned for `reconcile_workspaces` to clean up.
+fn attach_stack_ids(state: &mut State, stacks: &[Stack]) {
+    for stack in stacks {
+        let existing = |key: &ReviewKey| state.get(key).and_then(|e| e.stack_id.clone());
+        let chosen = existing(&stack.tip)
+            .or_else(|| stack.members.iter().find_map(existing));
+        let Some(id) = chosen else {
+            continue;
+        };
+        for key in &stack.members {
+            if let Some(mut entry) = state.get(key).cloned()
+                && entry.stack_id.as_deref() != Some(id.as_str())
+            {
+                entry.stack_id = Some(id.clone());
+                state.insert(entry);
+            }
+        }
+    }
+}
+
+fn review_from_entry(entry: &ReviewEntry) -> Review {
+    Review {
+        key: entry.key.clone(),
+        title: entry.title.clone(),
+        author: entry.author.clone(),
+        url: entry.url.clone(),
+        repo: entry.repo.clone(),
+        version: entry.version.clone(),
+        kind: entry.kind.clone(),
+        diff_stat: entry.diff_stat.clone(),
+        description: entry.description.clone(),
+        ancestors: entry.ancestors.clone(),
+    }
+}
+
+/// Bring each existing workspace in line with its stack: rebuild it if the stack's tip or tip
+/// version changed, remove it once every review in it has resolved. See the module docs.
+async fn reconcile_workspaces(
+    sources: &[Box<dyn ReviewSource>],
+    only_source: Option<&str>,
+    state: &mut State,
+    dry_run: bool,
+    report: &mut SyncReport,
+) {
+    let stacks = stacks::group(state.iter());
+    attach_stack_ids(state, &stacks);
+
+    let ids: Vec<String> = state.workspaces().map(|(id, _)| id.clone()).collect();
+    for id in ids {
+        let Some(mut ws) = state.workspace(&id).cloned() else {
+            continue;
+        };
+        if only_source.is_some_and(|o| o != ws.tip.source) {
+            continue;
+        }
+        let members = state.members_of(&id);
+        let live: Vec<&ReviewKey> = members
+            .iter()
+            .filter(|k| state.get(k).is_some_and(|e| !e.resolved))
+            .collect();
+
+        if live.is_empty() {
+            remove_finished_workspace(&id, &ws, &members, state, dry_run, report);
+            continue;
+        }
+
+        // The stack this workspace belongs to; prefer the one still containing its old tip.
+        let stack = stacks::stack_containing(&stacks, &ws.tip)
+            .or_else(|| stacks::stack_containing(&stacks, live[0]));
+        let Some(stack) = stack else {
+            continue;
+        };
+        let Some(tip) = state.get(&stack.tip).cloned() else {
+            continue;
+        };
+        if ws.tip == tip.key && ws.version == tip.version {
+            continue;
+        }
+
+        let vcs = vcs_for(ws.vcs);
+        if vcs
+            .is_dirty(&ws.workspace_path, &ws.head_id)
+            .unwrap_or(true)
+        {
+            ws.status = Status::Dirty;
+            state.insert_workspace(id, ws);
+            report.flagged.push((
+                tip.key.clone(),
+                "local changes; not updated to the new version".into(),
+            ));
+            continue;
+        }
+        if dry_run {
+            report.updated.push(tip.key.clone());
+            continue;
+        }
+
+        let Some(source) = sources.iter().find(|s| s.name() == tip.key.source) else {
+            continue;
+        };
+        let review = review_from_entry(&tip);
+        let checkout = match source.checkout_spec(&review, &ws.repo_path).await {
+            Ok(checkout) => checkout,
+            Err(e) => {
+                report.errors.push((tip.key.clone(), e.to_string()));
+                continue;
+            }
+        };
+        match vcs.update_workspace(
+            &ws.repo_path,
+            &ws.workspace_path,
+            &checkout,
+            &id,
+            &tip.version,
+        ) {
+            Ok(head) => {
+                ws.head_id = head;
+                ws.tip = tip.key.clone();
+                ws.version = tip.version.clone();
+                ws.status = Status::Ready;
+                state.insert_workspace(id, ws);
+                report.updated.push(tip.key.clone());
+            }
+            Err(e) => {
+                ws.status = Status::ApplyFailed;
+                state.insert_workspace(id, ws);
+                report.errors.push((tip.key.clone(), e.to_string()));
+            }
+        }
+    }
+}
+
+/// Every review in this workspace has resolved (or none remain): remove the workspace and its
+/// reviews if it's clean or already gone from disk; keep it, flagged, if it has local changes.
+fn remove_finished_workspace(
+    id: &str,
+    ws: &Workspace,
+    members: &[ReviewKey],
+    state: &mut State,
+    dry_run: bool,
+    report: &mut SyncReport,
+) {
+    let vcs = vcs_for(ws.vcs);
+    // Already gone from disk (e.g. removed by hand) - nothing left to clean up, just stop
+    // tracking it rather than flagging it as dirty forever.
+    let gone = !ws.workspace_path.exists();
+    if !gone
+        && vcs
+            .is_dirty(&ws.workspace_path, &ws.head_id)
+            .unwrap_or(true)
+    {
+        report.flagged.push((
+            ws.tip.clone(),
+            "resolved but has local changes; workspace kept".into(),
+        ));
+        return;
+    }
+    if !dry_run {
+        if !gone
+            && let Err(e) = vcs.remove_workspace(&ws.repo_path, &ws.workspace_path, id)
+        {
+            report.errors.push((ws.tip.clone(), e.to_string()));
+            return;
+        }
+        state.remove_workspace(id);
+        for key in members {
+            state.remove(key);
+        }
+    }
+    report.removed.extend(members.iter().cloned());
 }
 
 /// Resolve a canonical repo (asking before cloning one, unless `on_missing` says otherwise) and
-/// create a workspace for `key`, a review already tracked by a prior `sync()`. A no-op that
-/// returns the existing path if `key` already has a `Ready`/`Dirty` workspace; an `ApplyFailed`
-/// one is instead cleaned up and retried, since handing back a broken/empty path again would
-/// just repeat the failure silently. This is the on-demand counterpart to `sync()`'s deliberate
-/// refusal to create workspaces on its own - see the module docs.
+/// make sure `key`, a review already tracked by a prior `sync()`, has a workspace - the one for
+/// its whole stack - then move that workspace to `key`'s own patch. If the stack is already
+/// checked out this is just the move (skipped when the workspace has local changes, which are
+/// never disturbed); an `ApplyFailed` workspace is instead cleaned up and rebuilt, since handing
+/// back a broken/empty path again would just repeat the failure silently. This is the on-demand
+/// counterpart to `sync()`'s deliberate refusal to create workspaces on its own - see the module
+/// docs.
 ///
 /// Under `OnMissing::Ask`, a repo with no local checkout surfaces as a `repo::NeedsClone` error
 /// (`downcast_ref` it) rather than cloning - callers should confirm with the user and retry with
@@ -328,73 +396,119 @@ pub async fn fetch_local(
 ) -> Result<std::path::PathBuf> {
     paths.ensure_dirs()?;
     let mut state = State::load(&paths.state_file())?;
-    let mut entry = state
+    let entry = state
         .get(key)
         .cloned()
         .with_context(|| format!("`{key}` isn't tracked; run `rq sync` first"))?;
 
-    if let Some(ws) = &entry.workspace {
-        if ws.status != Status::ApplyFailed {
-            return Ok(ws.workspace_path.clone());
-        }
-        // Retry instead of handing back the broken path: best-effort clean up whatever the
-        // failed attempt left registered/on-disk first, since re-adding a workspace at the same
-        // name/path would otherwise fail again for that reason alone.
-        let stale_vcs = vcs_for(ws.vcs);
-        let _ = stale_vcs.remove_workspace(&ws.repo_path, &ws.workspace_path, &key.slug());
-        let _ = std::fs::remove_dir_all(&ws.workspace_path);
-    }
+    let stacks = stacks::group(state.iter());
+    attach_stack_ids(&mut state, &stacks);
+    let stack = stacks::stack_containing(&stacks, key)
+        .cloned()
+        .unwrap_or_else(|| Stack {
+            tip: key.clone(),
+            members: vec![key.clone()],
+        });
+    let stack_id = state
+        .get(key)
+        .and_then(|e| e.stack_id.clone())
+        .unwrap_or_else(|| stack.members[0].slug());
 
     let source = sources
         .iter()
         .find(|s| s.name() == key.source)
         .with_context(|| format!("no configured source named `{}`", key.source))?;
 
-    let review = Review {
-        key: entry.key.clone(),
-        title: entry.title.clone(),
-        author: entry.author.clone(),
-        url: entry.url.clone(),
-        repo: entry.repo.clone(),
-        version: entry.version.clone(),
-        kind: entry.kind.clone(),
-        diff_stat: entry.diff_stat.clone(),
-        description: entry.description.clone(),
-    };
+    if let Some(ws) = state.workspace(&stack_id).cloned() {
+        if ws.status != Status::ApplyFailed {
+            position_at(source.as_ref(), &ws, key);
+            state.save(&paths.state_file())?;
+            return Ok(ws.workspace_path);
+        }
+        // Retry instead of handing back the broken path: best-effort clean up whatever the
+        // failed attempt left registered/on-disk first, since re-adding a workspace at the same
+        // name/path would otherwise fail again for that reason alone.
+        let stale_vcs = vcs_for(ws.vcs);
+        let _ = stale_vcs.remove_workspace(&ws.repo_path, &ws.workspace_path, &stack_id);
+        let _ = std::fs::remove_dir_all(&ws.workspace_path);
+        state.remove_workspace(&stack_id);
+    }
+
+    let tip = state
+        .get(&stack.tip)
+        .cloned()
+        .unwrap_or_else(|| entry.clone());
+    let tip_source = sources
+        .iter()
+        .find(|s| s.name() == tip.key.source)
+        .with_context(|| format!("no configured source named `{}`", tip.key.source))?;
+    let review = review_from_entry(&tip);
 
     let mut repo_store = RepoStore::load(paths, config)?;
     let canon = repo_store.resolve(&review.repo, on_missing)?;
-    let checkout = source.checkout_spec(&review, &canon.path).await?;
+    let checkout = tip_source.checkout_spec(&review, &canon.path).await?;
     let vcs = vcs_for(canon.vcs);
-    let ws_path = paths.workspace_dir(&key.slug());
+    let ws_path = paths.workspace_dir(&stack_id);
     if let Some(parent) = ws_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let outcome = vcs.add_workspace(
-        &canon.path,
-        &ws_path,
-        &checkout,
-        &key.slug(),
-        &review.version,
-    );
+    let outcome = vcs.add_workspace(&canon.path, &ws_path, &checkout, &stack_id, &review.version);
     let (status, head_id) = match &outcome {
         Ok(head) => (Status::Ready, head.clone()),
         // Recorded anyway (with the workspace left in place, per the vcs backends' own
         // contract) so `rq show`/`rq path` can point at it for inspection.
         Err(_) => (Status::ApplyFailed, String::new()),
     };
-    entry.workspace = Some(Workspace {
+    let ws = Workspace {
         repo_path: canon.path.clone(),
         vcs: canon.vcs,
         workspace_path: ws_path.clone(),
         head_id,
         status,
-    });
-    state.insert(entry);
+        tip: tip.key.clone(),
+        version: tip.version.clone(),
+    };
+    state.insert_workspace(stack_id.clone(), ws.clone());
+    for member in &stack.members {
+        if let Some(mut e) = state.get(member).cloned() {
+            e.stack_id = Some(stack_id.clone());
+            state.insert(e);
+        }
+    }
+    if outcome.is_ok() {
+        position_at(source.as_ref(), &ws, key);
+    }
     state.save(&paths.state_file())?;
     repo_store.save()?;
     outcome.map(|_| ws_path)
+}
+
+/// Best-effort: move a stack's workspace to `key`'s patch. Never disturbs a workspace with local
+/// changes, and does nothing if `key`'s commit can't be found (e.g. a patch added to the stack
+/// since the workspace was built, which the next sync will pick up) - the caller still gets the
+/// workspace either way.
+fn position_at(source: &dyn ReviewSource, ws: &Workspace, key: &ReviewKey) {
+    let vcs = vcs_for(ws.vcs);
+    if vcs
+        .is_dirty(&ws.workspace_path, &ws.head_id)
+        .unwrap_or(true)
+    {
+        return;
+    }
+    let target = vcs
+        .commits(&ws.workspace_path, &ws.head_id, STACK_SCAN_DEPTH)
+        .ok()
+        .and_then(|commits| {
+            commits
+                .into_iter()
+                .find(|(_, message)| source.is_commit_for(key, message))
+                .map(|(id, _)| id)
+        })
+        .or_else(|| (*key == ws.tip).then(|| ws.head_id.clone()));
+    if let Some(commit) = target {
+        let _ = vcs.position(&ws.workspace_path, &commit);
+    }
 }
 
 /// Returned by `remove_workspace` when the workspace has local changes and `force` wasn't set.
@@ -406,19 +520,23 @@ pub struct WorkspaceDirty {
     pub path: PathBuf,
 }
 
-/// Delete a review's local workspace on demand - the `d` hotkey in `rq show`'s TUI. Acts
-/// regardless of `resolved`/`in_queue`, unlike `sync()`'s own resolved-and-clean removal path.
+/// Delete the local workspace of a review's stack on demand - the `d` hotkey in `rq show`'s TUI.
+/// Acts regardless of `resolved`/`in_queue`, unlike `sync()`'s own resolved-and-clean removal
+/// path, and on every review in the stack, since they share the one workspace.
 ///
 /// A dirty workspace is left untouched and surfaces as `WorkspaceDirty` (`downcast_ref` it)
 /// unless `force` is set, in which case whatever the backend's own `remove_workspace` can't clean
 /// up on a dirty worktree (it assumes a clean one) is finished off with a raw directory removal.
 pub fn remove_workspace(paths: &Paths, key: &ReviewKey, force: bool) -> Result<()> {
     let mut state = State::load(&paths.state_file())?;
-    let mut entry = state
+    let entry = state
         .get(key)
         .cloned()
         .with_context(|| format!("`{key}` isn't tracked"))?;
-    let Some(ws) = entry.workspace.clone() else {
+    let (Some(stack_id), Some(ws)) = (
+        entry.stack_id.clone(),
+        state.workspace_of(&entry).cloned(),
+    ) else {
         bail!("`{key}` has no local workspace");
     };
 
@@ -435,7 +553,7 @@ pub fn remove_workspace(paths: &Paths, key: &ReviewKey, force: bool) -> Result<(
             .into());
         }
         if vcs
-            .remove_workspace(&ws.repo_path, &ws.workspace_path, &key.slug())
+            .remove_workspace(&ws.repo_path, &ws.workspace_path, &stack_id)
             .is_err()
         {
             if !force {
@@ -449,8 +567,12 @@ pub fn remove_workspace(paths: &Paths, key: &ReviewKey, force: bool) -> Result<(
         }
     }
 
-    entry.workspace = None;
-    state.insert(entry);
+    state.remove_workspace(&stack_id);
+    state.for_each_entry_mut(|e| {
+        if e.stack_id.as_deref() == Some(stack_id.as_str()) {
+            e.stack_id = None;
+        }
+    });
     state.save(&paths.state_file())
 }
 
@@ -649,7 +771,7 @@ mod tests {
             "diff_stat should be fetched as part of the same sync that adds the review"
         );
         assert!(
-            entry.workspace.is_none(),
+            state.workspace_of(entry).is_none(),
             "sync must not create a workspace on its own"
         );
 
@@ -684,8 +806,7 @@ mod tests {
 
         assert!(ws_path.join("pr.txt").exists());
         let state = State::load(&paths.state_file()).unwrap();
-        let entry = state.get(&key).unwrap();
-        let ws = entry.workspace.as_ref().unwrap();
+        let ws = state.workspace_for(&key).unwrap();
         assert_eq!(ws.status, Status::Ready);
         assert_eq!(ws.head_id, sha);
         assert_eq!(ws.workspace_path, ws_path);
@@ -729,10 +850,11 @@ mod tests {
         // marked failed (e.g. a later step errored) - a naive retry would otherwise leave this
         // stuck forever, since `git worktree add`/`jj workspace add` refuse to reuse the path.
         let mut state = State::load(&paths.state_file()).unwrap();
-        let mut entry = state.get(&key).cloned().unwrap();
-        entry.workspace.as_mut().unwrap().status = Status::ApplyFailed;
-        entry.workspace.as_mut().unwrap().head_id = String::new();
-        state.insert(entry);
+        let stack_id = state.get(&key).unwrap().stack_id.clone().unwrap();
+        let mut ws = state.workspace(&stack_id).cloned().unwrap();
+        ws.status = Status::ApplyFailed;
+        ws.head_id = String::new();
+        state.insert_workspace(stack_id, ws);
         state.save(&paths.state_file()).unwrap();
 
         let retried_path = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone)
@@ -742,7 +864,7 @@ mod tests {
         assert_eq!(retried_path, ws_path);
         assert!(retried_path.join("pr.txt").exists());
         let state = State::load(&paths.state_file()).unwrap();
-        let ws = state.get(&key).unwrap().workspace.as_ref().unwrap();
+        let ws = state.workspace_for(&key).unwrap();
         assert_eq!(ws.status, Status::Ready);
         assert_eq!(ws.head_id, sha);
     }
@@ -771,7 +893,7 @@ mod tests {
                 .unwrap()
                 .get(&key)
                 .unwrap()
-                .workspace
+                .stack_id
                 .is_none()
         );
         drop(server);
@@ -885,10 +1007,10 @@ mod tests {
             .unwrap();
 
         assert!(report.removed.is_empty());
-        let entry = State::load(&paths.state_file()).unwrap();
-        let entry = entry.get(&key).unwrap();
+        let state = State::load(&paths.state_file()).unwrap();
+        let entry = state.get(&key).unwrap();
         assert!(!entry.in_queue);
-        assert!(entry.workspace.as_ref().unwrap().workspace_path.exists());
+        assert!(state.workspace_of(entry).unwrap().workspace_path.exists());
     }
 
     #[tokio::test]
@@ -938,11 +1060,11 @@ mod tests {
 
         assert!(report.updated.is_empty());
         assert_eq!(report.flagged.len(), 1);
-        let entry = State::load(&paths.state_file()).unwrap();
-        let entry = entry.get(&key).unwrap();
-        assert_eq!(entry.workspace.as_ref().unwrap().status, Status::Dirty);
+        let state = State::load(&paths.state_file()).unwrap();
+        let ws = state.workspace_for(&key).unwrap();
+        assert_eq!(ws.status, Status::Dirty);
         assert_eq!(
-            entry.version, sha1,
+            ws.version, sha1,
             "dirty workspace must not be moved to the new version"
         );
         assert!(
@@ -976,12 +1098,12 @@ mod tests {
         remove_workspace(&paths, &key, false).unwrap();
 
         assert!(!ws_path.exists());
-        let entry = State::load(&paths.state_file()).unwrap();
-        let entry = entry.get(&key).unwrap();
+        let state = State::load(&paths.state_file()).unwrap();
         assert!(
-            entry.workspace.is_none(),
+            state.workspace_for(&key).is_none(),
             "review stays tracked, just without a workspace"
         );
+        assert!(state.get(&key).is_some());
     }
 
     #[tokio::test]
@@ -1011,8 +1133,8 @@ mod tests {
 
         assert!(err.downcast_ref::<WorkspaceDirty>().is_some());
         assert!(ws_path.exists(), "must not touch a dirty workspace");
-        let entry = State::load(&paths.state_file()).unwrap();
-        assert!(entry.get(&key).unwrap().workspace.is_some());
+        let state = State::load(&paths.state_file()).unwrap();
+        assert!(state.workspace_for(&key).is_some());
     }
 
     #[tokio::test]
@@ -1041,8 +1163,8 @@ mod tests {
         remove_workspace(&paths, &key, true).unwrap();
 
         assert!(!ws_path.exists());
-        let entry = State::load(&paths.state_file()).unwrap();
-        assert!(entry.get(&key).unwrap().workspace.is_none());
+        let state = State::load(&paths.state_file()).unwrap();
+        assert!(state.workspace_for(&key).is_none());
     }
 
     #[test]
@@ -1065,7 +1187,8 @@ mod tests {
             in_queue: true,
             resolved: false,
             last_synced: chrono::Utc::now(),
-            workspace: None,
+            stack_id: None,
+            ancestors: Vec::new(),
             diff_stat: None,
             description: None,
         });
@@ -1111,5 +1234,262 @@ mod tests {
             !paths.repos_dir().exists(),
             "dry-run must not clone the canonical repo"
         );
+    }
+
+    /// A source whose reviews form a Phabricator-style stack, checked out by applying one small
+    /// patch per review (`D<n>` adds `<n>.txt`), each commit carrying a `Differential Revision:`
+    /// trailer like `moz-phab patch` leaves.
+    struct StackSource {
+        upstream: std::path::PathBuf,
+        queue: std::sync::Mutex<Vec<Review>>,
+        lifecycle: std::sync::Mutex<Lifecycle>,
+    }
+
+    impl StackSource {
+        fn new(upstream: &Path) -> Self {
+            Self {
+                upstream: upstream.to_path_buf(),
+                queue: Default::default(),
+                lifecycle: std::sync::Mutex::new(Lifecycle::Open),
+            }
+        }
+
+        fn review(&self, n: u32, ancestors: &[u32], version: &str) -> Review {
+            Review {
+                key: ReviewKey::new("stk", format!("D{n}")),
+                title: format!("Review {n}"),
+                author: "alice".into(),
+                url: format!("https://phab.example.com/D{n}"),
+                repo: crate::source::RepoRef {
+                    urls: vec![self.upstream.to_string_lossy().to_string()],
+                    display_name: "proj".into(),
+                },
+                version: version.into(),
+                kind: crate::source::ReviewKind::Direct,
+                diff_stat: None,
+                description: None,
+                ancestors: ancestors
+                    .iter()
+                    .map(|a| ReviewKey::new("stk", format!("D{a}")))
+                    .collect(),
+            }
+        }
+
+        fn set_queue(&self, reviews: Vec<Review>) {
+            *self.queue.lock().unwrap() = reviews;
+        }
+    }
+
+    fn patch_for(id: &str) -> crate::source::Patch {
+        let file = format!("{id}.txt");
+        crate::source::Patch {
+            title: format!("patch {id}"),
+            author: "Patch Author <patch@example.com>".into(),
+            message: format!(
+                "patch {id}\n\nDifferential Revision: https://phab.example.com/{id}"
+            ),
+            diff: format!(
+                "diff --git a/{file} b/{file}\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/{file}\n@@ -0,0 +1 @@\n+{id}\n"
+            ),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReviewSource for StackSource {
+        fn name(&self) -> &str {
+            "stk"
+        }
+
+        async fn fetch_queue(&self) -> Result<Vec<Review>> {
+            Ok(self.queue.lock().unwrap().clone())
+        }
+
+        async fn checkout_spec(
+            &self,
+            review: &Review,
+            _canonical_repo: &Path,
+        ) -> Result<crate::source::Checkout> {
+            let patches = review
+                .ancestors
+                .iter()
+                .chain(std::iter::once(&review.key))
+                .map(|k| patch_for(&k.id))
+                .collect();
+            Ok(crate::source::Checkout::Patches {
+                base: None,
+                patches,
+            })
+        }
+
+        async fn fetch_status(&self, ids: &[String]) -> Result<Vec<(String, Lifecycle)>> {
+            let lifecycle = *self.lifecycle.lock().unwrap();
+            Ok(ids.iter().map(|id| (id.clone(), lifecycle)).collect())
+        }
+
+        fn is_commit_for(&self, review: &ReviewKey, message: &str) -> bool {
+            message.lines().any(|l| l.ends_with(&format!("/{}", review.id)))
+        }
+    }
+
+    fn stack_fixture() -> (Repos, TempDir, Paths, Vec<Box<dyn ReviewSource>>) {
+        let repos = make_repos();
+        let work_tmp = TempDir::new().unwrap();
+        let paths = paths_in(work_tmp.path());
+        let source = StackSource::new(&repos.upstream);
+        source.set_queue(vec![
+            source.review(1, &[], "1"),
+            source.review(2, &[1], "1"),
+        ]);
+        (repos, work_tmp, paths, vec![Box::new(source)])
+    }
+
+    fn stk(n: u32) -> ReviewKey {
+        ReviewKey::new("stk", format!("D{n}"))
+    }
+
+    #[tokio::test]
+    async fn stacked_reviews_share_one_workspace_positioned_at_the_requested_patch() {
+        let (_repos, _tmp, paths, sources) = stack_fixture();
+        let config = Config::default();
+        sync(&sources, &paths, None, false).await.unwrap();
+
+        let ws_path = fetch_local(&sources, &paths, &config, &stk(1), OnMissing::Clone)
+            .await
+            .unwrap();
+        // Opened on D1's patch: D2's file (on top) isn't checked out.
+        assert!(ws_path.join("D1.txt").exists());
+        assert!(!ws_path.join("D2.txt").exists());
+
+        let state = State::load(&paths.state_file()).unwrap();
+        assert_eq!(state.workspaces().count(), 1);
+        assert_eq!(
+            state.get(&stk(1)).unwrap().stack_id,
+            state.get(&stk(2)).unwrap().stack_id,
+            "both reviews point at the one workspace"
+        );
+        assert_eq!(state.workspace_for(&stk(2)).unwrap().tip, stk(2));
+
+        // Asking for the top review reuses the workspace and moves to the tip.
+        let again = fetch_local(&sources, &paths, &config, &stk(2), OnMissing::Clone)
+            .await
+            .unwrap();
+        assert_eq!(again, ws_path);
+        assert!(ws_path.join("D2.txt").exists());
+        assert_eq!(State::load(&paths.state_file()).unwrap().workspaces().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn local_changes_stop_fetch_local_from_moving_the_workspace() {
+        let (_repos, _tmp, paths, sources) = stack_fixture();
+        let config = Config::default();
+        sync(&sources, &paths, None, false).await.unwrap();
+        let ws_path = fetch_local(&sources, &paths, &config, &stk(2), OnMissing::Clone)
+            .await
+            .unwrap();
+        std::fs::write(ws_path.join("scratch.txt"), "review notes\n").unwrap();
+
+        fetch_local(&sources, &paths, &config, &stk(1), OnMissing::Clone)
+            .await
+            .unwrap();
+
+        assert!(ws_path.join("D2.txt").exists(), "must stay on the tip");
+        assert!(ws_path.join("scratch.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_new_patch_on_top_rebuilds_the_workspace_with_the_new_tip() {
+        let (repos, _tmp, paths, sources) = stack_fixture();
+        let config = Config::default();
+        sync(&sources, &paths, None, false).await.unwrap();
+        let ws_path = fetch_local(&sources, &paths, &config, &stk(1), OnMissing::Clone)
+            .await
+            .unwrap();
+
+        let next = StackSource::new(&repos.upstream);
+        next.set_queue(vec![
+            next.review(1, &[], "1"),
+            next.review(2, &[1], "1"),
+            next.review(3, &[1, 2], "1"),
+        ]);
+        let sources: Vec<Box<dyn ReviewSource>> = vec![Box::new(next)];
+        let report = sync(&sources, &paths, None, false).await.unwrap();
+
+        assert_eq!(report.updated, vec![stk(3)]);
+        let state = State::load(&paths.state_file()).unwrap();
+        let ws = state.workspace_for(&stk(3)).unwrap();
+        assert_eq!(ws.tip, stk(3));
+        assert_eq!(ws.status, Status::Ready);
+        assert_eq!(state.workspaces().count(), 1, "still the one workspace");
+        assert!(ws_path.join("D3.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_changed_patch_mid_stack_updates_the_workspace_via_the_tip_version() {
+        let (repos, _tmp, paths, sources) = stack_fixture();
+        let config = Config::default();
+        sync(&sources, &paths, None, false).await.unwrap();
+        fetch_local(&sources, &paths, &config, &stk(2), OnMissing::Clone)
+            .await
+            .unwrap();
+
+        // Phabricator folds every ancestor's modification time into the tip's version.
+        let next = StackSource::new(&repos.upstream);
+        next.set_queue(vec![next.review(1, &[], "2"), next.review(2, &[1], "2")]);
+        let sources: Vec<Box<dyn ReviewSource>> = vec![Box::new(next)];
+        let report = sync(&sources, &paths, None, false).await.unwrap();
+
+        assert_eq!(report.updated, vec![stk(2)]);
+        let state = State::load(&paths.state_file()).unwrap();
+        assert_eq!(state.workspace_for(&stk(2)).unwrap().version, "2");
+    }
+
+    #[tokio::test]
+    async fn workspace_is_removed_only_once_every_review_in_the_stack_resolves() {
+        let (repos, _tmp, paths, sources) = stack_fixture();
+        let config = Config::default();
+        sync(&sources, &paths, None, false).await.unwrap();
+        let ws_path = fetch_local(&sources, &paths, &config, &stk(2), OnMissing::Clone)
+            .await
+            .unwrap();
+
+        // D1 lands and D2 is still open (and now stands alone): the workspace stays.
+        let next = StackSource::new(&repos.upstream);
+        next.set_queue(vec![next.review(2, &[], "3")]);
+        let sources: Vec<Box<dyn ReviewSource>> = vec![Box::new(next)];
+        let report = sync(&sources, &paths, None, false).await.unwrap();
+        assert_eq!(report.updated, vec![stk(2)]);
+        assert!(ws_path.exists());
+        // Rebuilt on the landed base, so only D2's own patch remains.
+        assert!(ws_path.join("D2.txt").exists());
+        assert!(!ws_path.join("D1.txt").exists());
+
+        // Now everything resolves.
+        let done = StackSource::new(&repos.upstream);
+        *done.lifecycle.lock().unwrap() = Lifecycle::Resolved;
+        let sources: Vec<Box<dyn ReviewSource>> = vec![Box::new(done)];
+        let report = sync(&sources, &paths, None, false).await.unwrap();
+
+        assert!(report.removed.contains(&stk(2)));
+        assert!(!ws_path.exists());
+        let state = State::load(&paths.state_file()).unwrap();
+        assert_eq!(state.workspaces().count(), 0);
+        assert!(state.get(&stk(2)).is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_workspace_takes_the_whole_stack_with_it() {
+        let (_repos, _tmp, paths, sources) = stack_fixture();
+        let config = Config::default();
+        sync(&sources, &paths, None, false).await.unwrap();
+        let ws_path = fetch_local(&sources, &paths, &config, &stk(1), OnMissing::Clone)
+            .await
+            .unwrap();
+
+        remove_workspace(&paths, &stk(1), false).unwrap();
+
+        assert!(!ws_path.exists());
+        let state = State::load(&paths.state_file()).unwrap();
+        assert!(state.workspace_for(&stk(2)).is_none());
+        assert!(state.get(&stk(2)).unwrap().stack_id.is_none());
     }
 }
