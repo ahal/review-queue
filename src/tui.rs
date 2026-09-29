@@ -14,14 +14,15 @@
 //!
 //! Fetching a review with no local worktree yet asks to confirm first (`prompt_confirm_fetch`) -
 //! `fetch_local` may clone a repo or shell out to a source's checkout command, either of which
-//! can take a while. Once confirmed, `begin_fetch` runs it on a background thread so the event
-//! loop stays responsive: a spinner ticks via `Cursive::cb_sink`, and `Cancel` stays clickable
-//! throughout. The underlying `git`/`jj` calls have no cancellation points of their own, so
-//! cancelling doesn't interrupt them - it just detaches from the operation, which keeps running;
+//! can take a while. Once confirmed the dialog closes and `begin_fetch` runs it on a background
+//! thread so the event loop stays responsive: the review's row shows a spinner (ticked via
+//! `Cursive::cb_sink`) where its workspace icon goes, and `d` on that row cancels. The underlying
+//! `git`/`jj` calls have no cancellation points of their own, so cancelling doesn't interrupt
+//! them - it just detaches from the operation, which keeps running (spinner turns red);
 //! `finish_fetch` still runs when it completes, and removes whatever workspace it created instead
 //! of opening a shell into it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,8 +66,26 @@ struct Ctx {
     /// Reviews `begin_fetch` currently has a background fetch running for - guards against
     /// pressing `enter` on the same review again (and racing two `fetch_local` calls against the
     /// same workspace path) while its own confirm/progress dialog is already up.
-    fetching: BTreeSet<ReviewKey>,
+    fetching: BTreeMap<ReviewKey, Fetch>,
 }
+
+/// A background fetch `begin_fetch` has running for a review, shown as a spinner in that review's
+/// row until it finishes.
+struct Fetch {
+    /// Flipped by `cancel_fetch`. The underlying `fetch_local` can't be interrupted, so this only
+    /// tells `finish_fetch` to clean up instead of opening the workspace.
+    cancelled: Arc<AtomicBool>,
+    frame: usize,
+}
+
+/// What `row_label` needs to draw a fetch's spinner in place of the workspace icon.
+#[derive(Debug, Clone, Copy)]
+struct Spin {
+    frame: usize,
+    cancelling: bool,
+}
+
+type Spinners = BTreeMap<ReviewKey, Spin>;
 
 /// A row in the `reviews` `SelectView`: either a review itself, or one of the diffstat lines
 /// shown underneath it while expanded. Both carry the owning review's key so opening/collapsing
@@ -117,11 +136,18 @@ pub fn run(
         author_w,
         expanded: BTreeSet::new(),
         pending_shell: None,
-        fetching: BTreeSet::new(),
+        fetching: BTreeMap::new(),
     });
 
     let mut select = SelectView::<Row>::new();
-    for (label, row) in build_rows(&entries, key_w, author_w, &BTreeSet::new(), terminal_width()) {
+    for (label, row) in build_rows(
+        &entries,
+        key_w,
+        author_w,
+        &BTreeSet::new(),
+        terminal_width(),
+        &Spinners::new(),
+    ) {
         select.add_item(label, row);
     }
     select.set_on_submit(|s, row: &Row| open_locally_selected_key(s, row.key().clone()));
@@ -249,11 +275,24 @@ fn ansi(c: BaseColor) -> Color {
     Color::Dark(c)
 }
 
-fn row_label(e: &ReviewEntry, key_w: usize, author_w: usize, expanded: bool) -> StyledString {
+fn row_label(
+    e: &ReviewEntry,
+    key_w: usize,
+    author_w: usize,
+    expanded: bool,
+    spin: Option<Spin>,
+) -> StyledString {
     let marker = if expanded { '\u{25be}' } else { '\u{25b8}' };
 
     let mut out = StyledString::styled(format!("{marker} "), Effect::Dim);
-    if e.workspace.is_some() {
+    if let Some(spin) = spin {
+        let color = if spin.cancelling {
+            BaseColor::Red
+        } else {
+            BaseColor::Yellow
+        };
+        out.append_styled(SPINNER_FRAMES[spin.frame % SPINNER_FRAMES.len()], ansi(color));
+    } else if e.workspace.is_some() {
         out.append_styled("\u{2913}", ansi(BaseColor::Cyan));
     } else {
         out.append_plain(" ");
@@ -372,12 +411,13 @@ fn build_rows(
     author_w: usize,
     expanded: &BTreeSet<ReviewKey>,
     width: usize,
+    spinners: &Spinners,
 ) -> Vec<(StyledString, Row)> {
     let mut rows = Vec::new();
     for e in entries {
         let is_expanded = expanded.contains(&e.key);
         rows.push((
-            row_label(e, key_w, author_w, is_expanded),
+            row_label(e, key_w, author_w, is_expanded, spinners.get(&e.key).copied()),
             Row::Entry(e.key.clone()),
         ));
         if is_expanded {
@@ -465,6 +505,11 @@ fn delete_workspace_selected(s: &mut Cursive) {
     let Some(key) = selected_key(s) else {
         return;
     };
+    // Nothing to delete yet while it's still being fetched - `d` cancels it instead.
+    if s.user_data::<Ctx>().is_some_and(|ctx| ctx.fetching.contains_key(&key)) {
+        cancel_fetch(s, &key);
+        return;
+    }
     let workspace_path = s.user_data::<Ctx>().and_then(|ctx| {
         State::load(&ctx.paths.state_file())
             .ok()
@@ -533,7 +578,7 @@ fn open_locally_selected_key(s: &mut Cursive, key: ReviewKey) {
     } else {
         OnMissing::Ask
     };
-    if ctx.fetching.contains(&key) {
+    if ctx.fetching.contains_key(&key) {
         set_status(s, format!("already fetching {key}"));
         return;
     }
@@ -551,76 +596,42 @@ fn open_locally_selected_key(s: &mut Cursive, key: ReviewKey) {
     }
 }
 
-/// Per-fetch view names, namespaced by review key - two reviews can be fetching at once (the TUI
-/// stays responsive while a fetch runs), so a bare `"fetch_dialog"`/`"fetch_spinner"` would let
-/// one's dialog get mistaken for the other's.
-fn fetch_dialog_name(key: &ReviewKey) -> String {
-    format!("fetch_dialog::{key}")
-}
-fn fetch_spinner_name(key: &ReviewKey) -> String {
-    format!("fetch_spinner::{key}")
-}
-
 /// Confirms before fetching a review that has no local worktree yet, since `fetch_local` may
-/// clone a repo or run a source's checkout command - either can take a while. `Proceed` hands off
-/// to `begin_fetch`; `Cancel` also flips `cancelled`, though it's a no-op at this point since
-/// nothing is running yet - the same flag is threaded through to `finish_fetch` in case the user
-/// cancels again once the fetch is actually in flight.
+/// clone a repo or run a source's checkout command - either can take a while. `Proceed` closes
+/// the dialog and hands off to `begin_fetch`, which shows progress in the review's own row.
 fn prompt_confirm_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let cancel_flag = cancelled.clone();
-    let proceed_key = key.clone();
     let dialog = Dialog::text(format!("No local worktree for `{key}` yet.\nFetch it now?"))
         .title("Fetch review?")
-        .button("Cancel", move |s| {
-            cancel_flag.store(true, Ordering::SeqCst);
+        .button("Cancel", |s| {
             s.pop_layer();
         })
         .button("Proceed", move |s| {
-            begin_fetch(s, proceed_key.clone(), on_missing, cancelled.clone());
-        })
-        .with_name(fetch_dialog_name(&key));
+            s.pop_layer();
+            begin_fetch(s, key.clone(), on_missing);
+        });
     s.add_layer(dialog);
 }
 
-/// Kicks off `sync::fetch_local` on a background thread and shows progress while it runs. If
-/// `s` has a `fetch_dialog` layer already up (the `prompt_confirm_fetch` dialog, `Proceed` just
-/// pressed), it's reused: `Proceed` is disabled - greyed out and unclickable - rather than
-/// removed, and `Cancel` (already wired to `cancelled`) is left alone so it keeps working exactly
-/// as it did before the fetch started. Otherwise (e.g. after confirming a clone from
-/// `prompt_clone`, which has no preceding fetch dialog to repurpose) a fresh one is built with
-/// just `Cancel`.
-fn begin_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing, cancelled: Arc<AtomicBool>) {
-    let dialog_name = fetch_dialog_name(&key);
-    let spinner_name = fetch_spinner_name(&key);
-    let reused = s
-        .call_on_name(&dialog_name, |d: &mut Dialog| {
-            if let Some(btn) = d.buttons_mut().nth(1) {
-                btn.disable();
-            }
-            d.set_content(TextView::new(spinner_line(&key, 0)).with_name(spinner_name.clone()));
-        })
-        .is_some();
-    if !reused {
-        let cancel_flag = cancelled.clone();
-        let dialog = Dialog::around(TextView::new(spinner_line(&key, 0)).with_name(spinner_name))
-            .title("Fetching...")
-            .button("Cancel", move |s| {
-                cancel_flag.store(true, Ordering::SeqCst);
-                s.pop_layer();
-            })
-            .with_name(dialog_name);
-        s.add_layer(dialog);
-    }
-
+/// Kicks off `sync::fetch_local` on a background thread. Progress is a spinner in the review's
+/// row where the workspace icon goes (see `row_label`), so the rest of the UI stays usable; `d`
+/// on that row cancels (`cancel_fetch`).
+fn begin_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
+    let cancelled = Arc::new(AtomicBool::new(false));
     let Some(ctx) = s.user_data::<Ctx>() else {
         return;
     };
-    ctx.fetching.insert(key.clone());
+    ctx.fetching.insert(
+        key.clone(),
+        Fetch {
+            cancelled: cancelled.clone(),
+            frame: 0,
+        },
+    );
     let sources = ctx.sources.clone();
     let paths = ctx.paths.clone();
     let config = ctx.config.clone();
     let handle = ctx.handle.clone();
+    reload(s);
 
     let done = Arc::new(AtomicBool::new(false));
     spawn_spinner_ticker(s, key.clone(), done.clone());
@@ -642,33 +653,49 @@ fn begin_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing, cancelled
     });
 }
 
-fn spinner_line(key: &ReviewKey, frame: usize) -> String {
-    format!(
-        "{} fetching `{key}`...",
-        SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]
-    )
+/// Cancels a review's in-flight fetch (`d` on its row, see `delete_workspace_selected`).
+/// `fetch_local`'s `git`/`jj` calls have no cancellation points, so the operation keeps running in
+/// the background: the spinner turns red until it completes, and `finish_fetch` then removes
+/// whatever workspace it created.
+fn cancel_fetch(s: &mut Cursive, key: &ReviewKey) {
+    let flagged = s
+        .user_data::<Ctx>()
+        .and_then(|ctx| ctx.fetching.get(key))
+        .map(|f| f.cancelled.swap(true, Ordering::SeqCst));
+    match flagged {
+        Some(false) => {
+            set_status(
+                s,
+                format!("cancelling {key} - it will be cleaned up once the running operation stops"),
+            );
+            reload(s);
+        }
+        Some(true) => set_status(s, format!("already cancelling {key}")),
+        None => set_status(s, format!("`{key}` isn't being fetched")),
+    }
 }
 
-/// Ticks `key`'s spinner text view roughly every 120ms until `done` is set, so `begin_fetch`'s
-/// background fetch has some visible sign of life instead of a frozen-looking dialog.
+/// Advances `key`'s row spinner roughly every 120ms until `done` is set, so `begin_fetch`'s
+/// background fetch has some visible sign of life.
 fn spawn_spinner_ticker(s: &Cursive, key: ReviewKey, done: Arc<AtomicBool>) {
     let cb_sink = s.cb_sink().clone();
-    let spinner_name = fetch_spinner_name(&key);
     std::thread::spawn(move || {
-        let mut frame = 0usize;
         loop {
             std::thread::sleep(Duration::from_millis(120));
             if done.load(Ordering::SeqCst) {
                 break;
             }
-            frame = frame.wrapping_add(1);
             let tick_key = key.clone();
-            let name = spinner_name.clone();
             if cb_sink
                 .send(Box::new(move |s| {
-                    s.call_on_name(&name, |v: &mut TextView| {
-                        v.set_content(spinner_line(&tick_key, frame));
-                    });
+                    let ticked = s
+                        .user_data::<Ctx>()
+                        .and_then(|ctx| ctx.fetching.get_mut(&tick_key))
+                        .map(|f| f.frame = f.frame.wrapping_add(1))
+                        .is_some();
+                    if ticked {
+                        reload(s);
+                    }
                 }))
                 .is_err()
             {
@@ -690,15 +717,6 @@ fn finish_fetch(
 ) {
     if let Some(ctx) = s.user_data::<Ctx>() {
         ctx.fetching.remove(&key);
-    }
-    // By name and not `pop_layer()` - the user is free to open other dialogs (e.g. `d`) while a
-    // fetch runs in the background, which would otherwise end up on top of this one and get
-    // popped by mistake instead of it.
-    if let Some(pos) = s
-        .screen_mut()
-        .find_layer_from_name(&fetch_dialog_name(&key))
-    {
-        s.screen_mut().remove_layer(pos);
     }
 
     if cancelled.load(Ordering::SeqCst) {
@@ -786,12 +804,7 @@ fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf) {
     })
     .button("Yes", move |s| {
         s.pop_layer();
-        begin_fetch(
-            s,
-            yes_key.clone(),
-            OnMissing::Clone,
-            Arc::new(AtomicBool::new(false)),
-        );
+        begin_fetch(s, yes_key.clone(), OnMissing::Clone);
     })
     .button("Always", move |s| {
         s.pop_layer();
@@ -806,12 +819,7 @@ fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf) {
             set_status(s, format!("failed to save auto_clone: {e:#}"));
             return;
         }
-        begin_fetch(
-            s,
-            always_key.clone(),
-            OnMissing::Clone,
-            Arc::new(AtomicBool::new(false)),
-        );
+        begin_fetch(s, always_key.clone(), OnMissing::Clone);
     });
     s.add_layer(dialog);
 }
@@ -823,9 +831,19 @@ fn reload(s: &mut Cursive) {
             ctx.key_w,
             ctx.author_w,
             ctx.expanded.clone(),
+            ctx.fetching
+                .iter()
+                .map(|(k, f)| {
+                    let spin = Spin {
+                        frame: f.frame,
+                        cancelling: f.cancelled.load(Ordering::SeqCst),
+                    };
+                    (k.clone(), spin)
+                })
+                .collect::<Spinners>(),
         )
     });
-    let Some((loaded, key_w, author_w, expanded)) = loaded else {
+    let Some((loaded, key_w, author_w, expanded, spinners)) = loaded else {
         return;
     };
     let entries = match loaded {
@@ -839,7 +857,7 @@ fn reload(s: &mut Cursive) {
     s.call_on_name("reviews", |v: &mut SelectView<Row>| {
         let selected = v.selection().map(|row| row.key().clone());
         v.clear();
-        for (label, row) in build_rows(&entries, key_w, author_w, &expanded, terminal_width()) {
+        for (label, row) in build_rows(&entries, key_w, author_w, &expanded, terminal_width(), &spinners) {
             v.add_item(label, row);
         }
         if let Some(selected) = selected
@@ -880,7 +898,7 @@ mod tests {
     #[test]
     fn collapsed_entries_produce_one_row_each() {
         let entries = vec![entry("D1", None), entry("D2", None)];
-        let rows = build_rows(&entries, 5, 6, &BTreeSet::new(), 100);
+        let rows = build_rows(&entries, 5, 6, &BTreeSet::new(), 100, &Spinners::new());
         assert_eq!(rows.len(), 2);
         assert!(matches!(&rows[0].1, Row::Entry(k) if k.id == "D1"));
         assert!(matches!(&rows[1].1, Row::Entry(k) if k.id == "D2"));
@@ -893,7 +911,7 @@ mod tests {
             entry("D2", None),
         ];
         let expanded = ReviewKey::new("moz", "D1");
-        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([expanded.clone()]), 100);
+        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([expanded.clone()]), 100, &Spinners::new());
 
         // D1's entry row, its title + blank line, its two diffstat lines, then D2's entry row.
         assert_eq!(rows.len(), 6);
@@ -912,7 +930,7 @@ mod tests {
         ];
         let d1 = ReviewKey::new("moz", "D1");
         let d2 = ReviewKey::new("moz", "D2");
-        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([d1.clone(), d2.clone()]), 100);
+        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([d1.clone(), d2.clone()]), 100, &Spinners::new());
 
         // D1's entry + title/blank + its diffstat line, then the same for D2 - expanding D2 must
         // not have collapsed D1.
@@ -980,7 +998,7 @@ mod tests {
         assert_eq!(lines.last().unwrap(), "      ");
 
         let expanded = BTreeSet::from([e.key.clone()]);
-        let rows = build_rows(&[e], 5, 6, &expanded, 100);
+        let rows = build_rows(&[e], 5, 6, &expanded, 100, &Spinners::new());
         // entry + title/description lines + diffstat line
         assert_eq!(rows.len(), 1 + lines.len() + 1);
     }
@@ -993,6 +1011,41 @@ mod tests {
         assert!(lines.len() > 4, "{lines:?}");
         assert!(lines.iter().all(|l| l.chars().count() <= 40));
         assert_eq!(lines[..lines.len() - 1].join(" ").split_whitespace().count(), 30);
+    }
+
+    #[test]
+    fn a_fetching_row_shows_a_spinner_instead_of_the_workspace_icon() {
+        let e = entry("D1", None);
+        let plain = row_label(&e, 5, 6, false, None).source().to_string();
+        let spin = Spin {
+            frame: 0,
+            cancelling: false,
+        };
+        let spinning = row_label(&e, 5, 6, false, Some(spin)).source().to_string();
+        assert!(spinning.contains(SPINNER_FRAMES[0]));
+        assert!(!plain.contains(SPINNER_FRAMES[0]));
+        assert_eq!(plain.chars().count(), spinning.chars().count());
+    }
+
+    #[tokio::test]
+    async fn cancel_fetch_flags_only_a_review_that_is_being_fetched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut siv = cursive::dummy();
+        siv.set_user_data(ctx_with_state(tmp.path(), vec![entry("D1", None)]));
+        let key = ReviewKey::new("moz", "D1");
+        let flag = Arc::new(AtomicBool::new(false));
+        siv.user_data::<Ctx>().unwrap().fetching.insert(
+            key.clone(),
+            Fetch {
+                cancelled: flag.clone(),
+                frame: 0,
+            },
+        );
+
+        cancel_fetch(&mut siv, &ReviewKey::new("moz", "D2"));
+        assert!(!flag.load(Ordering::SeqCst));
+        cancel_fetch(&mut siv, &key);
+        assert!(flag.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1048,7 +1101,7 @@ mod tests {
         ];
         let mut select = SelectView::<Row>::new();
         let expanded = ReviewKey::new("moz", "D1");
-        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded]), 100) {
+        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded]), 100, &Spinners::new()) {
             select.add_item(label, row);
         }
         siv.add_layer(select.with_name("reviews"));
@@ -1069,7 +1122,7 @@ mod tests {
         let entries = vec![entry("D1", Some("a.rs | 1 +"))];
         let mut select = SelectView::<Row>::new();
         let expanded = ReviewKey::new("moz", "D1");
-        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded]), 100) {
+        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded]), 100, &Spinners::new()) {
             select.add_item(label, row);
         }
         siv.add_layer(select.with_name("reviews"));
@@ -1105,7 +1158,7 @@ mod tests {
             author_w: 6,
             expanded: BTreeSet::new(),
             pending_shell: None,
-            fetching: BTreeSet::new(),
+            fetching: BTreeMap::new(),
         }
     }
 
