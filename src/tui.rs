@@ -10,7 +10,7 @@
 //! `run_event_loop` for why that means tearing down and recreating the whole backend rather than
 //! just toggling raw mode. See `crate::sync`'s module docs for why `rq sync` itself never creates
 //! workspaces. `d` deletes the selected review's workspace (`sync::remove_workspace`), confirming
-//! first and, if it has local changes, confirming again before discarding them. Once confirmed the
+//! first and always discarding any local changes. Once confirmed the
 //! dialog closes and the deletion runs on a background thread (`begin_delete`) with the same row
 //! spinner as a fetch.
 //!
@@ -532,52 +532,37 @@ fn delete_workspace_selected(s: &mut Cursive) {
         cancel_fetch(s, &key);
         return;
     }
-    let workspace_path = s.user_data::<Ctx>().and_then(|ctx| {
-        State::load(&ctx.paths.state_file())
-            .ok()
-            .and_then(|st| st.get(&key).and_then(|e| e.workspace.as_ref()).cloned())
-            .map(|ws| ws.workspace_path)
-    });
-    match workspace_path {
-        Some(path) => prompt_delete_workspace(s, key, path, false),
-        None => set_status(s, format!("`{key}` has no local workspace")),
+    let has_workspace = s
+        .user_data::<Ctx>()
+        .and_then(|ctx| State::load(&ctx.paths.state_file()).ok())
+        .and_then(|st| st.get(&key).map(|e| e.workspace.is_some()))
+        .unwrap_or(false);
+    if has_workspace {
+        prompt_delete_workspace(s, key);
+    } else {
+        set_status(s, format!("`{key}` has no local workspace"));
     }
 }
 
-/// Confirms before deleting a workspace - `force` (retried after a `WorkspaceDirty` error) warns
-/// that local changes will be discarded instead of just naming the path.
-fn prompt_delete_workspace(s: &mut Cursive, key: ReviewKey, path: PathBuf, force: bool) {
-    let (title, text) = if force {
-        (
-            "Discard local changes?",
-            format!(
-                "{} has local changes.\nDelete it anyway, discarding them?",
-                path.display()
-            ),
-        )
-    } else {
-        (
-            "Delete workspace?",
-            format!("Delete workspace at {}?", path.display()),
-        )
-    };
-    let yes_key = key.clone();
-    let dialog = Dialog::text(text)
-        .title(title)
+/// Confirms before deleting a workspace. Local changes are always discarded - there's no second
+/// prompt for a dirty workspace.
+fn prompt_delete_workspace(s: &mut Cursive, key: ReviewKey) {
+    let dialog = Dialog::text(format!("Delete workspace for {key}?"))
+        .title("Delete workspace?")
         .button("No", |s| {
             s.pop_layer();
         })
         .button("Yes", move |s| {
             s.pop_layer();
-            begin_delete(s, yes_key.clone(), path.clone(), force);
+            begin_delete(s, key.clone());
         });
     s.add_layer(vim_keys(dialog));
 }
 
-/// Runs `sync::remove_workspace` on a background thread, showing the same row spinner as a fetch
-/// while it works (deleting a big worktree can take a while). A dirty workspace re-prompts with
-/// `force` once it finishes, back on the main thread.
-fn begin_delete(s: &mut Cursive, key: ReviewKey, path: PathBuf, force: bool) {
+/// Runs `sync::remove_workspace` (forced, discarding any local changes) on a background thread,
+/// showing the same row spinner as a fetch while it works - deleting a big worktree can take a
+/// while.
+fn begin_delete(s: &mut Cursive, key: ReviewKey) {
     let Some(ctx) = s.user_data::<Ctx>() else {
         return;
     };
@@ -597,36 +582,21 @@ fn begin_delete(s: &mut Cursive, key: ReviewKey, path: PathBuf, force: bool) {
 
     let cb_sink = s.cb_sink().clone();
     std::thread::spawn(move || {
-        let result = sync::remove_workspace(&paths, &key, force);
+        let result = sync::remove_workspace(&paths, &key, true);
         done.store(true, Ordering::SeqCst);
-        let _ = cb_sink.send(Box::new(move |s| finish_delete(s, key, path, force, result)));
+        let _ = cb_sink.send(Box::new(move |s| finish_delete(s, key, result)));
     });
 }
 
-fn finish_delete(s: &mut Cursive, key: ReviewKey, path: PathBuf, force: bool, result: Result<()>) {
+fn finish_delete(s: &mut Cursive, key: ReviewKey, result: Result<()>) {
     if let Some(ctx) = s.user_data::<Ctx>() {
         ctx.fetching.remove(&key);
     }
     match result {
-        Ok(()) => {
-            set_status(s, format!("deleted workspace for {key}"));
-            reload(s);
-        }
-        Err(e) => match e.downcast::<sync::WorkspaceDirty>() {
-            Ok(_) if !force => {
-                reload(s);
-                prompt_delete_workspace(s, key, path, true);
-            }
-            Ok(e) => {
-                set_status(s, format!("failed to delete workspace for {key}: {e:#}"));
-                reload(s);
-            }
-            Err(e) => {
-                set_status(s, format!("failed to delete workspace for {key}: {e:#}"));
-                reload(s);
-            }
-        },
+        Ok(()) => set_status(s, format!("deleted workspace for {key}")),
+        Err(e) => set_status(s, format!("failed to delete workspace for {key}: {e:#}")),
     }
+    reload(s);
 }
 
 /// `f`: fetches (or refreshes) the selected review in the background with no confirmation and
@@ -683,7 +653,7 @@ fn open_locally_selected_key(s: &mut Cursive, key: ReviewKey) {
 /// clone a repo or run a source's checkout command - either can take a while. `Proceed` closes
 /// the dialog and hands off to `begin_fetch`, which shows progress in the review's own row.
 fn prompt_confirm_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
-    let dialog = Dialog::text(format!("No local worktree for `{key}` yet.\nFetch it now?"))
+    let dialog = Dialog::text(format!("Create workspace for {key}?"))
         .title("Fetch review?")
         .button("Cancel", |s| {
             s.pop_layer();
