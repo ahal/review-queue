@@ -17,6 +17,11 @@ pub struct Config {
     /// `workdir`. Set by answering "always" to the clone prompt (see `set_auto_clone`).
     #[serde(default)]
     pub auto_clone: bool,
+    /// Shell command to run in a review's workspace instead of an interactive `$SHELL` when it's
+    /// opened locally from the TUI. Run via `sh -c` with the workspace as cwd; the review is
+    /// described by `RQ_REVIEW` (`source/id`), `RQ_SOURCE`, `RQ_ID` and `RQ_WORKSPACE`.
+    #[serde(default)]
+    pub open_command: Option<String>,
 
     #[serde(default)]
     pub source: SourcesConfig,
@@ -146,6 +151,13 @@ ignore_repos = ["mozilla/some-noisy-repo"]
         );
         assert_eq!(cfg.workdir, Some(PathBuf::from("~/dev")));
         assert!(!cfg.auto_clone);
+        assert!(cfg.open_command.is_none());
+    }
+
+    #[test]
+    fn parses_open_command() {
+        let cfg: Config = toml::from_str(r#"open_command = "nvim +DiffviewOpen""#).unwrap();
+        assert_eq!(cfg.open_command.as_deref(), Some("nvim +DiffviewOpen"));
     }
 
     #[test]

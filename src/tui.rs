@@ -6,7 +6,7 @@
 //! review's diffstat (fetched by `rq sync` and read straight out of `state.json` - no network
 //! calls here). `o` opens the review in a browser. Enter opens it locally: fetching it on demand
 //! if needed (the same `sync::fetch_local` a plain `rq fetch <id>` runs), then suspending the TUI
-//! to drop the user into a subshell in its worktree, resuming once they exit it - see
+//! to drop the user into a subshell in its worktree (or run the configured `open_command`), resuming once they exit it - see
 //! `run_event_loop` for why that means tearing down and recreating the whole backend rather than
 //! just toggling raw mode. See `crate::sync`'s module docs for why `rq sync` itself never creates
 //! workspaces. `d` deletes the selected review's workspace (`sync::remove_workspace`), confirming
@@ -236,23 +236,53 @@ fn run_event_loop(mut siv: Cursive) -> Result<()> {
         match outcome {
             Outcome::Quit => return Ok(()),
             Outcome::OpenShell(key, path) => {
-                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-                let result = std::process::Command::new(&shell)
-                    .current_dir(&path)
-                    .status();
+                let open_command = siv
+                    .user_data::<Ctx>()
+                    .and_then(|ctx| ctx.config.open_command.clone());
+                let (label, result) = run_open_command(open_command.as_deref(), &key, &path);
                 match result {
                     Ok(status) if status.success() => {
                         set_status(&mut siv, format!("back from {key} ({})", path.display()))
                     }
                     Ok(status) => set_status(
                         &mut siv,
-                        format!("`{shell}` exited with {status} in {}", path.display()),
+                        format!("`{label}` exited with {status} in {}", path.display()),
                     ),
-                    Err(e) => set_status(&mut siv, format!("failed to launch `{shell}`: {e}")),
+                    Err(e) => set_status(&mut siv, format!("failed to launch `{label}`: {e}")),
                 }
             }
         }
     }
+}
+
+/// Runs the configured `open_command` (via `sh -c`) or, if there is none, an interactive
+/// `$SHELL`, in the review's workspace. Returns the command's display name alongside its result.
+fn run_open_command(
+    open_command: Option<&str>,
+    key: &ReviewKey,
+    path: &std::path::Path,
+) -> (String, std::io::Result<std::process::ExitStatus>) {
+    let mut cmd = match open_command {
+        Some(script) => {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", script]);
+            cmd
+        }
+        None => {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            std::process::Command::new(shell)
+        }
+    };
+    cmd.current_dir(path)
+        .env("RQ_REVIEW", key.slug())
+        .env("RQ_SOURCE", &key.source)
+        .env("RQ_ID", &key.id)
+        .env("RQ_WORKSPACE", path);
+    let label = open_command
+        .map(str::to_string)
+        .unwrap_or_else(|| cmd.get_program().to_string_lossy().into_owned());
+    let result = cmd.status();
+    (label, result)
 }
 
 fn load_rows(paths: &Paths, all: bool) -> Result<Vec<ReviewEntry>> {
