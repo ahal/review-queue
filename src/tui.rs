@@ -26,6 +26,7 @@
 //! (or refreshes) the selected review in the background.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -255,13 +256,13 @@ fn run_event_loop(mut siv: Cursive) -> Result<()> {
     }
 }
 
-/// Runs the configured `open_command` (via `sh -c`) or, if there is none, an interactive
-/// `$SHELL`, in the review's workspace. Returns the command's display name alongside its result.
-fn run_open_command(
+/// Builds the configured `open_command` (run via `sh -c`) or, if there is none, an interactive
+/// `$SHELL`, to run in the review's workspace. Returns the command's display name with it.
+fn build_open_command(
     open_command: Option<&str>,
     key: &ReviewKey,
     path: &std::path::Path,
-) -> (String, std::io::Result<std::process::ExitStatus>) {
+) -> (String, std::process::Command) {
     let mut cmd = match open_command {
         Some(script) => {
             let mut cmd = std::process::Command::new("sh");
@@ -281,8 +282,56 @@ fn run_open_command(
     let label = open_command
         .map(str::to_string)
         .unwrap_or_else(|| cmd.get_program().to_string_lossy().into_owned());
+    (label, cmd)
+}
+
+fn run_open_command(
+    open_command: Option<&str>,
+    key: &ReviewKey,
+    path: &std::path::Path,
+) -> (String, std::io::Result<std::process::ExitStatus>) {
+    let (label, mut cmd) = build_open_command(open_command, key, path);
     let result = cmd.status();
     (label, result)
+}
+
+/// Opens a fetched workspace: queues it for `run_event_loop` to suspend the TUI around, or - with
+/// `open_command_wait = false` - just starts the command in the background and keeps going.
+fn open_workspace(s: &mut Cursive, key: ReviewKey, path: PathBuf) {
+    let Some(ctx) = s.user_data::<Ctx>() else {
+        return;
+    };
+    let detached = match &ctx.config.open_command {
+        Some(cmd) if !ctx.config.open_command_wait => cmd.clone(),
+        _ => {
+            ctx.pending_shell = Some((key, path));
+            return;
+        }
+    };
+
+    let (label, mut cmd) = build_open_command(Some(&detached), &key, &path);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        // Own process group, so a Ctrl-C aimed at rq doesn't also hit the command.
+        .process_group(0);
+    match cmd.spawn() {
+        Ok(mut child) => {
+            set_status(s, format!("opened {key} ({})", path.display()));
+            // Reap the child so it doesn't linger as a zombie, and surface a failure.
+            let sink = s.cb_sink().clone();
+            std::thread::spawn(move || {
+                if let Ok(status) = child.wait() {
+                    if !status.success() {
+                        let _ = sink.send(Box::new(move |s| {
+                            set_status(s, format!("`{label}` exited with {status} for {key}"))
+                        }));
+                    }
+                }
+            });
+        }
+        Err(e) => set_status(s, format!("failed to launch `{label}`: {e}")),
+    }
 }
 
 fn load_rows(paths: &Paths, all: bool) -> Result<Vec<ReviewEntry>> {
@@ -391,7 +440,10 @@ fn row_label(
         } else {
             BaseColor::Yellow
         };
-        out.append_styled(SPINNER_FRAMES[spin.frame % SPINNER_FRAMES.len()], ansi(color));
+        out.append_styled(
+            SPINNER_FRAMES[spin.frame % SPINNER_FRAMES.len()],
+            ansi(color),
+        );
     } else if e.stack_id.is_some() {
         out.append_styled("\u{2913}", ansi(BaseColor::Cyan));
     } else {
@@ -505,7 +557,12 @@ fn description_lines(e: &ReviewEntry, width: usize) -> Vec<String> {
     let wrap = width.saturating_sub(DETAIL_INDENT.len() + 2).max(20);
     let mut lines = wrap_text(&e.title, wrap);
     lines.push(String::new());
-    if let Some(desc) = e.description.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+    if let Some(desc) = e
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
         lines.extend(wrap_text(desc, wrap));
         lines.push(String::new());
     }
@@ -549,9 +606,7 @@ fn build_rows(
         });
         let is_expanded = expanded.contains(&e.key);
         // A stack shares one workspace, so its spinner runs on every member.
-        let spin = spinners
-            .get(stack.map_or(&e.key, |st| &st.tip))
-            .copied();
+        let spin = spinners.get(stack.map_or(&e.key, |st| &st.tip)).copied();
         rows.push((
             row_label(e, key_w, author_w, is_expanded, link, spin),
             Row::Entry(e.key.clone()),
@@ -639,9 +694,11 @@ fn vim_keys(dialog: Dialog) -> OnEventView<Dialog> {
 }
 
 fn show_help(s: &mut Cursive) {
-    let dialog = Dialog::text(HELP_DIALOG).title("Shortcuts").button("Close", |s| {
-        s.pop_layer();
-    });
+    let dialog = Dialog::text(HELP_DIALOG)
+        .title("Shortcuts")
+        .button("Close", |s| {
+            s.pop_layer();
+        });
     // Esc would otherwise fall through to the global quit callback.
     s.add_layer(
         vim_keys(dialog)
@@ -682,7 +739,9 @@ fn delete_workspace_selected(s: &mut Cursive) {
     };
     // Nothing to delete yet while it's still being fetched - `d` cancels it instead.
     let guard = fetch_guard(s, &key);
-    if s.user_data::<Ctx>().is_some_and(|ctx| ctx.fetching.contains_key(&guard)) {
+    if s.user_data::<Ctx>()
+        .is_some_and(|ctx| ctx.fetching.contains_key(&guard))
+    {
         cancel_fetch(s, &guard);
         return;
     }
@@ -706,7 +765,10 @@ fn delete_workspace_selected(s: &mut Cursive) {
 /// prompt for a dirty workspace.
 fn prompt_delete_workspace(s: &mut Cursive, key: ReviewKey, sharing: usize) {
     let text = if sharing > 1 {
-        format!("Delete the workspace for {key} and the {} other reviews in its stack?", sharing - 1)
+        format!(
+            "Delete the workspace for {key} and the {} other reviews in its stack?",
+            sharing - 1
+        )
     } else {
         format!("Delete workspace for {key}?")
     };
@@ -872,7 +934,15 @@ fn begin_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing, open_shel
         ));
         done.store(true, Ordering::SeqCst);
         let _ = cb_sink.send(Box::new(move |s| {
-            finish_fetch(s, worker_key, guard, result, cancelled, open_shell, had_workspace)
+            finish_fetch(
+                s,
+                worker_key,
+                guard,
+                result,
+                cancelled,
+                open_shell,
+                had_workspace,
+            )
         }));
     });
 }
@@ -918,7 +988,9 @@ fn cancel_fetch(s: &mut Cursive, key: &ReviewKey) {
         Some(false) => {
             set_status(
                 s,
-                format!("cancelling {key} - it will be cleaned up once the running operation stops"),
+                format!(
+                    "cancelling {key} - it will be cleaned up once the running operation stops"
+                ),
             );
             reload(s);
         }
@@ -996,9 +1068,7 @@ fn finish_fetch(
     match result {
         Ok(path) => {
             if open_shell {
-                if let Some(ctx) = s.user_data::<Ctx>() {
-                    ctx.pending_shell = Some((key, path));
-                }
+                open_workspace(s, key, path);
             } else {
                 set_status(s, format!("fetched {key} ({})", path.display()));
             }
@@ -1033,9 +1103,7 @@ fn do_open_locally(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
         // subshell only gets launched by `run_event_loop`, which alone is allowed to tear down
         // the backend.
         Some(Ok(path)) => {
-            if let Some(ctx) = s.user_data::<Ctx>() {
-                ctx.pending_shell = Some((key, path));
-            }
+            open_workspace(s, key, path);
             reload(s);
         }
         Some(Err(e)) => match e.downcast::<NeedsClone>() {
@@ -1167,7 +1235,10 @@ mod tests {
 
     fn stacked(id: &str, ancestors: &[&str]) -> ReviewEntry {
         let mut e = entry(id, None);
-        e.ancestors = ancestors.iter().map(|a| ReviewKey::new("moz", *a)).collect();
+        e.ancestors = ancestors
+            .iter()
+            .map(|a| ReviewKey::new("moz", *a))
+            .collect();
         e
     }
 
@@ -1184,10 +1255,18 @@ mod tests {
         let ids: Vec<_> = ordered.iter().map(|e| e.key.id.as_str()).collect();
         assert_eq!(ids, ["D1", "D2", "D3", "D4"]);
 
-        let entries = vec![stacked("D1", &["D9"]), stacked("D2", &[]), stacked("D9", &[])];
+        let entries = vec![
+            stacked("D1", &["D9"]),
+            stacked("D2", &[]),
+            stacked("D9", &[]),
+        ];
         let ordered = order_by_stack(entries);
         let ids: Vec<_> = ordered.iter().map(|e| e.key.id.as_str()).collect();
-        assert_eq!(ids, ["D9", "D1", "D2"], "D9 is D1's parent, so it comes first");
+        assert_eq!(
+            ids,
+            ["D9", "D1", "D2"],
+            "D9 is D1's parent, so it comes first"
+        );
     }
 
     #[test]
@@ -1208,7 +1287,10 @@ mod tests {
         let rows = build_rows(&entries, 6, 6, &BTreeSet::new(), 100, &spinners);
 
         assert_eq!(rows.len(), 4);
-        assert!(rows.iter().all(|(_, r)| matches!(r, Row::Entry(_))), "no header rows");
+        assert!(
+            rows.iter().all(|(_, r)| matches!(r, Row::Entry(_))),
+            "no header rows"
+        );
 
         let plain = |i: usize| rows[i].0.source().to_string();
         // The connector hangs directly off the id: marker, icon, space, then the id.
@@ -1233,7 +1315,14 @@ mod tests {
             stacked("D3", &[]),
         ]);
         let (key_w, author_w) = column_widths(&entries);
-        let rows = build_rows(&entries, key_w, author_w, &BTreeSet::new(), 100, &Spinners::new());
+        let rows = build_rows(
+            &entries,
+            key_w,
+            author_w,
+            &BTreeSet::new(),
+            100,
+            &Spinners::new(),
+        );
         let author_col: Vec<usize> = rows
             .iter()
             .filter(|(_, r)| matches!(r, Row::Entry(_)))
@@ -1243,7 +1332,10 @@ mod tests {
             })
             .collect();
         assert_eq!(author_col.len(), 3);
-        assert!(author_col.iter().all(|c| *c == author_col[0]), "{author_col:?}");
+        assert!(
+            author_col.iter().all(|c| *c == author_col[0]),
+            "{author_col:?}"
+        );
     }
 
     #[test]
@@ -1262,7 +1354,14 @@ mod tests {
             entry("D2", None),
         ];
         let expanded = ReviewKey::new("moz", "D1");
-        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([expanded.clone()]), 100, &Spinners::new());
+        let rows = build_rows(
+            &entries,
+            5,
+            6,
+            &BTreeSet::from([expanded.clone()]),
+            100,
+            &Spinners::new(),
+        );
 
         // D1's entry row, its title + blank line, its two diffstat lines, then D2's entry row.
         assert_eq!(rows.len(), 6);
@@ -1281,7 +1380,14 @@ mod tests {
         ];
         let d1 = ReviewKey::new("moz", "D1");
         let d2 = ReviewKey::new("moz", "D2");
-        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([d1.clone(), d2.clone()]), 100, &Spinners::new());
+        let rows = build_rows(
+            &entries,
+            5,
+            6,
+            &BTreeSet::from([d1.clone(), d2.clone()]),
+            100,
+            &Spinners::new(),
+        );
 
         // D1's entry + title/blank + its diffstat line, then the same for D2 - expanding D2 must
         // not have collapsed D1.
@@ -1361,7 +1467,13 @@ mod tests {
         let lines = description_lines(&e, 40);
         assert!(lines.len() > 4, "{lines:?}");
         assert!(lines.iter().all(|l| l.chars().count() <= 40));
-        assert_eq!(lines[..lines.len() - 1].join(" ").split_whitespace().count(), 30);
+        assert_eq!(
+            lines[..lines.len() - 1]
+                .join(" ")
+                .split_whitespace()
+                .count(),
+            30
+        );
     }
 
     #[test]
@@ -1372,7 +1484,9 @@ mod tests {
             frame: 0,
             cancelling: false,
         };
-        let spinning = row_label(&e, 5, 6, false, None, Some(spin)).source().to_string();
+        let spinning = row_label(&e, 5, 6, false, None, Some(spin))
+            .source()
+            .to_string();
         assert!(spinning.contains(SPINNER_FRAMES[0]));
         assert!(!plain.contains(SPINNER_FRAMES[0]));
         assert_eq!(plain.chars().count(), spinning.chars().count());
@@ -1421,10 +1535,8 @@ mod tests {
             .with_name("dlg"),
         );
         let focus = |siv: &mut Cursive| {
-            siv.call_on_name("dlg", |v: &mut OnEventView<Dialog>| {
-                v.get_inner().focus()
-            })
-            .unwrap()
+            siv.call_on_name("dlg", |v: &mut OnEventView<Dialog>| v.get_inner().focus())
+                .unwrap()
         };
 
         siv.runner().refresh(); // lay the dialog out so its buttons have areas to move between
@@ -1445,7 +1557,10 @@ mod tests {
     fn a_review_without_a_description_still_shows_its_title() {
         let mut e = entry("D1", None);
         e.description = Some("  \n".into());
-        assert_eq!(description_lines(&e, 100), vec!["      Fix the thing", "      "]);
+        assert_eq!(
+            description_lines(&e, 100),
+            vec!["      Fix the thing", "      "]
+        );
     }
 
     #[test]
@@ -1494,7 +1609,14 @@ mod tests {
         ];
         let mut select = SelectView::<Row>::new();
         let expanded = ReviewKey::new("moz", "D1");
-        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded]), 100, &Spinners::new()) {
+        for (label, row) in build_rows(
+            &entries,
+            5,
+            6,
+            &BTreeSet::from([expanded]),
+            100,
+            &Spinners::new(),
+        ) {
             select.add_item(label, row);
         }
         siv.add_layer(select.with_name("reviews"));
@@ -1515,7 +1637,14 @@ mod tests {
         let entries = vec![entry("D1", Some("a.rs | 1 +"))];
         let mut select = SelectView::<Row>::new();
         let expanded = ReviewKey::new("moz", "D1");
-        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded]), 100, &Spinners::new()) {
+        for (label, row) in build_rows(
+            &entries,
+            5,
+            6,
+            &BTreeSet::from([expanded]),
+            100,
+            &Spinners::new(),
+        ) {
             select.add_item(label, row);
         }
         siv.add_layer(select.with_name("reviews"));
@@ -1550,7 +1679,7 @@ mod tests {
             key_w: 5,
             author_w: 6,
             expanded: BTreeSet::new(),
-                pending_shell: None,
+            pending_shell: None,
             fetching: BTreeMap::new(),
         }
     }

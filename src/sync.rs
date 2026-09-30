@@ -207,8 +207,7 @@ fn handle_out_of_queue(
 fn attach_stack_ids(state: &mut State, stacks: &[Stack]) {
     for stack in stacks {
         let existing = |key: &ReviewKey| state.get(key).and_then(|e| e.stack_id.clone());
-        let chosen = existing(&stack.tip)
-            .or_else(|| stack.members.iter().find_map(existing));
+        let chosen = existing(&stack.tip).or_else(|| stack.members.iter().find_map(existing));
         let Some(id) = chosen else {
             continue;
         };
@@ -361,9 +360,7 @@ fn remove_finished_workspace(
         return;
     }
     if !dry_run {
-        if !gone
-            && let Err(e) = vcs.remove_workspace(&ws.repo_path, &ws.workspace_path, id)
-        {
+        if !gone && let Err(e) = vcs.remove_workspace(&ws.repo_path, &ws.workspace_path, id) {
             report.errors.push((ws.tip.clone(), e.to_string()));
             return;
         }
@@ -533,10 +530,8 @@ pub fn remove_workspace(paths: &Paths, key: &ReviewKey, force: bool) -> Result<(
         .get(key)
         .cloned()
         .with_context(|| format!("`{key}` isn't tracked"))?;
-    let (Some(stack_id), Some(ws)) = (
-        entry.stack_id.clone(),
-        state.workspace_of(&entry).cloned(),
-    ) else {
+    let (Some(stack_id), Some(ws)) = (entry.stack_id.clone(), state.workspace_of(&entry).cloned())
+    else {
         bail!("`{key}` has no local workspace");
     };
 
@@ -1285,9 +1280,7 @@ mod tests {
         crate::source::Patch {
             title: format!("patch {id}"),
             author: "Patch Author <patch@example.com>".into(),
-            message: format!(
-                "patch {id}\n\nDifferential Revision: https://phab.example.com/{id}"
-            ),
+            message: format!("patch {id}\n\nDifferential Revision: https://phab.example.com/{id}"),
             diff: format!(
                 "diff --git a/{file} b/{file}\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/{file}\n@@ -0,0 +1 @@\n+{id}\n"
             ),
@@ -1327,7 +1320,9 @@ mod tests {
         }
 
         fn is_commit_for(&self, review: &ReviewKey, message: &str) -> bool {
-            message.lines().any(|l| l.ends_with(&format!("/{}", review.id)))
+            message
+                .lines()
+                .any(|l| l.ends_with(&format!("/{}", review.id)))
         }
     }
 
@@ -1375,7 +1370,13 @@ mod tests {
             .unwrap();
         assert_eq!(again, ws_path);
         assert!(ws_path.join("D2.txt").exists());
-        assert_eq!(State::load(&paths.state_file()).unwrap().workspaces().count(), 1);
+        assert_eq!(
+            State::load(&paths.state_file())
+                .unwrap()
+                .workspaces()
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

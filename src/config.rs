@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub data_dir: Option<PathBuf>,
@@ -22,6 +22,12 @@ pub struct Config {
     /// described by `RQ_REVIEW` (`source/id`), `RQ_SOURCE`, `RQ_ID` and `RQ_WORKSPACE`.
     #[serde(default)]
     pub open_command: Option<String>,
+    /// Whether rq suspends its TUI until `open_command` exits (the default). Set to `false` for
+    /// commands that hand off elsewhere and return - e.g. switching a tmux client - so rq keeps
+    /// running, with the command's stdio detached. Ignored without `open_command`: the fallback
+    /// `$SHELL` needs the terminal.
+    #[serde(default = "default_true")]
+    pub open_command_wait: bool,
 
     #[serde(default)]
     pub source: SourcesConfig,
@@ -81,6 +87,13 @@ pub enum VcsKind {
 
 fn default_true() -> bool {
     true
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        // Go through serde so the field defaults (e.g. `open_command_wait`) live in one place.
+        toml::from_str("").expect("an empty config is valid")
+    }
 }
 
 impl Config {
@@ -152,6 +165,13 @@ ignore_repos = ["mozilla/some-noisy-repo"]
         assert_eq!(cfg.workdir, Some(PathBuf::from("~/dev")));
         assert!(!cfg.auto_clone);
         assert!(cfg.open_command.is_none());
+        assert!(cfg.open_command_wait, "blocking is the default");
+    }
+
+    #[test]
+    fn open_command_wait_can_be_disabled() {
+        let cfg: Config = toml::from_str("open_command_wait = false").unwrap();
+        assert!(!cfg.open_command_wait);
     }
 
     #[test]

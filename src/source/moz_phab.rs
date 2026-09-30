@@ -1438,7 +1438,9 @@ mod tests {
         // Parent lookup for D2's stack.
         Mock::given(method("POST"))
             .and(path("/api/differential.revision.search"))
-            .and(body_string_contains("constraints%5Bphids%5D%5B0%5D=PHID-DREV-1"))
+            .and(body_string_contains(
+                "constraints%5Bphids%5D%5B0%5D=PHID-DREV-1",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[d1])))
             .mount(&server)
             .await;

@@ -245,7 +245,10 @@ fn migrate_per_review_workspaces(value: &mut serde_json::Value) {
         let Some(Value::Object(mut ws)) = entry.remove("workspace") else {
             continue;
         };
-        ws.insert("tip".into(), entry.get("key").cloned().unwrap_or(Value::Null));
+        ws.insert(
+            "tip".into(),
+            entry.get("key").cloned().unwrap_or(Value::Null),
+        );
         ws.insert(
             "version".into(),
             entry.get("version").cloned().unwrap_or(Value::Null),

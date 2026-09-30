@@ -28,10 +28,8 @@ pub fn group<'a>(entries: impl IntoIterator<Item = &'a ReviewEntry>) -> Vec<Stac
         .map(|e| (&e.key, e))
         .collect();
 
-    let ancestors_of_something: BTreeSet<&ReviewKey> = live
-        .values()
-        .flat_map(|e| e.ancestors.iter())
-        .collect();
+    let ancestors_of_something: BTreeSet<&ReviewKey> =
+        live.values().flat_map(|e| e.ancestors.iter()).collect();
 
     let mut assigned: BTreeSet<&ReviewKey> = BTreeSet::new();
     let mut stacks = Vec::new();
@@ -133,11 +131,7 @@ mod tests {
 
     #[test]
     fn a_fork_gives_each_leaf_its_own_stack_and_the_shared_parent_to_the_first() {
-        let entries = [
-            entry("D1", &[]),
-            entry("D2", &["D1"]),
-            entry("D3", &["D1"]),
-        ];
+        let entries = [entry("D1", &[]), entry("D2", &["D1"]), entry("D3", &["D1"])];
         let stacks = group(&entries);
         assert_eq!(stacks.len(), 2);
         assert_eq!(stacks[0].members, vec![k("D1"), k("D2")]);
