@@ -50,7 +50,7 @@ use crate::sync;
 /// Frames for the spinner shown while a review is fetched on a background thread.
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-const HELP: &str = "[Q]uit   [?]";
+const HELP: &str = "[?] Help";
 
 const HELP_DIALOG: &str = "↑/↓ or j/k    move
 ←/→ or h/l    expand/collapse
