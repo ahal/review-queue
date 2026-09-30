@@ -53,7 +53,7 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 const HELP: &str = "[Q]uit   [?]";
 
 const HELP_DIALOG: &str = "↑/↓ or j/k    move
-←/→ or h/l    expand/collapse (a stack's header folds its reviews)
+←/→ or h/l    expand/collapse
 enter         open locally
 f             fetch
 o             open in browser
@@ -73,8 +73,6 @@ struct Ctx {
     author_w: usize,
     /// Reviews currently expanded to show their diffstat - any number at once, independently.
     expanded: BTreeSet<ReviewKey>,
-    /// Stacks (by tip) whose member reviews are folded away under their header.
-    collapsed: BTreeSet<ReviewKey>,
     /// Set by `do_open_locally` on a successful fetch; drained by `run_event_loop`, which is the
     /// only place actually allowed to touch the terminal/backend to suspend into a subshell.
     pending_shell: Option<(ReviewKey, PathBuf)>,
@@ -112,15 +110,12 @@ type Spinners = BTreeMap<ReviewKey, Spin>;
 enum Row {
     Entry(ReviewKey),
     Detail(ReviewKey),
-    /// The header above a stack of two or more reviews, carrying the stack's tip: acting on it
-    /// (open, fetch, delete) acts on the tip, whose workspace is the stack's.
-    Stack(ReviewKey),
 }
 
 impl Row {
     fn key(&self) -> &ReviewKey {
         match self {
-            Row::Entry(k) | Row::Detail(k) | Row::Stack(k) => k,
+            Row::Entry(k) | Row::Detail(k) => k,
         }
     }
 }
@@ -156,7 +151,6 @@ pub fn run(
         key_w,
         author_w,
         expanded: BTreeSet::new(),
-        collapsed: BTreeSet::new(),
         pending_shell: None,
         fetching: BTreeMap::new(),
     });
@@ -166,7 +160,6 @@ pub fn run(
         &entries,
         key_w,
         author_w,
-        &BTreeSet::new(),
         &BTreeSet::new(),
         terminal_width(),
         &Spinners::new(),
@@ -300,16 +293,9 @@ fn order_by_stack(entries: Vec<ReviewEntry>) -> Vec<ReviewEntry> {
 }
 
 fn column_widths(entries: &[ReviewEntry]) -> (usize, usize) {
-    // A stacked review's key is indented, and its author/title still line up with everyone
-    // else's, so the column has to be wide enough for the indent too.
-    let stacked: BTreeSet<ReviewKey> = stacks::group(entries.iter())
-        .into_iter()
-        .filter(|s| s.members.len() > 1)
-        .flat_map(|s| s.members)
-        .collect();
     let key_w = entries
         .iter()
-        .map(|e| e.key.slug().len() + if stacked.contains(&e.key) { STACK_INDENT.len() } else { 0 })
+        .map(|e| e.key.slug().len())
         .max()
         .unwrap_or(3)
         .max(3);
@@ -331,8 +317,27 @@ fn truncate(s: &str, width: usize) -> String {
     }
 }
 
-/// How far in a stack's member reviews sit from its header (and from unstacked reviews).
-const STACK_INDENT: &str = "  ";
+/// Columns a connector takes after the id: a space and the glyph.
+const LINK_W: usize = 2;
+
+/// Where a review sits in its stack, drawn as a connector in the gutter so the stack's members
+/// read as one linked chain even though the rows are flat. Members are bottom-most first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Link {
+    Bottom,
+    Middle,
+    Top,
+}
+
+impl Link {
+    fn glyph(self) -> &'static str {
+        match self {
+            Link::Bottom => "\u{2510}",
+            Link::Middle => "\u{2524}",
+            Link::Top => "\u{2518}",
+        }
+    }
+}
 
 fn ansi(c: BaseColor) -> Color {
     Color::Dark(c)
@@ -343,17 +348,12 @@ fn row_label(
     key_w: usize,
     author_w: usize,
     expanded: bool,
-    stacked: bool,
+    link: Option<Link>,
     spin: Option<Spin>,
 ) -> StyledString {
     let marker = if expanded { '\u{25be}' } else { '\u{25b8}' };
 
     let mut out = StyledString::new();
-    if stacked {
-        // One level in from unstacked reviews; the header above owns the workspace icon and
-        // spinner, since the workspace is shared.
-        out.append_plain(STACK_INDENT);
-    }
     out.append_styled(format!("{marker} "), Effect::Dim);
     if let Some(spin) = spin {
         let color = if spin.cancelling {
@@ -362,15 +362,23 @@ fn row_label(
             BaseColor::Yellow
         };
         out.append_styled(SPINNER_FRAMES[spin.frame % SPINNER_FRAMES.len()], ansi(color));
-    } else if e.stack_id.is_some() && !stacked {
+    } else if e.stack_id.is_some() {
         out.append_styled("\u{2913}", ansi(BaseColor::Cyan));
     } else {
         out.append_plain(" ");
     }
     out.append_plain(" ");
-    // The indent comes out of the key column so the author and title stay aligned.
-    let key_w = if stacked { key_w.saturating_sub(STACK_INDENT.len()) } else { key_w };
-    out.append_styled(format!("{:<key_w$}", e.key.slug()), ansi(BaseColor::Cyan));
+    let slug = e.key.slug();
+    out.append_styled(&slug, ansi(BaseColor::Cyan));
+    // The connector hangs off the id; the padding keeps authors aligned across stacked and
+    // unstacked rows.
+    let mut pad = key_w.saturating_sub(slug.chars().count()) + LINK_W;
+    if let Some(link) = link {
+        out.append_plain(" ");
+        out.append_styled(link.glyph(), ansi(BaseColor::Magenta));
+        pad -= LINK_W;
+    }
+    out.append_plain(" ".repeat(pad));
     out.append_plain("  ");
     out.append_plain(truncate(&e.author, author_w));
     out.append_plain("  ");
@@ -477,43 +485,11 @@ fn description_lines(e: &ReviewEntry, width: usize) -> Vec<String> {
         .collect()
 }
 
-/// The header above a stack. A stack has no title or author of its own - it can span authors,
-/// bugs and repos - so it only says how many revisions it holds; the rest stays on member rows.
-fn stack_header_label(
-    members: &[&ReviewEntry],
-    collapsed: bool,
-    has_workspace: bool,
-    spin: Option<Spin>,
-) -> StyledString {
-    let marker = if collapsed { '\u{25b8}' } else { '\u{25be}' };
-    let mut out = StyledString::styled(format!("{marker} "), Effect::Dim);
-    if let Some(spin) = spin {
-        let color = if spin.cancelling {
-            BaseColor::Red
-        } else {
-            BaseColor::Yellow
-        };
-        out.append_styled(SPINNER_FRAMES[spin.frame % SPINNER_FRAMES.len()], ansi(color));
-    } else if has_workspace {
-        out.append_styled("\u{2913}", ansi(BaseColor::Cyan));
-    } else {
-        out.append_plain(" ");
-    }
-    out.append_plain(" ");
-
-    out.append_styled(
-        format!("stack of {} revisions", members.len()),
-        ansi(BaseColor::Cyan),
-    );
-    out
-}
-
 fn build_rows(
     entries: &[ReviewEntry],
     key_w: usize,
     author_w: usize,
     expanded: &BTreeSet<ReviewKey>,
-    collapsed: &BTreeSet<ReviewKey>,
     width: usize,
     spinners: &Spinners,
 ) -> Vec<(StyledString, Row)> {
@@ -523,7 +499,6 @@ fn build_rows(
         .into_iter()
         .filter(|s| s.members.len() > 1)
         .collect();
-    let by_key: BTreeMap<&ReviewKey, &ReviewEntry> = entries.iter().map(|e| (&e.key, e)).collect();
     let stack_of: BTreeMap<&ReviewKey, usize> = stacks
         .iter()
         .enumerate()
@@ -531,44 +506,24 @@ fn build_rows(
         .collect();
 
     let mut rows = Vec::new();
-    let mut headed: BTreeSet<usize> = BTreeSet::new();
     for e in entries {
-        let stack = stack_of.get(&e.key).copied();
-        if let Some(i) = stack
-            && headed.insert(i)
-        {
-            let stack = &stacks[i];
-            let members: Vec<&ReviewEntry> = stack
-                .members
-                .iter()
-                .filter_map(|k| by_key.get(k).copied())
-                .collect();
-            let is_collapsed = collapsed.contains(&stack.tip);
-            let has_workspace = members.iter().any(|m| m.stack_id.is_some());
-            rows.push((
-                stack_header_label(
-                    &members,
-                    is_collapsed,
-                    has_workspace,
-                    spinners.get(&stack.tip).copied(),
-                ),
-                Row::Stack(stack.tip.clone()),
-            ));
-        }
-        if let Some(i) = stack
-            && collapsed.contains(&stacks[i].tip)
-        {
-            continue;
-        }
-
+        let stack = stack_of.get(&e.key).map(|&i| &stacks[i]);
+        let link = stack.map(|st| {
+            if st.members.first() == Some(&e.key) {
+                Link::Bottom
+            } else if st.members.last() == Some(&e.key) {
+                Link::Top
+            } else {
+                Link::Middle
+            }
+        });
         let is_expanded = expanded.contains(&e.key);
-        let spin = if stack.is_some() {
-            None
-        } else {
-            spinners.get(&e.key).copied()
-        };
+        // A stack shares one workspace, so its spinner runs on every member.
+        let spin = spinners
+            .get(stack.map_or(&e.key, |st| &st.tip))
+            .copied();
         rows.push((
-            row_label(e, key_w, author_w, is_expanded, stack.is_some(), spin),
+            row_label(e, key_w, author_w, is_expanded, link, spin),
             Row::Entry(e.key.clone()),
         ));
         if is_expanded {
@@ -626,14 +581,6 @@ fn set_expanded(s: &mut Cursive, expand: bool) {
     };
     if let Some(ctx) = s.user_data::<Ctx>() {
         match row {
-            // On a stack's header, folds/unfolds the stack's member reviews.
-            Row::Stack(tip) => {
-                if expand {
-                    ctx.collapsed.remove(&tip);
-                } else {
-                    ctx.collapsed.insert(tip);
-                }
-            }
             Row::Entry(key) | Row::Detail(key) => {
                 if expand {
                     ctx.expanded.insert(key);
@@ -1115,7 +1062,6 @@ fn reload(s: &mut Cursive) {
             ctx.key_w,
             ctx.author_w,
             ctx.expanded.clone(),
-            ctx.collapsed.clone(),
             ctx.fetching
                 .iter()
                 .map(|(k, f)| {
@@ -1128,7 +1074,7 @@ fn reload(s: &mut Cursive) {
                 .collect::<Spinners>(),
         )
     });
-    let Some((loaded, key_w, author_w, expanded, collapsed, spinners)) = loaded else {
+    let Some((loaded, key_w, author_w, expanded, spinners)) = loaded else {
         return;
     };
     let entries = match loaded {
@@ -1147,14 +1093,12 @@ fn reload(s: &mut Cursive) {
             key_w,
             author_w,
             &expanded,
-            &collapsed,
             terminal_width(),
             &spinners,
         );
         for (label, row) in rows {
             v.add_item(label, row);
         }
-        // Compare whole rows, not just keys: a stack's header and its tip share a key.
         if let Some(selected) = selected
             && let Some(idx) =
                 (0..v.len()).find(|&i| v.get_item(i).is_some_and(|(_, row)| *row == selected))
@@ -1217,10 +1161,11 @@ mod tests {
     }
 
     #[test]
-    fn a_stack_gets_a_header_with_flat_indented_members() {
+    fn stacked_members_are_flat_rows_linked_by_a_connector() {
         let entries = order_by_stack(vec![
             stacked("D1", &[]),
-            stacked("D3", &["D1"]),
+            stacked("D2", &["D1"]),
+            stacked("D3", &["D1", "D2"]),
             stacked("D9", &[]),
         ]);
         let spinners = Spinners::from([(
@@ -1230,24 +1175,24 @@ mod tests {
                 cancelling: false,
             },
         )]);
-        let rows = build_rows(&entries, 5, 6, &BTreeSet::new(), &BTreeSet::new(), 100, &spinners);
+        let rows = build_rows(&entries, 6, 6, &BTreeSet::new(), 100, &spinners);
 
         assert_eq!(rows.len(), 4);
-        assert!(matches!(&rows[0].1, Row::Stack(k) if k.id == "D3"), "header carries the tip");
-        assert!(matches!(&rows[1].1, Row::Entry(k) if k.id == "D1"));
-        assert!(matches!(&rows[2].1, Row::Entry(k) if k.id == "D3"));
-        assert!(matches!(&rows[3].1, Row::Entry(k) if k.id == "D9"));
+        assert!(rows.iter().all(|(_, r)| matches!(r, Row::Entry(_))), "no header rows");
 
         let plain = |i: usize| rows[i].0.source().to_string();
-        assert!(plain(0).contains("stack of 2 revisions"));
-        // Members sit at the same single indent, unlike the unstacked review below.
-        assert!(plain(1).starts_with(STACK_INDENT));
-        assert!(plain(2).starts_with(STACK_INDENT));
-        assert!(!plain(3).starts_with(STACK_INDENT));
-        // The stack's spinner is on the header only.
-        assert!(plain(0).contains(SPINNER_FRAMES[0]));
-        assert!(!plain(1).contains(SPINNER_FRAMES[0]));
-        assert!(!plain(2).contains(SPINNER_FRAMES[0]));
+        // The connector hangs directly off the id: marker, icon, space, then the id.
+        let id_len = "moz/D1".len();
+        let slot = |i: usize| plain(i).chars().nth(4 + id_len + 1).unwrap().to_string();
+        assert_eq!(slot(0), Link::Bottom.glyph());
+        assert_eq!(slot(1), Link::Middle.glyph());
+        assert_eq!(slot(2), Link::Top.glyph());
+        assert!(plain(3).starts_with("▸   moz/D9 "), "{}", plain(3));
+        // The stack's shared spinner shows on every member, not the unstacked review.
+        for i in 0..3 {
+            assert!(plain(i).contains(SPINNER_FRAMES[0]));
+        }
+        assert!(!plain(3).contains(SPINNER_FRAMES[0]));
     }
 
     #[test]
@@ -1258,29 +1203,23 @@ mod tests {
             stacked("D3", &[]),
         ]);
         let (key_w, author_w) = column_widths(&entries);
-        let rows = build_rows(&entries, key_w, author_w, &BTreeSet::new(), &BTreeSet::new(), 100, &Spinners::new());
+        let rows = build_rows(&entries, key_w, author_w, &BTreeSet::new(), 100, &Spinners::new());
         let author_col: Vec<usize> = rows
             .iter()
             .filter(|(_, r)| matches!(r, Row::Entry(_)))
-            .map(|(l, _)| l.source().find("someone").unwrap())
+            .map(|(l, _)| {
+                let src = l.source();
+                src[..src.find("someone").unwrap()].chars().count()
+            })
             .collect();
         assert_eq!(author_col.len(), 3);
         assert!(author_col.iter().all(|c| *c == author_col[0]), "{author_col:?}");
     }
 
     #[test]
-    fn a_collapsed_stack_shows_only_its_header() {
-        let entries = order_by_stack(vec![stacked("D1", &[]), stacked("D2", &["D1"])]);
-        let collapsed = BTreeSet::from([ReviewKey::new("moz", "D2")]);
-        let rows = build_rows(&entries, 5, 6, &BTreeSet::new(), &collapsed, 100, &Spinners::new());
-        assert_eq!(rows.len(), 1);
-        assert!(matches!(&rows[0].1, Row::Stack(_)));
-    }
-
-    #[test]
     fn collapsed_entries_produce_one_row_each() {
         let entries = vec![entry("D1", None), entry("D2", None)];
-        let rows = build_rows(&entries, 5, 6, &BTreeSet::new(), &BTreeSet::new(), 100, &Spinners::new());
+        let rows = build_rows(&entries, 5, 6, &BTreeSet::new(), 100, &Spinners::new());
         assert_eq!(rows.len(), 2);
         assert!(matches!(&rows[0].1, Row::Entry(k) if k.id == "D1"));
         assert!(matches!(&rows[1].1, Row::Entry(k) if k.id == "D2"));
@@ -1293,7 +1232,7 @@ mod tests {
             entry("D2", None),
         ];
         let expanded = ReviewKey::new("moz", "D1");
-        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([expanded.clone()]), &BTreeSet::new(), 100, &Spinners::new());
+        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([expanded.clone()]), 100, &Spinners::new());
 
         // D1's entry row, its title + blank line, its two diffstat lines, then D2's entry row.
         assert_eq!(rows.len(), 6);
@@ -1312,7 +1251,7 @@ mod tests {
         ];
         let d1 = ReviewKey::new("moz", "D1");
         let d2 = ReviewKey::new("moz", "D2");
-        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([d1.clone(), d2.clone()]), &BTreeSet::new(), 100, &Spinners::new());
+        let rows = build_rows(&entries, 5, 6, &BTreeSet::from([d1.clone(), d2.clone()]), 100, &Spinners::new());
 
         // D1's entry + title/blank + its diffstat line, then the same for D2 - expanding D2 must
         // not have collapsed D1.
@@ -1380,7 +1319,7 @@ mod tests {
         assert_eq!(lines.last().unwrap(), "      ");
 
         let expanded = BTreeSet::from([e.key.clone()]);
-        let rows = build_rows(&[e], 5, 6, &expanded, &BTreeSet::new(), 100, &Spinners::new());
+        let rows = build_rows(&[e], 5, 6, &expanded, 100, &Spinners::new());
         // entry + title/description lines + diffstat line
         assert_eq!(rows.len(), 1 + lines.len() + 1);
     }
@@ -1398,12 +1337,12 @@ mod tests {
     #[test]
     fn a_fetching_row_shows_a_spinner_instead_of_the_workspace_icon() {
         let e = entry("D1", None);
-        let plain = row_label(&e, 5, 6, false, false, None).source().to_string();
+        let plain = row_label(&e, 5, 6, false, None, None).source().to_string();
         let spin = Spin {
             frame: 0,
             cancelling: false,
         };
-        let spinning = row_label(&e, 5, 6, false, false, Some(spin)).source().to_string();
+        let spinning = row_label(&e, 5, 6, false, None, Some(spin)).source().to_string();
         assert!(spinning.contains(SPINNER_FRAMES[0]));
         assert!(!plain.contains(SPINNER_FRAMES[0]));
         assert_eq!(plain.chars().count(), spinning.chars().count());
@@ -1525,7 +1464,7 @@ mod tests {
         ];
         let mut select = SelectView::<Row>::new();
         let expanded = ReviewKey::new("moz", "D1");
-        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded]), &BTreeSet::new(), 100, &Spinners::new()) {
+        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded]), 100, &Spinners::new()) {
             select.add_item(label, row);
         }
         siv.add_layer(select.with_name("reviews"));
@@ -1546,7 +1485,7 @@ mod tests {
         let entries = vec![entry("D1", Some("a.rs | 1 +"))];
         let mut select = SelectView::<Row>::new();
         let expanded = ReviewKey::new("moz", "D1");
-        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded]), &BTreeSet::new(), 100, &Spinners::new()) {
+        for (label, row) in build_rows(&entries, 5, 6, &BTreeSet::from([expanded]), 100, &Spinners::new()) {
             select.add_item(label, row);
         }
         siv.add_layer(select.with_name("reviews"));
@@ -1581,8 +1520,7 @@ mod tests {
             key_w: 5,
             author_w: 6,
             expanded: BTreeSet::new(),
-            collapsed: BTreeSet::new(),
-            pending_shell: None,
+                pending_shell: None,
             fetching: BTreeMap::new(),
         }
     }
