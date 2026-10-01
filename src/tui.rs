@@ -172,11 +172,17 @@ pub fn run(
     // `OnEventView` intercepts the arrow keys before `SelectView`'s own built-in handling sees
     // them, so they go through `move_selection`/`set_expanded` too instead of stopping on a
     // diffstat line or falling through to `SelectView`'s own (unwanted) left/right handling.
+    // `j`/`k`/`h`/`l` must be bound here rather than as global callbacks: those run outside the
+    // view tree, so the enclosing `ScrollView` never scrolls to keep the selection visible.
     let select = OnEventView::new(select.with_name("reviews"))
         .on_event(Key::Down, |s| move_selection(s, true))
+        .on_event('j', |s| move_selection(s, true))
         .on_event(Key::Up, |s| move_selection(s, false))
+        .on_event('k', |s| move_selection(s, false))
         .on_event(Key::Right, |s| set_expanded(s, true))
-        .on_event(Key::Left, |s| set_expanded(s, false));
+        .on_event('l', |s| set_expanded(s, true))
+        .on_event(Key::Left, |s| set_expanded(s, false))
+        .on_event('h', |s| set_expanded(s, false));
 
     let layout = LinearLayout::vertical()
         .child(select.scrollable().full_height())
@@ -191,10 +197,6 @@ pub fn run(
     siv.add_global_callback('d', delete_workspace_selected);
     siv.add_global_callback('f', fetch_selected);
     siv.add_global_callback('r', reload);
-    siv.add_global_callback('j', |s| move_selection(s, true));
-    siv.add_global_callback('k', |s| move_selection(s, false));
-    siv.add_global_callback('l', |s| set_expanded(s, true));
-    siv.add_global_callback('h', |s| set_expanded(s, false));
 
     run_event_loop(siv)
 }
