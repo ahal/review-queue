@@ -45,7 +45,7 @@ use crate::paths::Paths;
 use crate::repo::{NeedsClone, OnMissing};
 use crate::source::ReviewSource;
 use crate::stacks;
-use crate::state::{ReviewEntry, ReviewKey, State};
+use crate::state::{ReviewEntry, ReviewKey, State, Status};
 use crate::sync;
 
 /// Frames for the spinner shown while a review is fetched on a background thread.
@@ -865,9 +865,14 @@ fn open_locally_selected_key(s: &mut Cursive, key: ReviewKey) {
         set_status(s, msg);
         return;
     }
+    // A workspace left `ApplyFailed` doesn't count: `fetch_local` tears it down and rebuilds it,
+    // which on a large repo takes long enough to freeze the UI if run inline.
     let has_workspace = State::load(&ctx.paths.state_file())
         .ok()
-        .is_some_and(|st| st.workspace_for(&key).is_some());
+        .is_some_and(|st| {
+            st.workspace_for(&key)
+                .is_some_and(|ws| ws.status != Status::ApplyFailed)
+        });
 
     if has_workspace {
         // Already fetched - `fetch_local` is a fast, local no-op in this case, so there's

@@ -238,6 +238,12 @@ impl JjVcs {
     }
 
     fn pin(&self, repo: &Path, name: &str, version: &str, head: &str) -> Result<()> {
+        // A stack's version can be a comma-joined list of its patches' versions, and jj parses
+        // bookmark names as revset symbols, so anything outside this set is a syntax error.
+        let version: String = version
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '-' })
+            .collect();
         let bookmark = format!("review-queue/{name}/{version}");
         // `create` errors if the bookmark already exists (e.g. a retried sync); `set` handles
         // that case instead, so this call is idempotent either way.

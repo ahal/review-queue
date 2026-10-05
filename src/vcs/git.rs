@@ -218,6 +218,9 @@ impl Vcs for GitVcs {
         let ws_str = ws.to_string_lossy().to_string();
         let base = self.resolve_target(repo, checkout)?;
 
+        // A failed earlier attempt whose directory was since deleted leaves a registered-but-
+        // missing worktree, which makes `worktree add` at the same path refuse forever.
+        self.run(repo, &["worktree", "prune"])?;
         self.run(repo, &["worktree", "add", "--detach", &ws_str, &base])
             .with_context(|| format!("creating worktree at {}", ws.display()))?;
 
