@@ -345,8 +345,7 @@ fn remove_finished_workspace(
     report: &mut SyncReport,
 ) {
     let vcs = vcs_for(ws.vcs);
-    // Already gone from disk (e.g. removed by hand) - nothing left to clean up, just stop
-    // tracking it rather than flagging it as dirty forever.
+    // Already gone from disk (e.g. removed by hand) - don't flag it as dirty forever.
     let gone = !ws.workspace_path.exists();
     if !gone
         && vcs
@@ -360,7 +359,9 @@ fn remove_finished_workspace(
         return;
     }
     if !dry_run {
-        if !gone && let Err(e) = vcs.remove_workspace(&ws.repo_path, &ws.workspace_path, id) {
+        // Even when the directory is already gone, the parent repo still has the workspace
+        // registered; the backend forgets it.
+        if let Err(e) = vcs.remove_workspace(&ws.repo_path, &ws.workspace_path, id) {
             report.errors.push((ws.tip.clone(), e.to_string()));
             return;
         }
@@ -535,28 +536,32 @@ pub fn remove_workspace(paths: &Paths, key: &ReviewKey, force: bool) -> Result<(
         bail!("`{key}` has no local workspace");
     };
 
-    if ws.workspace_path.exists() {
-        let vcs = vcs_for(ws.vcs);
-        if !force
-            && vcs
-                .is_dirty(&ws.workspace_path, &ws.head_id)
-                .unwrap_or(true)
-        {
-            return Err(WorkspaceDirty {
-                path: ws.workspace_path.clone(),
-            }
-            .into());
+    let vcs = vcs_for(ws.vcs);
+    let exists = ws.workspace_path.exists();
+    if exists
+        && !force
+        && vcs
+            .is_dirty(&ws.workspace_path, &ws.head_id)
+            .unwrap_or(true)
+    {
+        return Err(WorkspaceDirty {
+            path: ws.workspace_path.clone(),
         }
-        if vcs
-            .remove_workspace(&ws.repo_path, &ws.workspace_path, &stack_id)
-            .is_err()
-        {
-            if !force {
-                bail!(
-                    "failed to remove workspace at {}",
-                    ws.workspace_path.display()
-                );
-            }
+        .into());
+    }
+    // Even when the directory is already gone, the parent repo still has the workspace
+    // registered; the backend forgets it.
+    if vcs
+        .remove_workspace(&ws.repo_path, &ws.workspace_path, &stack_id)
+        .is_err()
+    {
+        if !force {
+            bail!(
+                "failed to remove workspace at {}",
+                ws.workspace_path.display()
+            );
+        }
+        if exists {
             std::fs::remove_dir_all(&ws.workspace_path)
                 .with_context(|| format!("removing {}", ws.workspace_path.display()))?;
         }

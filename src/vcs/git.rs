@@ -292,9 +292,15 @@ impl Vcs for GitVcs {
     }
 
     fn remove_workspace(&self, repo: &Path, ws: &Path, name: &str) -> Result<()> {
-        let ws_str = ws.to_string_lossy().to_string();
-        self.run(repo, &["worktree", "remove", &ws_str])
-            .with_context(|| format!("removing worktree at {}", ws.display()))?;
+        if ws.exists() {
+            let ws_str = ws.to_string_lossy().to_string();
+            self.run(repo, &["worktree", "remove", &ws_str])
+                .with_context(|| format!("removing worktree at {}", ws.display()))?;
+        } else {
+            // Already deleted from disk: drop the now-dangling worktree registration.
+            self.run(repo, &["worktree", "prune"])
+                .context("pruning stale worktrees")?;
+        }
 
         let refs = self.run(
             repo,

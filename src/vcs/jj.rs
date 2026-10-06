@@ -417,7 +417,9 @@ impl Vcs for JjVcs {
         let ws_name = Self::workspace_name(name);
         self.run(repo, &["workspace", "forget", &ws_name])
             .with_context(|| format!("forgetting jj workspace `{ws_name}`"))?;
-        std::fs::remove_dir_all(ws).with_context(|| format!("removing {}", ws.display()))?;
+        if ws.exists() {
+            std::fs::remove_dir_all(ws).with_context(|| format!("removing {}", ws.display()))?;
+        }
 
         let prefix = format!("review-queue/{name}/");
         let listing = self.run(repo, &["bookmark", "list"])?;
