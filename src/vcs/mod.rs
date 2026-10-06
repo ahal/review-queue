@@ -72,3 +72,63 @@ pub(crate) fn parse_commit_records(raw: &str) -> Vec<(String, String)> {
         })
         .collect()
 }
+
+/// Render a child process's captured output as plain text. Progress spinners (like moz-phab's)
+/// redraw in place with `\r`, `\b` and ANSI escapes, which is just garbage once captured: apply
+/// the overwrites, drop escape sequences and other control characters.
+pub(crate) fn clean_output(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw);
+    let mut lines = Vec::new();
+    let mut line: Vec<char> = Vec::new();
+    let mut col: usize = 0;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' => {
+                lines.push(std::mem::take(&mut line).into_iter().collect::<String>());
+                col = 0;
+            }
+            '\r' => col = 0,
+            '\u{8}' => col = col.saturating_sub(1),
+            '\u{1b}' => {
+                // CSI sequence: ESC [ params final-byte (0x40..=0x7e).
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for n in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+            }
+            c if c.is_control() || c == '\u{fffd}' => {}
+            c => {
+                if col < line.len() {
+                    line[col] = c;
+                } else {
+                    line.push(c);
+                }
+                col += 1;
+            }
+        }
+    }
+    lines.push(line.into_iter().collect());
+    lines
+        .iter()
+        .map(|l| l.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+#[cfg(test)]
+mod clean_output_tests {
+    use super::clean_output;
+
+    #[test]
+    fn applies_overwrites_and_strips_escapes() {
+        let raw = b"Starting up..  -\x08\\\x08|\nFetching\rDone!!!!\n\x1b[31mred\x1b[0m\n";
+        assert_eq!(clean_output(raw), "Starting up..  |\nDone!!!!\nred");
+    }
+}

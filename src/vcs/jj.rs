@@ -226,8 +226,8 @@ impl JjVcs {
                 "`{program} {}` in {} failed: {}\n{}",
                 args.join(" "),
                 ws.display(),
-                String::from_utf8_lossy(&output.stderr).trim(),
-                String::from_utf8_lossy(&output.stdout).trim(),
+                crate::vcs::clean_output(&output.stderr),
+                crate::vcs::clean_output(&output.stdout),
             );
         }
         Ok(())
