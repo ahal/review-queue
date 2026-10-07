@@ -91,8 +91,8 @@ pub struct ReviewEntry {
     /// changes) but the review itself hasn't resolved yet.
     pub in_queue: bool,
     /// The review itself landed/closed/merged/abandoned (as opposed to just dropping out of your
-    /// queue). A resolved review with no workspace is dropped on the next sync; one with a clean
-    /// workspace has that workspace removed too - dirty workspaces are kept either way.
+    /// queue). A resolved review with no workspace is dropped on the next sync; one with a
+    /// workspace has that workspace removed too, even if it has local changes.
     pub resolved: bool,
     pub last_synced: chrono::DateTime<chrono::Utc>,
     /// Id of the `State::workspaces` entry this review's checked out in, if it's been fetched.

@@ -19,8 +19,7 @@
 //! Finally each existing workspace is reconciled against its stack: reviews newly chained onto a
 //! checked-out stack join its workspace; a workspace whose tip or tip `version` changed is
 //! updated in place if clean (`update_workspace`), or flagged if dirty; one whose reviews have
-//! all resolved is removed if clean (dirty ones are kept, and re-checked on every later sync, so
-//! they clear out on their own once the local changes are gone). This is the only
+//! all resolved is removed, discarding any local changes. This is the only
 //! workspace-removal path; there's no separate prune step.
 //!
 //! `fetch_local()` is the on-demand counterpart - resolving a canonical repo (asking before
@@ -335,7 +334,7 @@ async fn reconcile_workspaces(
 }
 
 /// Every review in this workspace has resolved (or none remain): remove the workspace and its
-/// reviews if it's clean or already gone from disk; keep it, flagged, if it has local changes.
+/// reviews, discarding any local changes.
 fn remove_finished_workspace(
     id: &str,
     ws: &Workspace,
@@ -345,24 +344,20 @@ fn remove_finished_workspace(
     report: &mut SyncReport,
 ) {
     let vcs = vcs_for(ws.vcs);
-    // Already gone from disk (e.g. removed by hand) - don't flag it as dirty forever.
-    let gone = !ws.workspace_path.exists();
-    if !gone
-        && vcs
-            .is_dirty(&ws.workspace_path, &ws.head_id)
-            .unwrap_or(true)
-    {
-        report.flagged.push((
-            ws.tip.clone(),
-            "resolved but has local changes; workspace kept".into(),
-        ));
-        return;
-    }
     if !dry_run {
         // Even when the directory is already gone, the parent repo still has the workspace
         // registered; the backend forgets it.
-        if let Err(e) = vcs.remove_workspace(&ws.repo_path, &ws.workspace_path, id) {
-            report.errors.push((ws.tip.clone(), e.to_string()));
+        // The backend assumes a clean worktree, so finish a dirty one off with a raw removal.
+        if vcs
+            .remove_workspace(&ws.repo_path, &ws.workspace_path, id)
+            .is_err()
+            && ws.workspace_path.exists()
+            && let Err(e) = std::fs::remove_dir_all(&ws.workspace_path)
+        {
+            report.errors.push((
+                ws.tip.clone(),
+                format!("removing {}: {e}", ws.workspace_path.display()),
+            ));
             return;
         }
         state.remove_workspace(id);
