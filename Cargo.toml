@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "Track reviews across Phabricator, GitHub, and other sources; check them out locally as git worktrees or jj workspaces."
 license = "MPL-2.0"
+repository = "https://github.com/ahal/review-queue"
+readme = "README.md"
+keywords = ["code-review", "github", "phabricator", "jj", "git-worktree"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [".claude"]
 
 [[bin]]
 name = "rq"
