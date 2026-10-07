@@ -132,6 +132,9 @@ impl GithubSource {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(NotFound(format!("GET {path} failed: {status} {body}")).into());
+            }
             bail!("GET {path} failed: {status} {body}");
         }
         resp.json::<T>()
@@ -280,17 +283,30 @@ impl ReviewSource for GithubSource {
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
             let (owner, repo, number) = parse_id(id)?;
-            let pr = self.fetch_pull(&owner, &repo, number).await?;
-            let lifecycle = if pr.state == "closed" {
-                Lifecycle::Resolved
-            } else {
-                Lifecycle::Open
+            let lifecycle = match self.fetch_pull(&owner, &repo, number).await {
+                Ok(pr) if pr.state == "closed" => Lifecycle::Resolved,
+                Ok(_) => Lifecycle::Open,
+                // Deleted, transferred, or no longer accessible - don't track it forever.
+                Err(e) if e.is::<NotFound>() => Lifecycle::Resolved,
+                Err(e) => return Err(e),
             };
             out.push((id.clone(), lifecycle));
         }
         Ok(out)
     }
 }
+
+/// A 404 from the GitHub API, kept distinguishable from other request failures.
+#[derive(Debug)]
+struct NotFound(String);
+
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotFound {}
 
 /// `token`, then `token_cmd`, then `$GITHUB_TOKEN`, then `gh auth token`.
 async fn resolve_token(cfg: &GithubConfig) -> Result<Option<String>> {
