@@ -6,7 +6,7 @@ out as git worktrees or jj workspaces.
 ## Install
 
 ```sh
-cargo install --path .
+cargo install review-queue
 ```
 
 ## Usage
