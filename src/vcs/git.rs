@@ -216,6 +216,9 @@ impl Vcs for GitVcs {
         version: &str,
     ) -> Result<String> {
         let ws_str = ws.to_string_lossy().to_string();
+        // Refresh the default branch so `origin/HEAD` (the base for patch stacks) is current.
+        self.run(repo, &["fetch", "origin"])
+            .with_context(|| format!("fetching origin in {}", repo.display()))?;
         let base = self.resolve_target(repo, checkout)?;
 
         // A failed earlier attempt whose directory was since deleted leaves a registered-but-

@@ -298,6 +298,9 @@ impl Vcs for JjVcs {
         name: &str,
         version: &str,
     ) -> Result<String> {
+        // Refresh the default branch so `trunk()` (and revsets like `trunk()..@`) are current.
+        self.run(repo, &["git", "fetch"])
+            .with_context(|| format!("fetching default remote in {}", repo.display()))?;
         let revset = self.resolve_revset(repo, checkout)?;
         let patches = Self::patches_of(checkout);
         let ws_str = ws.to_string_lossy().to_string();
