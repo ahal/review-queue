@@ -242,7 +242,13 @@ impl JjVcs {
         // bookmark names as revset symbols, so anything outside this set is a syntax error.
         let version: String = version
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '-' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .collect();
         let bookmark = format!("review-queue/{name}/{version}");
         // `create` errors if the bookmark already exists (e.g. a retried sync); `set` handles

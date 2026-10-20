@@ -6,6 +6,7 @@ pub mod source;
 pub mod stacks;
 pub mod state;
 pub mod sync;
+pub mod target;
 pub mod tui;
 pub mod vcs;
 pub mod workdir;

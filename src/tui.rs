@@ -4,26 +4,18 @@
 //! intercepted via an `OnEventView` since `SelectView`'s own built-in handling would otherwise
 //! land on those lines like any other row. Left/right (and `h`/`l`) expand/collapse the selected
 //! review's diffstat (fetched by `rq sync` and read straight out of `state.json` - no network
-//! calls here). `o` opens the review in a browser. Enter opens it locally: fetching it on demand
-//! if needed (the same `sync::fetch_local` a plain `rq fetch <id>` runs), then suspending the TUI
-//! to drop the user into a subshell in its worktree (or run the configured `open_command`), resuming once they exit it - see
-//! `run_event_loop` for why that means tearing down and recreating the whole backend rather than
-//! just toggling raw mode. See `crate::sync`'s module docs for why `rq sync` itself never creates
-//! workspaces. `d` deletes the selected review's workspace (`sync::remove_workspace`), confirming
-//! first and always discarding any local changes. Once confirmed the
-//! dialog closes and the deletion runs on a background thread (`begin_delete`) with the same row
-//! spinner as a fetch.
-//!
-//! Fetching a review with no local worktree yet asks to confirm first (`prompt_confirm_fetch`) -
-//! `fetch_local` may clone a repo or shell out to a source's checkout command, either of which
-//! can take a while. Once confirmed the dialog closes and `begin_fetch` runs it on a background
-//! thread so the event loop stays responsive: the review's row shows a spinner (ticked via
-//! `Cursive::cb_sink`) where its workspace icon goes, and `d` on that row cancels. The underlying
-//! `git`/`jj` calls have no cancellation points of their own, so cancelling doesn't interrupt
-//! them - it just detaches from the operation, which keeps running (spinner turns red);
-//! `finish_fetch` still runs when it completes, and removes whatever workspace it created instead
-//! of opening a shell into it. `f` skips both the confirmation and the subshell: it just fetches
-//! (or refreshes) the selected review in the background.
+//! calls here). Enter opens a picker of named targets; `o` opens the browser and `w` fetches
+//! and opens a workspace in `$SHELL`. In the picker, arrows or `j`/`k` navigate, Enter or `l`
+//! runs the selection, and Esc closes it; other characters are ignored. Configured targets run
+//! commands, optionally fetching first
+//! and suspending the TUI until they exit. See `run_event_loop` for why suspension tears down
+//! and recreates the backend. `rq sync` itself never creates workspaces (see `crate::sync`).
+//! `d` deletes the selected workspace after confirmation, discarding local changes, or cancels
+//! an in-flight fetch. Fetching runs on a background thread with a row spinner; choosing a
+//! target is the confirmation to create its workspace. The underlying `git`/`jj` calls cannot
+//! be interrupted, so cancellation detaches from the operation and turns the spinner red.
+//! `finish_fetch` removes newly created workspaces after cancellation. `f` fetches or refreshes
+//! in the background without running a target.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::process::CommandExt;
@@ -47,17 +39,17 @@ use crate::source::ReviewSource;
 use crate::stacks;
 use crate::state::{ReviewEntry, ReviewKey, State, Status};
 use crate::sync;
+use crate::target::{self, Action, Target};
 
 /// Frames for the spinner shown while a review is fetched on a background thread.
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 const HELP: &str = "[?] Help";
 
-const HELP_DIALOG: &str = "↑/↓ or j/k    move
+const HELP_NAVIGATION: &str = "↑/↓ or j/k    move
 ←/→ or h/l    expand/collapse
-enter         open locally
+enter         choose target…
 f             fetch
-o             open in browser
 d             delete workspace
 r             reload
 q / esc       quit
@@ -74,12 +66,13 @@ struct Ctx {
     author_w: usize,
     /// Reviews currently expanded to show their diffstat - any number at once, independently.
     expanded: BTreeSet<ReviewKey>,
-    /// Set by `do_open_locally` on a successful fetch; drained by `run_event_loop`, which is the
-    /// only place actually allowed to touch the terminal/backend to suspend into a subshell.
-    pending_shell: Option<(ReviewKey, PathBuf)>,
+    /// Waiting target command (or `$SHELL`) queued by `launch`, drained by `run_event_loop`,
+    /// which is the only place allowed to suspend the terminal.
+    pending_run: Option<PendingRun>,
+    /// Resolved built-in and configured targets, indexed by the picker and global shortcuts.
+    targets: Arc<Vec<Target>>,
     /// Reviews `begin_fetch` currently has a background fetch running for - guards against
-    /// pressing `enter` on the same review again (and racing two `fetch_local` calls against the
-    /// same workspace path) while its own confirm/progress dialog is already up.
+    /// starting two `fetch_local` calls against the same workspace path.
     fetching: BTreeMap<ReviewKey, Fetch>,
 }
 
@@ -131,6 +124,7 @@ pub fn run(
     sources: Vec<Box<dyn ReviewSource>>,
     all: bool,
 ) -> Result<()> {
+    let targets = Arc::new(target::resolve(&config.targets)?);
     let entries = load_rows(&paths, all)?;
     if entries.is_empty() {
         println!("No reviews tracked yet. Run `rq sync` first.");
@@ -152,7 +146,8 @@ pub fn run(
         key_w,
         author_w,
         expanded: BTreeSet::new(),
-        pending_shell: None,
+        pending_run: None,
+        targets: targets.clone(),
         fetching: BTreeMap::new(),
     });
 
@@ -167,7 +162,7 @@ pub fn run(
     ) {
         select.add_item(label, row);
     }
-    select.set_on_submit(|s, row: &Row| open_locally_selected_key(s, row.key().clone()));
+    select.set_on_submit(|s, row: &Row| show_targets(s, row.key().clone()));
 
     // `OnEventView` intercepts the arrow keys before `SelectView`'s own built-in handling sees
     // them, so they go through `move_selection`/`set_expanded` too instead of stopping on a
@@ -193,7 +188,11 @@ pub fn run(
     siv.add_global_callback('q', |s| s.quit());
     siv.add_global_callback('?', show_help);
     siv.add_global_callback(Key::Esc, |s| s.quit());
-    siv.add_global_callback('o', open_in_browser_selected);
+    for (idx, target) in targets.iter().enumerate() {
+        if let Some(key) = target.key {
+            siv.add_global_callback(key, move |s| run_target_selected(s, idx));
+        }
+    }
     siv.add_global_callback('d', delete_workspace_selected);
     siv.add_global_callback('f', fetch_selected);
     siv.add_global_callback('r', reload);
@@ -212,7 +211,7 @@ pub fn run(
 fn run_event_loop(mut siv: Cursive) -> Result<()> {
     enum Outcome {
         Quit,
-        OpenShell(ReviewKey, PathBuf),
+        OpenShell(PendingRun),
     }
 
     loop {
@@ -222,11 +221,11 @@ fn run_event_loop(mut siv: Cursive) -> Result<()> {
             runner.refresh();
             loop {
                 runner.step();
-                if let Some((key, path)) = runner
+                if let Some(run) = runner
                     .user_data::<Ctx>()
-                    .and_then(|ctx| ctx.pending_shell.take())
+                    .and_then(|ctx| ctx.pending_run.take())
                 {
-                    break Outcome::OpenShell(key, path);
+                    break Outcome::OpenShell(run);
                 }
                 if !runner.is_running() {
                     break Outcome::Quit;
@@ -238,11 +237,11 @@ fn run_event_loop(mut siv: Cursive) -> Result<()> {
 
         match outcome {
             Outcome::Quit => return Ok(()),
-            Outcome::OpenShell(key, path) => {
-                let open_command = siv
-                    .user_data::<Ctx>()
-                    .and_then(|ctx| ctx.config.open_command.clone());
-                let (label, result) = run_open_command(open_command.as_deref(), &key, &path);
+            Outcome::OpenShell(run) => {
+                let (label, mut cmd) = build_command(&run);
+                let result = cmd.status();
+                let key = &run.key;
+                let path = &run.cwd;
                 match result {
                     Ok(status) if status.success() => {
                         set_status(&mut siv, format!("back from {key} ({})", path.display()))
@@ -258,14 +257,18 @@ fn run_event_loop(mut siv: Cursive) -> Result<()> {
     }
 }
 
-/// Builds the configured `open_command` (run via `sh -c`) or, if there is none, an interactive
-/// `$SHELL`, to run in the review's workspace. Returns the command's display name with it.
-fn build_open_command(
-    open_command: Option<&str>,
-    key: &ReviewKey,
-    path: &std::path::Path,
-) -> (String, std::process::Command) {
-    let mut cmd = match open_command {
+/// A target command (or `$SHELL`) and review context waiting for the terminal to suspend.
+struct PendingRun {
+    key: ReviewKey,
+    cwd: PathBuf,
+    workspace: Option<PathBuf>,
+    url: String,
+    command: Option<String>,
+}
+
+/// Builds a target command or an interactive `$SHELL` with the review's environment.
+fn build_command(run: &PendingRun) -> (String, std::process::Command) {
+    let mut cmd = match &run.command {
         Some(script) => {
             let mut cmd = std::process::Command::new("sh");
             cmd.args(["-c", script]);
@@ -276,42 +279,63 @@ fn build_open_command(
             std::process::Command::new(shell)
         }
     };
-    cmd.current_dir(path)
-        .env("RQ_REVIEW", key.slug())
-        .env("RQ_SOURCE", &key.source)
-        .env("RQ_ID", &key.id)
-        .env("RQ_WORKSPACE", path);
-    let label = open_command
-        .map(str::to_string)
+    cmd.current_dir(&run.cwd)
+        .env("RQ_REVIEW", run.key.slug())
+        .env("RQ_SOURCE", &run.key.source)
+        .env("RQ_ID", &run.key.id)
+        .env("RQ_URL", &run.url);
+    if let Some(path) = &run.workspace {
+        cmd.env("RQ_WORKSPACE", path);
+    } else {
+        cmd.env_remove("RQ_WORKSPACE");
+    }
+    let label = run
+        .command
+        .clone()
         .unwrap_or_else(|| cmd.get_program().to_string_lossy().into_owned());
     (label, cmd)
 }
 
-fn run_open_command(
-    open_command: Option<&str>,
-    key: &ReviewKey,
-    path: &std::path::Path,
-) -> (String, std::io::Result<std::process::ExitStatus>) {
-    let (label, mut cmd) = build_open_command(open_command, key, path);
-    let result = cmd.status();
-    (label, result)
-}
-
-/// Opens a fetched workspace: queues it for `run_event_loop` to suspend the TUI around, or - with
-/// `open_command_wait = false` - just starts the command in the background and keeps going.
-fn open_workspace(s: &mut Cursive, key: ReviewKey, path: PathBuf) {
+/// Queues a target for terminal suspension, or starts it detached and reaps it in a thread.
+fn launch(s: &mut Cursive, key: ReviewKey, workspace: Option<PathBuf>, idx: usize) {
     let Some(ctx) = s.user_data::<Ctx>() else {
         return;
     };
-    let detached = match &ctx.config.open_command {
-        Some(cmd) if !ctx.config.open_command_wait => cmd.clone(),
-        _ => {
-            ctx.pending_shell = Some((key, path));
+    let url = State::load(&ctx.paths.state_file())
+        .ok()
+        .and_then(|st| st.get(&key).map(|e| e.url.clone()));
+    let Some(url) = url else {
+        set_status(s, format!("`{key}` is no longer tracked"));
+        return;
+    };
+    let (command, wait) = match &ctx.targets[idx].action {
+        Action::Workspace => (None, true),
+        Action::Command { command, wait, .. } => (Some(command.clone()), *wait),
+        Action::Browser => return,
+    };
+    let cwd = match workspace
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(std::env::current_dir)
+    {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            set_status(s, format!("failed to get current directory: {e}"));
             return;
         }
     };
-
-    let (label, mut cmd) = build_open_command(Some(&detached), &key, &path);
+    let run = PendingRun {
+        key: key.clone(),
+        cwd,
+        workspace,
+        url,
+        command,
+    };
+    if wait {
+        ctx.pending_run = Some(run);
+        return;
+    }
+    let (label, mut cmd) = build_command(&run);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -319,16 +343,16 @@ fn open_workspace(s: &mut Cursive, key: ReviewKey, path: PathBuf) {
         .process_group(0);
     match cmd.spawn() {
         Ok(mut child) => {
-            set_status(s, format!("opened {key} ({})", path.display()));
+            set_status(s, format!("opened {key} ({})", run.cwd.display()));
             // Reap the child so it doesn't linger as a zombie, and surface a failure.
             let sink = s.cb_sink().clone();
             std::thread::spawn(move || {
-                if let Ok(status) = child.wait() {
-                    if !status.success() {
-                        let _ = sink.send(Box::new(move |s| {
-                            set_status(s, format!("`{label}` exited with {status} for {key}"))
-                        }));
-                    }
+                if let Ok(status) = child.wait()
+                    && !status.success()
+                {
+                    let _ = sink.send(Box::new(move |s| {
+                        set_status(s, format!("`{label}` exited with {status} for {key}"))
+                    }));
                 }
             });
         }
@@ -696,11 +720,10 @@ fn vim_keys(dialog: Dialog) -> OnEventView<Dialog> {
 }
 
 fn show_help(s: &mut Cursive) {
-    let dialog = Dialog::text(HELP_DIALOG)
-        .title("Shortcuts")
-        .button("Close", |s| {
-            s.pop_layer();
-        });
+    let text = help_text(&s.user_data::<Ctx>().unwrap().targets);
+    let dialog = Dialog::text(text).title("Shortcuts").button("Close", |s| {
+        s.pop_layer();
+    });
     // Esc would otherwise fall through to the global quit callback.
     s.add_layer(
         vim_keys(dialog)
@@ -713,11 +736,52 @@ fn show_help(s: &mut Cursive) {
     );
 }
 
-fn open_in_browser_selected(s: &mut Cursive) {
-    let Some(key) = selected_key(s) else {
-        return;
-    };
-    open_in_browser(s, &key);
+fn help_text(targets: &[Target]) -> String {
+    let mut text = HELP_NAVIGATION.to_string();
+    for target in targets {
+        if let Some(key) = target.key {
+            text.push_str(&format!("\n{key}             {}", target.description));
+        }
+    }
+    text
+}
+
+fn show_targets(s: &mut Cursive, key: ReviewKey) {
+    let targets = s.user_data::<Ctx>().unwrap().targets.clone();
+    let mut select = SelectView::<usize>::new();
+    for (idx, target) in targets.iter().enumerate() {
+        select.add_item(target.description.clone(), idx);
+    }
+    let submit_key = key.clone();
+    select.set_on_submit(move |s, idx| {
+        s.pop_layer();
+        run_target(s, submit_key.clone(), *idx);
+    });
+    let dialog = OnEventView::new(
+        Dialog::around(select.with_name("targets").scrollable()).title(format!("Open {key}")),
+    )
+    // Consume all characters so target shortcuts and global callbacks stay on the review list.
+    .on_pre_event_inner(
+        |event: &Event| matches!(event, Event::Char(_)),
+        |d, event| {
+            Some(match event {
+                Event::Char('j') => d.on_event(Event::Key(Key::Down)),
+                Event::Char('k') => d.on_event(Event::Key(Key::Up)),
+                Event::Char('l') => d.on_event(Event::Key(Key::Enter)),
+                _ => EventResult::consumed(),
+            })
+        },
+    )
+    .on_event(Key::Esc, |s| {
+        s.pop_layer();
+    });
+    s.add_layer(dialog);
+}
+
+fn run_target_selected(s: &mut Cursive, idx: usize) {
+    if let Some(key) = selected_key(s) {
+        run_target(s, key, idx);
+    }
 }
 
 fn open_in_browser(s: &mut Cursive, key: &ReviewKey) {
@@ -828,7 +892,7 @@ fn finish_delete(s: &mut Cursive, key: ReviewKey, guard: ReviewKey, result: Resu
 }
 
 /// `f`: fetches (or refreshes) the selected review in the background with no confirmation and
-/// without opening a shell - unlike Enter, which confirms first and then opens the workspace.
+/// without running a target.
 fn fetch_selected(s: &mut Cursive) {
     let Some(key) = selected_key(s) else {
         return;
@@ -847,10 +911,24 @@ fn fetch_selected(s: &mut Cursive) {
         set_status(s, msg);
         return;
     }
-    begin_fetch(s, key, on_missing, false);
+    begin_fetch(s, key, on_missing, None);
 }
 
-fn open_locally_selected_key(s: &mut Cursive, key: ReviewKey) {
+fn run_target(s: &mut Cursive, key: ReviewKey, idx: usize) {
+    let action = s.user_data::<Ctx>().unwrap().targets[idx].action.clone();
+    match action {
+        Action::Browser => {
+            open_in_browser(s, &key);
+            return;
+        }
+        Action::Command {
+            workspace: false, ..
+        } => {
+            launch(s, key, None, idx);
+            return;
+        }
+        _ => {}
+    }
     let guard = fetch_guard(s, &key);
     let Some(ctx) = s.user_data::<Ctx>() else {
         return;
@@ -867,43 +945,22 @@ fn open_locally_selected_key(s: &mut Cursive, key: ReviewKey) {
     }
     // A workspace left `ApplyFailed` doesn't count: `fetch_local` tears it down and rebuilds it,
     // which on a large repo takes long enough to freeze the UI if run inline.
-    let has_workspace = State::load(&ctx.paths.state_file())
-        .ok()
-        .is_some_and(|st| {
-            st.workspace_for(&key)
-                .is_some_and(|ws| ws.status != Status::ApplyFailed)
-        });
+    let has_workspace = State::load(&ctx.paths.state_file()).ok().is_some_and(|st| {
+        st.workspace_for(&key)
+            .is_some_and(|ws| ws.status != Status::ApplyFailed)
+    });
 
     if has_workspace {
         // Already fetched - `fetch_local` is a fast, local no-op in this case, so there's
-        // nothing worth showing a confirmation or progress dialog for.
-        do_open_locally(s, key, on_missing);
+        // nothing worth showing a spinner for.
+        do_open_locally(s, key, on_missing, Some(idx));
     } else {
-        prompt_confirm_fetch(s, key, on_missing);
+        begin_fetch(s, key, on_missing, Some(idx));
     }
 }
 
-/// Confirms before fetching a review that has no local worktree yet, since `fetch_local` may
-/// clone a repo or run a source's checkout command - either can take a while. `Proceed` closes
-/// the dialog and hands off to `begin_fetch`, which shows progress in the review's own row.
-fn prompt_confirm_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
-    let dialog = Dialog::text(format!("Create workspace for {key}?"))
-        .title("Fetch review?")
-        .button("Cancel", |s| {
-            s.pop_layer();
-        })
-        .button("Proceed", move |s| {
-            s.pop_layer();
-            begin_fetch(s, key.clone(), on_missing, true);
-        });
-    s.add_layer(vim_keys(dialog));
-}
-
-/// Kicks off `sync::fetch_local` on a background thread; `open_shell` says whether to drop into a
-/// subshell in the workspace once it's done (Enter) or just leave it fetched (`f`). Progress is a spinner in the review's
-/// row where the workspace icon goes (see `row_label`), so the rest of the UI stays usable; `d`
-/// on that row cancels (`cancel_fetch`).
-fn begin_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing, open_shell: bool) {
+/// Fetches in the background, then runs the chosen target if one was requested.
+fn begin_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing, then: Option<usize>) {
     let cancelled = Arc::new(AtomicBool::new(false));
     let guard = fetch_guard(s, &key);
     let Some(ctx) = s.user_data::<Ctx>() else {
@@ -941,15 +998,7 @@ fn begin_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing, open_shel
         ));
         done.store(true, Ordering::SeqCst);
         let _ = cb_sink.send(Box::new(move |s| {
-            finish_fetch(
-                s,
-                worker_key,
-                guard,
-                result,
-                cancelled,
-                open_shell,
-                had_workspace,
-            )
+            finish_fetch(s, worker_key, guard, result, cancelled, then, had_workspace)
         }));
     });
 }
@@ -1047,7 +1096,7 @@ fn finish_fetch(
     guard: ReviewKey,
     result: Result<PathBuf>,
     cancelled: Arc<AtomicBool>,
-    open_shell: bool,
+    then: Option<usize>,
     had_workspace: bool,
 ) {
     if let Some(ctx) = s.user_data::<Ctx>() {
@@ -1074,15 +1123,15 @@ fn finish_fetch(
 
     match result {
         Ok(path) => {
-            if open_shell {
-                open_workspace(s, key, path);
+            if let Some(idx) = then {
+                launch(s, key, Some(path), idx);
             } else {
                 set_status(s, format!("fetched {key} ({})", path.display()));
             }
             reload(s);
         }
         Err(e) => match e.downcast::<NeedsClone>() {
-            Ok(needs_clone) => prompt_clone(s, key, needs_clone.url, needs_clone.dest, open_shell),
+            Ok(needs_clone) => prompt_clone(s, key, needs_clone.url, needs_clone.dest, then),
             Err(e) => {
                 set_status(s, format!("error fetching {key}: {e:#}"));
                 reload(s);
@@ -1091,7 +1140,7 @@ fn finish_fetch(
     }
 }
 
-fn do_open_locally(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
+fn do_open_locally(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing, then: Option<usize>) {
     let outcome = s.user_data::<Ctx>().map(|ctx| {
         tokio::task::block_in_place(|| {
             ctx.handle.clone().block_on(sync::fetch_local(
@@ -1110,11 +1159,13 @@ fn do_open_locally(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
         // subshell only gets launched by `run_event_loop`, which alone is allowed to tear down
         // the backend.
         Some(Ok(path)) => {
-            open_workspace(s, key, path);
+            if let Some(idx) = then {
+                launch(s, key, Some(path), idx);
+            }
             reload(s);
         }
         Some(Err(e)) => match e.downcast::<NeedsClone>() {
-            Ok(needs_clone) => prompt_clone(s, key, needs_clone.url, needs_clone.dest, true),
+            Ok(needs_clone) => prompt_clone(s, key, needs_clone.url, needs_clone.dest, then),
             Err(e) => {
                 set_status(s, format!("error fetching {key}: {e:#}"));
                 reload(s);
@@ -1126,7 +1177,7 @@ fn do_open_locally(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing) {
 
 /// Raw stdin can't be read while cursive owns the screen, so the CLI's `Y/n/always` prompt
 /// becomes a dialog here instead.
-fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf, open_shell: bool) {
+fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf, then: Option<usize>) {
     let yes_key = key.clone();
     let always_key = key.clone();
     let dialog = Dialog::text(format!(
@@ -1140,7 +1191,7 @@ fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf, ope
     })
     .button("Yes", move |s| {
         s.pop_layer();
-        begin_fetch(s, yes_key.clone(), OnMissing::Clone, open_shell);
+        begin_fetch(s, yes_key.clone(), OnMissing::Clone, then);
     })
     .button("Always", move |s| {
         s.pop_layer();
@@ -1155,7 +1206,7 @@ fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf, ope
             set_status(s, format!("failed to save auto_clone: {e:#}"));
             return;
         }
-        begin_fetch(s, always_key.clone(), OnMissing::Clone, open_shell);
+        begin_fetch(s, always_key.clone(), OnMissing::Clone, then);
     });
     s.add_layer(vim_keys(dialog));
 }
@@ -1238,6 +1289,171 @@ mod tests {
             diff_stat: diff_stat.map(String::from),
             description: None,
         }
+    }
+
+    fn command_targets() -> Arc<Vec<Target>> {
+        let config: Config = toml::from_str(
+            r#"
+[targets.url]
+description = "Write URL"
+command = "echo $RQ_URL"
+workspace = false
+key = "u"
+"#,
+        )
+        .unwrap();
+        Arc::new(target::resolve(&config.targets).unwrap())
+    }
+
+    #[tokio::test]
+    async fn enter_opens_picker_and_shortcut_queues_command_without_fetching() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut siv = cursive::dummy();
+        let mut ctx = ctx_with_state(tmp.path(), vec![entry("D1", None)]);
+        ctx.targets = command_targets();
+        siv.set_user_data(ctx);
+        let key = ReviewKey::new("moz", "D1");
+        let mut reviews = SelectView::<Row>::new();
+        reviews.add_item("D1", Row::Entry(key.clone()));
+        reviews.set_on_submit(|s, row: &Row| show_targets(s, row.key().clone()));
+        siv.add_layer(reviews.with_name("reviews"));
+        siv.add_global_callback('u', |s| run_target_selected(s, 2));
+        siv.add_global_callback('q', |s| s.quit());
+        for ch in ['d', 'f', 'r', '?', 'o', 'w', 'h', 'x', 'λ'] {
+            siv.add_global_callback(ch, |_| {
+                panic!("picker leaked a character to a global callback")
+            });
+        }
+        siv.runner().refresh();
+        siv.on_event(Event::Key(Key::Enter));
+        assert_eq!(siv.screen().len(), 2);
+        let labels = siv
+            .call_on_name("targets", |v: &mut SelectView<usize>| {
+                v.iter()
+                    .map(|(label, _)| label.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        assert_eq!(
+            labels,
+            ["Open in browser", "Open in workspace", "Write URL"]
+        );
+        siv.runner().refresh();
+        for ch in ['u', 'q', 'd', 'f', 'r', '?', 'o', 'w', 'h', 'x', 'λ'] {
+            siv.on_event(Event::Char(ch));
+            assert_eq!(siv.screen().len(), 2);
+            assert!(siv.is_running());
+            assert_eq!(
+                siv.call_on_name("targets", |v: &mut SelectView<usize>| v.selected_id())
+                    .unwrap(),
+                Some(0)
+            );
+            let ctx = siv.user_data::<Ctx>().unwrap();
+            assert!(ctx.pending_run.is_none());
+            assert!(ctx.fetching.is_empty());
+        }
+        siv.on_event(Event::Key(Key::Esc));
+        assert_eq!(siv.screen().len(), 1);
+        assert!(siv.is_running());
+        siv.on_event(Event::Char('u'));
+        assert_eq!(siv.screen().len(), 1);
+        let ctx = siv.user_data::<Ctx>().unwrap();
+        assert!(ctx.fetching.is_empty());
+        let run = ctx.pending_run.as_ref().unwrap();
+        assert_eq!(run.key, key);
+        assert_eq!(run.command.as_deref(), Some("echo $RQ_URL"));
+        assert_eq!(run.url, "https://example.com/D1");
+        assert_eq!(run.cwd, std::env::current_dir().unwrap());
+        assert!(run.workspace.is_none());
+        let (_, command) = build_command(run);
+        assert!(command.get_envs().any(|(key, value)| key == "RQ_URL"
+            && value == Some(std::ffi::OsStr::new("https://example.com/D1"))));
+    }
+
+    #[tokio::test]
+    async fn picker_navigation_enter_and_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut siv = cursive::dummy();
+        let mut ctx = ctx_with_state(tmp.path(), vec![entry("D1", None)]);
+        ctx.targets = command_targets();
+        siv.set_user_data(ctx);
+        siv.add_layer(TextView::new("reviews"));
+        siv.add_global_callback(Key::Esc, |s| s.quit());
+        let key = ReviewKey::new("moz", "D1");
+        show_targets(&mut siv, key.clone());
+        siv.runner().refresh();
+        siv.on_event(Event::Char('j'));
+        siv.on_event(Event::Key(Key::Down));
+        siv.on_event(Event::Key(Key::Up));
+        siv.on_event(Event::Char('j'));
+        siv.on_event(Event::Char('k'));
+        assert_eq!(
+            siv.call_on_name("targets", |v: &mut SelectView<usize>| v.selected_id())
+                .unwrap(),
+            Some(1)
+        );
+        siv.on_event(Event::Key(Key::Esc));
+        assert_eq!(siv.screen().len(), 1);
+        assert!(siv.is_running());
+        assert!(siv.user_data::<Ctx>().unwrap().pending_run.is_none());
+        for submit in [Event::Key(Key::Enter), Event::Char('l')] {
+            show_targets(&mut siv, key.clone());
+            siv.runner().refresh();
+            siv.on_event(Event::Char('j'));
+            siv.on_event(Event::Char('j'));
+            siv.on_event(submit);
+            assert_eq!(siv.screen().len(), 1);
+            assert!(siv.is_running());
+            let ctx = siv.user_data::<Ctx>().unwrap();
+            assert!(ctx.fetching.is_empty());
+            let run = ctx.pending_run.take().unwrap();
+            assert_eq!(run.key, key);
+            assert_eq!(run.command.as_deref(), Some("echo $RQ_URL"));
+        }
+    }
+
+    #[test]
+    fn command_environment_and_shell_fallback() {
+        let mut run = PendingRun {
+            key: ReviewKey::new("moz", "D1"),
+            cwd: PathBuf::from("/tmp"),
+            workspace: Some(PathBuf::from("/tmp")),
+            url: "https://example.com/D1".into(),
+            command: Some("echo hello".into()),
+        };
+        let (_, cmd) = build_command(&run);
+        assert_eq!(cmd.get_program(), "sh");
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["-c", "echo hello"]);
+        assert_eq!(cmd.get_current_dir(), Some(std::path::Path::new("/tmp")));
+        let vars: BTreeMap<_, _> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_str().unwrap(), v.map(|v| v.to_str().unwrap())))
+            .collect();
+        assert_eq!(vars["RQ_REVIEW"], Some("moz/D1"));
+        assert_eq!(vars["RQ_SOURCE"], Some("moz"));
+        assert_eq!(vars["RQ_ID"], Some("D1"));
+        assert_eq!(vars["RQ_URL"], Some("https://example.com/D1"));
+        assert_eq!(vars["RQ_WORKSPACE"], Some("/tmp"));
+        run.command = None;
+        run.workspace = None;
+        let (_, cmd) = build_command(&run);
+        assert_eq!(
+            cmd.get_program(),
+            std::ffi::OsStr::new(&std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()))
+        );
+        assert!(cmd.get_args().next().is_none());
+        assert!(
+            cmd.get_envs()
+                .any(|(k, v)| k == "RQ_WORKSPACE" && v.is_none())
+        );
+    }
+
+    #[test]
+    fn help_includes_custom_bound_targets() {
+        let text = help_text(&command_targets());
+        assert!(text.contains("choose target…"));
+        assert!(text.contains("u             Write URL"));
+        assert!(text.contains("o             Open in browser"));
     }
 
     fn stacked(id: &str, ancestors: &[&str]) -> ReviewEntry {
@@ -1686,7 +1902,8 @@ mod tests {
             key_w: 5,
             author_w: 6,
             expanded: BTreeSet::new(),
-            pending_shell: None,
+            pending_run: None,
+            targets: Arc::new(target::resolve(&BTreeMap::new()).unwrap()),
             fetching: BTreeMap::new(),
         }
     }

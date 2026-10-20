@@ -1,8 +1,9 @@
 //! `config.toml` schema: review sources and where canonical repos live.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,20 +18,49 @@ pub struct Config {
     /// `workdir`. Set by answering "always" to the clone prompt (see `set_auto_clone`).
     #[serde(default)]
     pub auto_clone: bool,
-    /// Shell command to run in a review's workspace instead of an interactive `$SHELL` when it's
-    /// opened locally from the TUI. Run via `sh -c` with the workspace as cwd; the review is
-    /// described by `RQ_REVIEW` (`source/id`), `RQ_SOURCE`, `RQ_ID` and `RQ_WORKSPACE`.
     #[serde(default)]
-    pub open_command: Option<String>,
-    /// Whether rq suspends its TUI until `open_command` exits (the default). Set to `false` for
-    /// commands that hand off elsewhere and return - e.g. switching a tmux client - so rq keeps
-    /// running, with the command's stdio detached. Ignored without `open_command`: the fallback
-    /// `$SHELL` needs the terminal.
-    #[serde(default = "default_true")]
-    pub open_command_wait: bool,
+    pub targets: BTreeMap<String, TargetConfig>,
 
     #[serde(default)]
     pub source: SourcesConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "RawTargetConfig")]
+pub struct TargetConfig {
+    pub description: Option<String>,
+    pub command: Option<String>,
+    pub key: Option<String>,
+    pub workspace: bool,
+    pub wait: bool,
+    // Built-ins must reject explicit workspace/wait fields, even when set to their defaults.
+    #[serde(skip)]
+    pub(crate) has_command_options: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTargetConfig {
+    description: Option<String>,
+    command: Option<String>,
+    key: Option<String>,
+    workspace: Option<bool>,
+    wait: Option<bool>,
+}
+
+impl From<RawTargetConfig> for TargetConfig {
+    fn from(raw: RawTargetConfig) -> Self {
+        Self {
+            has_command_options: raw.command.is_some()
+                || raw.workspace.is_some()
+                || raw.wait.is_some(),
+            description: raw.description,
+            command: raw.command,
+            key: raw.key,
+            workspace: raw.workspace.unwrap_or(true),
+            wait: raw.wait.unwrap_or(true),
+        }
+    }
 }
 
 /// Each source is a fixed, hardcoded slot (`[source.github]`, `[source.moz-phab]`) rather than a
@@ -91,7 +121,7 @@ fn default_true() -> bool {
 
 impl Default for Config {
     fn default() -> Self {
-        // Go through serde so the field defaults (e.g. `open_command_wait`) live in one place.
+        // Go through serde so the field defaults live in one place.
         toml::from_str("").expect("an empty config is valid")
     }
 }
@@ -103,9 +133,15 @@ impl Config {
         }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
+        let raw: toml::Value =
+            toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+        if raw.get("open_command").is_some() || raw.get("open_command_wait").is_some() {
+            bail!("open_command / open_command_wait replaced by `[targets.<id>]`, see README");
+        }
         let mut config: Config =
             toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
 
+        crate::target::resolve(&config.targets)?;
         config.data_dir = config.data_dir.map(|p| expand_tilde(&p));
         config.workdir = config.workdir.map(|p| expand_tilde(&p));
         Ok(config)
@@ -164,20 +200,64 @@ ignore_repos = ["mozilla/some-noisy-repo"]
         );
         assert_eq!(cfg.workdir, Some(PathBuf::from("~/dev")));
         assert!(!cfg.auto_clone);
-        assert!(cfg.open_command.is_none());
-        assert!(cfg.open_command_wait, "blocking is the default");
     }
 
     #[test]
-    fn open_command_wait_can_be_disabled() {
-        let cfg: Config = toml::from_str("open_command_wait = false").unwrap();
-        assert!(!cfg.open_command_wait);
+    fn parses_targets() {
+        let cfg: Config = toml::from_str(
+            r#"
+[targets.diffview]
+description = "Diffview"
+command = "nvim +DiffviewOpen"
+key = "v"
+"#,
+        )
+        .unwrap();
+        let target = &cfg.targets["diffview"];
+        assert_eq!(target.command.as_deref(), Some("nvim +DiffviewOpen"));
+        assert!(target.workspace);
+        assert!(target.wait);
     }
 
     #[test]
-    fn parses_open_command() {
-        let cfg: Config = toml::from_str(r#"open_command = "nvim +DiffviewOpen""#).unwrap();
-        assert_eq!(cfg.open_command.as_deref(), Some("nvim +DiffviewOpen"));
+    fn rejects_unknown_target_fields() {
+        let err = toml::from_str::<Config>(
+            r#"
+[targets.diffview]
+command = "nvim +DiffviewOpen"
+keys = "v"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `keys`"));
+    }
+
+    #[test]
+    fn old_open_options_require_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        for text in [r#"open_command = "nvim""#, "open_command_wait = false"] {
+            std::fs::write(&path, text).unwrap();
+            assert!(
+                Config::load(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("replaced by `[targets.<id>]`, see README")
+            );
+        }
+    }
+
+    #[test]
+    fn load_validates_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[targets.browser]\nworkspace = true").unwrap();
+        assert!(
+            Config::load(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("built-in target")
+        );
     }
 
     #[test]
