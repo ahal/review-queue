@@ -272,15 +272,19 @@ fn print_sync_report(report: &SyncReport, dry_run: bool) {
     for (key, err) in &report.errors {
         eprintln!("error syncing {key}: {err}");
     }
+    for (source, err) in &report.source_errors {
+        eprintln!("error syncing source `{source}`: {err}");
+    }
     if report.added.is_empty()
         && report.updated.is_empty()
         && report.removed.is_empty()
         && report.flagged.is_empty()
         && report.errors.is_empty()
+        && report.source_errors.is_empty()
     {
         println!("Nothing to do.");
     }
-    if !report.errors.is_empty() {
+    if !report.errors.is_empty() || !report.source_errors.is_empty() {
         std::process::exit(1);
     }
 }

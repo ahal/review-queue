@@ -54,6 +54,8 @@ pub struct SyncReport {
     /// Review + human-readable reason it was flagged instead of touched (dirty, apply failure).
     pub flagged: Vec<(ReviewKey, String)>,
     pub errors: Vec<(ReviewKey, String)>,
+    /// Source name + error for a source that failed as a whole; its reviews are left as-is.
+    pub source_errors: Vec<(String, String)>,
 }
 
 fn vcs_for(kind: VcsKind) -> Box<dyn Vcs> {
@@ -73,18 +75,33 @@ pub async fn sync(
     let mut state = State::load(&paths.state_file())?;
     let mut report = SyncReport::default();
     let mut seen: BTreeSet<ReviewKey> = BTreeSet::new();
+    let mut failed_sources: BTreeSet<&str> = BTreeSet::new();
 
     for source in sources {
         if only_source.is_some_and(|o| o != source.name()) {
             continue;
         }
-        let queue = source
-            .fetch_queue()
-            .await
-            .with_context(|| format!("fetching queue from `{}`", source.name()))?;
-        for review in queue {
+        let queue = match source.fetch_queue().await {
+            Ok(queue) => queue,
+            Err(e) => {
+                // Without its queue there's no telling which of its reviews left it, so don't
+                // check any of their statuses either.
+                failed_sources.insert(source.name());
+                report
+                    .source_errors
+                    .push((source.name().to_string(), format!("fetching queue: {e:#}")));
+                continue;
+            }
+        };
+        for review in queue.reviews {
             seen.insert(review.key.clone());
             record_review(&review, &mut state, &mut report);
+        }
+        // Still in the queue, just not fetchable right now: leave its state as it was rather
+        // than treating it as having left the queue.
+        for (key, err) in queue.errors {
+            seen.insert(key.clone());
+            report.errors.push((key, err));
         }
     }
 
@@ -95,7 +112,9 @@ pub async fn sync(
         if seen.contains(&entry.key) {
             continue;
         }
-        if only_source.is_some_and(|o| o != entry.key.source) {
+        if only_source.is_some_and(|o| o != entry.key.source)
+            || failed_sources.contains(entry.key.source.as_str())
+        {
             continue;
         }
         ids_by_source
@@ -108,13 +127,21 @@ pub async fn sync(
         let Some(source) = sources_by_name.get(source_name.as_str()) else {
             continue;
         };
-        let statuses = source
-            .fetch_status(&ids)
-            .await
-            .with_context(|| format!("checking status from `{source_name}`"))?;
+        let statuses = match source.fetch_status(&ids).await {
+            Ok(statuses) => statuses,
+            Err(e) => {
+                report
+                    .source_errors
+                    .push((source_name, format!("checking status: {e:#}")));
+                continue;
+            }
+        };
         for (id, lifecycle) in statuses {
             let key = ReviewKey::new(source_name.clone(), id);
-            handle_out_of_queue(&key, lifecycle, &mut state, &mut report);
+            match lifecycle {
+                Ok(lifecycle) => handle_out_of_queue(&key, lifecycle, &mut state, &mut report),
+                Err(err) => report.errors.push((key, err)),
+            }
         }
     }
 
@@ -582,6 +609,7 @@ mod tests {
 
     use super::*;
     use crate::config::GithubConfig;
+    use crate::source::Queue;
     use crate::source::github::GithubSource;
 
     fn git(dir: &Path, args: &[&str]) {
@@ -773,6 +801,52 @@ mod tests {
         // Nothing was cloned or registered either - that only happens on `fetch_local`.
         assert!(!paths.repos_file().exists());
         assert!(!paths.repos_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn inaccessible_pr_is_reported_and_left_untouched() {
+        let repos = make_repos();
+        let sha = git_rev_parse(&repos.fork, "HEAD");
+        let server = MockServer::start().await;
+        mount_search(&server, true).await;
+        mount_pull(
+            &server,
+            pull_json("moz", "proj", &repos.upstream, &repos.fork, &sha, "open"),
+        )
+        .await;
+
+        let work_tmp = TempDir::new().unwrap();
+        let paths = paths_in(work_tmp.path());
+        let key = ReviewKey::new("gh", "moz/proj/1");
+        sync(&[github_source(&server)], &paths, None, false)
+            .await
+            .unwrap();
+        drop(server);
+
+        // Still in the queue, then out of it, with the PR itself forbidden both times.
+        for in_queue in [true, false] {
+            let server = MockServer::start().await;
+            mount_search(&server, in_queue).await;
+            Mock::given(method("GET"))
+                .and(path("/repos/moz/proj/pulls/1"))
+                .respond_with(ResponseTemplate::new(403).set_body_string("SAML enforcement"))
+                .mount(&server)
+                .await;
+
+            let report = sync(&[github_source(&server)], &paths, None, false)
+                .await
+                .unwrap();
+
+            assert_eq!(report.errors.len(), 1, "in_queue={in_queue}");
+            assert_eq!(report.errors[0].0, key);
+            assert!(report.errors[0].1.contains("403"), "{}", report.errors[0].1);
+            assert!(report.removed.is_empty());
+            let state = State::load(&paths.state_file()).unwrap();
+            let entry = state.get(&key).unwrap();
+            assert!(entry.in_queue, "in_queue={in_queue}");
+            assert!(!entry.resolved);
+            assert_eq!(entry.version, sha);
+        }
     }
 
     #[tokio::test]
@@ -1293,8 +1367,11 @@ mod tests {
             "stk"
         }
 
-        async fn fetch_queue(&self) -> Result<Vec<Review>> {
-            Ok(self.queue.lock().unwrap().clone())
+        async fn fetch_queue(&self) -> Result<Queue> {
+            Ok(Queue {
+                reviews: self.queue.lock().unwrap().clone(),
+                ..Default::default()
+            })
         }
 
         async fn checkout_spec(
@@ -1314,9 +1391,12 @@ mod tests {
             })
         }
 
-        async fn fetch_status(&self, ids: &[String]) -> Result<Vec<(String, Lifecycle)>> {
+        async fn fetch_status(
+            &self,
+            ids: &[String],
+        ) -> Result<Vec<(String, std::result::Result<Lifecycle, String>)>> {
             let lifecycle = *self.lifecycle.lock().unwrap();
-            Ok(ids.iter().map(|id| (id.clone(), lifecycle)).collect())
+            Ok(ids.iter().map(|id| (id.clone(), Ok(lifecycle))).collect())
         }
 
         fn is_commit_for(&self, review: &ReviewKey, message: &str) -> bool {
@@ -1340,6 +1420,53 @@ mod tests {
 
     fn stk(n: u32) -> ReviewKey {
         ReviewKey::new("stk", format!("D{n}"))
+    }
+
+    #[tokio::test]
+    async fn failed_source_is_reported_and_other_sources_still_sync() {
+        let repos = make_repos();
+        let sha = git_rev_parse(&repos.fork, "HEAD");
+        let server = MockServer::start().await;
+        mount_search(&server, true).await;
+        mount_pull(
+            &server,
+            pull_json("moz", "proj", &repos.upstream, &repos.fork, &sha, "open"),
+        )
+        .await;
+        let work_tmp = TempDir::new().unwrap();
+        let paths = paths_in(work_tmp.path());
+        let gh_key = ReviewKey::new("gh", "moz/proj/1");
+        sync(&[github_source(&server)], &paths, None, false)
+            .await
+            .unwrap();
+        drop(server);
+
+        // Every GitHub request now fails, including the status check for the tracked PR.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let stack = StackSource::new(&repos.upstream);
+        stack.set_queue(vec![stack.review(1, &[], "1")]);
+        let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server), Box::new(stack)];
+
+        let report = sync(&sources, &paths, None, false).await.unwrap();
+
+        assert_eq!(report.source_errors.len(), 1);
+        assert_eq!(report.source_errors[0].0, "gh");
+        assert!(
+            report.source_errors[0].1.contains("500"),
+            "{}",
+            report.source_errors[0].1
+        );
+        assert_eq!(report.added, vec![stk(1)]);
+        assert!(report.errors.is_empty());
+        let state = State::load(&paths.state_file()).unwrap();
+        let entry = state.get(&gh_key).unwrap();
+        assert!(entry.in_queue);
+        assert!(!entry.resolved);
+        assert_eq!(entry.version, sha);
     }
 
     #[tokio::test]

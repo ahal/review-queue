@@ -43,7 +43,7 @@ use crate::config::GithubConfig;
 use crate::repo::normalize_url;
 use crate::source::diffstat::{FileChange, format_diffstat, format_summary};
 use crate::source::{
-    Checkout, ForkRef, Lifecycle, RepoRef, Review, ReviewKey, ReviewKind, ReviewSource,
+    Checkout, ForkRef, Lifecycle, Queue, RepoRef, Review, ReviewKey, ReviewKind, ReviewSource,
 };
 
 const DEFAULT_API_BASE: &str = "https://api.github.com";
@@ -230,7 +230,7 @@ impl ReviewSource for GithubSource {
         NAME
     }
 
-    async fn fetch_queue(&self) -> Result<Vec<Review>> {
+    async fn fetch_queue(&self) -> Result<Queue> {
         if self.token.is_none() {
             bail!(
                 "GitHub source needs a token to search `@me` - configure `token`/`token_cmd`, \
@@ -239,7 +239,7 @@ impl ReviewSource for GithubSource {
         }
 
         let q = self.build_query();
-        let mut reviews = Vec::new();
+        let mut queue = Queue::default();
         let mut page = 1u32;
         loop {
             let per_page_str = self.search_per_page.to_string();
@@ -253,15 +253,25 @@ impl ReviewSource for GithubSource {
             let count = resp.items.len();
             for item in &resp.items {
                 let (owner, repo, number) = parse_pr_url(&item.html_url)?;
-                let pr = self.fetch_pull(&owner, &repo, number).await?;
-                reviews.push(self.review_from_pull(&owner, &repo, &pr).await?);
+                let review = match self.fetch_pull(&owner, &repo, number).await {
+                    Ok(pr) => self.review_from_pull(&owner, &repo, &pr).await,
+                    Err(e) => Err(e),
+                };
+                match review {
+                    Ok(review) => queue.reviews.push(review),
+                    // e.g. a 403 from an org's SAML enforcement - skip just this PR.
+                    Err(e) => queue.errors.push((
+                        ReviewKey::new(NAME, format!("{owner}/{repo}/{number}")),
+                        e.to_string(),
+                    )),
+                }
             }
             if count < self.search_per_page as usize || page >= 10 {
                 break;
             }
             page += 1;
         }
-        Ok(reviews)
+        Ok(queue)
     }
 
     async fn checkout_spec(
@@ -279,7 +289,10 @@ impl ReviewSource for GithubSource {
         })
     }
 
-    async fn fetch_status(&self, ids: &[String]) -> Result<Vec<(String, Lifecycle)>> {
+    async fn fetch_status(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<(String, std::result::Result<Lifecycle, String>)>> {
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
             let (owner, repo, number) = parse_id(id)?;
@@ -288,9 +301,12 @@ impl ReviewSource for GithubSource {
                 Ok(_) => Lifecycle::Open,
                 // Deleted, transferred, or no longer accessible - don't track it forever.
                 Err(e) if e.is::<NotFound>() => Lifecycle::Resolved,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    out.push((id.clone(), Err(e.to_string())));
+                    continue;
+                }
             };
-            out.push((id.clone(), lifecycle));
+            out.push((id.clone(), Ok(lifecycle)));
         }
         Ok(out)
     }
@@ -559,7 +575,7 @@ mod tests {
             .await;
 
         let src = GithubSource::for_test(cfg(), Some("t".into()), server.uri(), SEARCH_PER_PAGE);
-        let reviews = src.fetch_queue().await.unwrap();
+        let reviews = src.fetch_queue().await.unwrap().reviews;
 
         assert_eq!(reviews.len(), 1);
         let r = &reviews[0];
@@ -685,7 +701,7 @@ mod tests {
 
         // per_page=1 so each mocked page has exactly one item, forcing the loop to page 3.
         let src = GithubSource::for_test(cfg(), Some("t".into()), server.uri(), 1);
-        let reviews = src.fetch_queue().await.unwrap();
+        let reviews = src.fetch_queue().await.unwrap().reviews;
         assert_eq!(reviews.len(), 2);
     }
 
@@ -852,11 +868,11 @@ mod tests {
 
         assert_eq!(
             statuses[0],
-            ("mozilla/gecko-dev/1".to_string(), Lifecycle::Open)
+            ("mozilla/gecko-dev/1".to_string(), Ok(Lifecycle::Open))
         );
         assert_eq!(
             statuses[1],
-            ("mozilla/gecko-dev/2".to_string(), Lifecycle::Resolved)
+            ("mozilla/gecko-dev/2".to_string(), Ok(Lifecycle::Resolved))
         );
     }
 

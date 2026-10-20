@@ -113,7 +113,9 @@ use serde_json::{Value, json};
 
 use crate::config::MozPhabConfig;
 use crate::source::diffstat::{FileChange, format_diffstat};
-use crate::source::{Checkout, Lifecycle, RepoRef, Review, ReviewKey, ReviewKind, ReviewSource};
+use crate::source::{
+    Checkout, Lifecycle, Queue, RepoRef, Review, ReviewKey, ReviewKind, ReviewSource,
+};
 
 /// This source's hardcoded id-namespace prefix - see [`crate::state::ReviewKey`].
 pub const NAME: &str = "phab";
@@ -495,7 +497,7 @@ impl ReviewSource for MozPhabSource {
         NAME
     }
 
-    async fn fetch_queue(&self) -> Result<Vec<Review>> {
+    async fn fetch_queue(&self) -> Result<Queue> {
         let who: WhoAmI = self.call("user.whoami", json!({})).await?;
         let my_phid = who.phid;
 
@@ -598,7 +600,10 @@ impl ReviewSource for MozPhabSource {
                 ancestors,
             });
         }
-        Ok(reviews)
+        Ok(Queue {
+            reviews,
+            ..Default::default()
+        })
     }
 
     async fn checkout_spec(&self, review: &Review, canonical_repo: &Path) -> Result<Checkout> {
@@ -628,7 +633,10 @@ impl ReviewSource for MozPhabSource {
         commit_message_is_for(message, &review.id)
     }
 
-    async fn fetch_status(&self, ids: &[String]) -> Result<Vec<(String, Lifecycle)>> {
+    async fn fetch_status(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<(String, std::result::Result<Lifecycle, String>)>> {
         let numeric_ids: Vec<u64> = ids.iter().map(|s| parse_id(s)).collect::<Result<_>>()?;
         let revisions: Vec<RevisionItem> = self
             .search_all(
@@ -647,7 +655,7 @@ impl ReviewSource for MozPhabSource {
                 // Vanished entirely (e.g. lost access) - don't track it forever.
                 None => Lifecycle::Resolved,
             };
-            out.push((id_str.clone(), lifecycle));
+            out.push((id_str.clone(), Ok(lifecycle)));
         }
         Ok(out)
     }
@@ -1187,12 +1195,12 @@ mod tests {
         ];
         let statuses = src.fetch_status(&ids).await.unwrap();
 
-        assert_eq!(statuses[0], ("D1".to_string(), Lifecycle::Resolved));
-        assert_eq!(statuses[1], ("D2".to_string(), Lifecycle::Open));
-        assert_eq!(statuses[2], ("D3".to_string(), Lifecycle::Resolved));
+        assert_eq!(statuses[0], ("D1".to_string(), Ok(Lifecycle::Resolved)));
+        assert_eq!(statuses[1], ("D2".to_string(), Ok(Lifecycle::Open)));
+        assert_eq!(statuses[2], ("D3".to_string(), Ok(Lifecycle::Resolved)));
         assert_eq!(
             statuses[3],
-            ("D4".to_string(), Lifecycle::Resolved),
+            ("D4".to_string(), Ok(Lifecycle::Resolved)),
             "an id missing from the response should count as resolved"
         );
     }
@@ -1308,7 +1316,7 @@ mod tests {
             .await;
 
         let src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
-        let reviews = src.fetch_queue().await.unwrap();
+        let reviews = src.fetch_queue().await.unwrap().reviews;
 
         assert_eq!(reviews.len(), 1);
         let r = &reviews[0];
@@ -1387,7 +1395,7 @@ mod tests {
             .await;
 
         let src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
-        let mut reviews = src.fetch_queue().await.unwrap();
+        let mut reviews = src.fetch_queue().await.unwrap().reviews;
         reviews.sort_by(|a, b| a.key.id.cmp(&b.key.id));
 
         assert_eq!(reviews.len(), 2);
@@ -1468,7 +1476,7 @@ mod tests {
             .await;
 
         let src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
-        let mut reviews = src.fetch_queue().await.unwrap();
+        let mut reviews = src.fetch_queue().await.unwrap().reviews;
         reviews.sort_by(|a, b| a.key.id.cmp(&b.key.id));
 
         assert!(reviews[0].ancestors.is_empty());

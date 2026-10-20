@@ -123,13 +123,22 @@ pub struct ForkRef {
     pub branch: String,
 }
 
+/// A source's review queue, plus reviews it found but couldn't fetch.
+#[derive(Debug, Default)]
+pub struct Queue {
+    pub reviews: Vec<Review>,
+    pub errors: Vec<(ReviewKey, String)>,
+}
+
 #[async_trait]
 pub trait ReviewSource: Send + Sync {
     /// Instance name from config, e.g. "moz" - distinguishes multiple configured instances of
     /// the same source type and forms the `source` half of a `ReviewKey`.
     fn name(&self) -> &str;
 
-    async fn fetch_queue(&self) -> Result<Vec<Review>>;
+    /// A whole-queue failure (auth, search) is an `Err`; a review that can't be fetched on its
+    /// own goes in [`Queue::errors`] so the rest of the queue still syncs.
+    async fn fetch_queue(&self) -> Result<Queue>;
 
     /// `canonical_repo` is the already-resolved local repo this review's workspace will be built
     /// from - most sources ignore it, but one that needs to prepare local repo state first (e.g.
@@ -139,7 +148,11 @@ pub trait ReviewSource: Send + Sync {
 
     /// Refresh the lifecycle of reviews that are no longer in the queue (e.g. changes were
     /// requested, or the reviewer was removed) so `sync` knows whether to keep the workspace.
-    async fn fetch_status(&self, ids: &[String]) -> Result<Vec<(String, Lifecycle)>>;
+    /// A per-review `Err` leaves that review's state untouched.
+    async fn fetch_status(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<(String, std::result::Result<Lifecycle, String>)>>;
 
     /// Whether `message` (a commit message from a workspace built for a stack containing
     /// `review`) is the commit that carries `review`'s patch. Lets a stack workspace be
