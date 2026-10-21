@@ -15,6 +15,23 @@ pub mod moz_phab;
 /// `{source}/{id}` identity for a review; re-exported here since sources produce it.
 pub use crate::state::ReviewKey;
 
+/// A source's API refused a request with `429 Too Many Requests`. Sources return this (wrapped
+/// in `anyhow::Error`; `downcast_ref` it) so `sync` can stop talking to that source for the rest
+/// of the run instead of collecting one error per remaining request - a rate limit (or an
+/// edge-level block) won't lift in the seconds a sync takes.
+#[derive(Debug, thiserror::Error)]
+#[error("rate limited by {name} (HTTP 429); skipped its remaining requests this run")]
+pub struct RateLimited {
+    pub name: String,
+}
+
+impl RateLimited {
+    /// Whether `err` is (or wraps) a `RateLimited`.
+    pub fn is(err: &anyhow::Error) -> bool {
+        err.chain().any(|e| e.is::<RateLimited>())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lifecycle {
     Open,

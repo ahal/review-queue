@@ -35,7 +35,7 @@ use anyhow::{Context, Result, bail};
 use crate::config::{Config, VcsKind};
 use crate::paths::Paths;
 use crate::repo::{OnMissing, RepoStore};
-use crate::source::{Lifecycle, Review, ReviewSource};
+use crate::source::{Lifecycle, RateLimited, Review, ReviewSource};
 use crate::stacks::{self, Stack};
 use crate::state::{ReviewEntry, ReviewKey, State, Status, Workspace};
 use crate::vcs::Vcs;
@@ -76,6 +76,8 @@ pub async fn sync(
     let mut report = SyncReport::default();
     let mut seen: BTreeSet<ReviewKey> = BTreeSet::new();
     let mut failed_sources: BTreeSet<&str> = BTreeSet::new();
+    // Sources that hit a rate limit this run: already reported once, so skip them from here on.
+    let mut rate_limited: BTreeSet<String> = BTreeSet::new();
 
     for source in sources {
         if only_source.is_some_and(|o| o != source.name()) {
@@ -87,6 +89,9 @@ pub async fn sync(
                 // Without its queue there's no telling which of its reviews left it, so don't
                 // check any of their statuses either.
                 failed_sources.insert(source.name());
+                if RateLimited::is(&e) {
+                    rate_limited.insert(source.name().to_string());
+                }
                 report
                     .source_errors
                     .push((source.name().to_string(), format!("fetching queue: {e:#}")));
@@ -130,6 +135,9 @@ pub async fn sync(
         let statuses = match source.fetch_status(&ids).await {
             Ok(statuses) => statuses,
             Err(e) => {
+                if RateLimited::is(&e) {
+                    rate_limited.insert(source_name.clone());
+                }
                 report
                     .source_errors
                     .push((source_name, format!("checking status: {e:#}")));
@@ -145,7 +153,15 @@ pub async fn sync(
         }
     }
 
-    reconcile_workspaces(sources, only_source, &mut state, dry_run, &mut report).await;
+    reconcile_workspaces(
+        sources,
+        only_source,
+        &mut rate_limited,
+        &mut state,
+        dry_run,
+        &mut report,
+    )
+    .await;
 
     if !dry_run {
         state.save(&paths.state_file())?;
@@ -268,6 +284,7 @@ fn review_from_entry(entry: &ReviewEntry) -> Review {
 async fn reconcile_workspaces(
     sources: &[Box<dyn ReviewSource>],
     only_source: Option<&str>,
+    rate_limited: &mut BTreeSet<String>,
     state: &mut State,
     dry_run: bool,
     report: &mut SyncReport,
@@ -325,12 +342,23 @@ async fn reconcile_workspaces(
             continue;
         }
 
+        // Left as-is; the next sync will pick the update up.
+        if rate_limited.contains(&tip.key.source) {
+            continue;
+        }
         let Some(source) = sources.iter().find(|s| s.name() == tip.key.source) else {
             continue;
         };
         let review = review_from_entry(&tip);
         let checkout = match source.checkout_spec(&review, &ws.repo_path).await {
             Ok(checkout) => checkout,
+            Err(e) if RateLimited::is(&e) => {
+                rate_limited.insert(tip.key.source.clone());
+                report
+                    .source_errors
+                    .push((tip.key.source.clone(), format!("{e:#}")));
+                continue;
+            }
             Err(e) => {
                 report.errors.push((tip.key.clone(), e.to_string()));
                 continue;
@@ -1312,6 +1340,9 @@ mod tests {
         upstream: std::path::PathBuf,
         queue: std::sync::Mutex<Vec<Review>>,
         lifecycle: std::sync::Mutex<Lifecycle>,
+        /// When set, `checkout_spec` fails with `RateLimited`.
+        rate_limited: std::sync::atomic::AtomicBool,
+        checkout_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl StackSource {
@@ -1320,6 +1351,8 @@ mod tests {
                 upstream: upstream.to_path_buf(),
                 queue: Default::default(),
                 lifecycle: std::sync::Mutex::new(Lifecycle::Open),
+                rate_limited: Default::default(),
+                checkout_calls: Default::default(),
             }
         }
 
@@ -1379,6 +1412,11 @@ mod tests {
             review: &Review,
             _canonical_repo: &Path,
         ) -> Result<crate::source::Checkout> {
+            use std::sync::atomic::Ordering;
+            self.checkout_calls.fetch_add(1, Ordering::Relaxed);
+            if self.rate_limited.load(Ordering::Relaxed) {
+                return Err(RateLimited { name: "stk".into() }.into());
+            }
             let patches = review
                 .ancestors
                 .iter()
@@ -1569,6 +1607,46 @@ mod tests {
         assert_eq!(report.updated, vec![stk(2)]);
         let state = State::load(&paths.state_file()).unwrap();
         assert_eq!(state.workspace_for(&stk(2)).unwrap().version, "2");
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_source_is_reported_once_and_skipped() {
+        let repos = make_repos();
+        let work_tmp = TempDir::new().unwrap();
+        let paths = paths_in(work_tmp.path());
+        let config = Config::default();
+        let source = StackSource::new(&repos.upstream);
+        source.set_queue(vec![source.review(1, &[], "1"), source.review(2, &[], "1")]);
+        let sources: Vec<Box<dyn ReviewSource>> = vec![Box::new(source)];
+        sync(&sources, &paths, None, false).await.unwrap();
+        for n in [1, 2] {
+            fetch_local(&sources, &paths, &config, &stk(n), OnMissing::Clone)
+                .await
+                .unwrap();
+        }
+
+        // Both workspaces need updating, but the first checkout hits a rate limit.
+        let next = StackSource::new(&repos.upstream);
+        next.set_queue(vec![next.review(1, &[], "2"), next.review(2, &[], "2")]);
+        next.rate_limited
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let checkout_calls = next.checkout_calls.clone();
+        let sources: Vec<Box<dyn ReviewSource>> = vec![Box::new(next)];
+        let report = sync(&sources, &paths, None, false).await.unwrap();
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.source_errors.len(), 1, "{:?}", report.source_errors);
+        assert_eq!(report.source_errors[0].0, "stk");
+        assert!(report.updated.is_empty());
+        assert_eq!(
+            checkout_calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the second workspace shouldn't ask the source again"
+        );
+        let state = State::load(&paths.state_file()).unwrap();
+        for n in [1, 2] {
+            assert_eq!(state.workspace_for(&stk(n)).unwrap().version, "1");
+        }
     }
 
     #[tokio::test]

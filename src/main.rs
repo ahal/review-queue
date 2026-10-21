@@ -51,13 +51,15 @@ async fn main() -> Result<()> {
 }
 
 /// Build a `ReviewSource` for each configured source.
-async fn build_sources(config: &Config) -> Result<Vec<Box<dyn ReviewSource>>> {
+async fn build_sources(config: &Config, paths: &Paths) -> Result<Vec<Box<dyn ReviewSource>>> {
     let mut sources: Vec<Box<dyn ReviewSource>> = Vec::new();
     if let Some(cfg) = &config.source.github {
         sources.push(Box::new(GithubSource::new(cfg.clone()).await?));
     }
     if let Some(cfg) = &config.source.moz_phab {
-        sources.push(Box::new(MozPhabSource::new(cfg.clone()).await?));
+        sources.push(Box::new(
+            MozPhabSource::new(cfg.clone(), Some(paths.phab_diffstat_cache_file())).await?,
+        ));
     }
     Ok(sources)
 }
@@ -90,7 +92,7 @@ async fn sync_cmd(
         )
     })?;
 
-    let sources = build_sources(config).await?;
+    let sources = build_sources(config, paths).await?;
     if sources.is_empty() {
         bail!("no usable sources configured (see `config.toml`)");
     }
@@ -118,7 +120,7 @@ async fn fetch_cmd(paths: &Paths, config: &Config, config_path: &Path, id: &str)
         )
     })?;
 
-    let sources = build_sources(config).await?;
+    let sources = build_sources(config, paths).await?;
     let mut on_missing = if config.auto_clone {
         OnMissing::Clone
     } else {
@@ -305,7 +307,7 @@ async fn list(
     }
 
     if !plain && std::io::stdout().is_terminal() {
-        let sources = build_sources(config).await?;
+        let sources = build_sources(config, paths).await?;
         return tui::run(
             paths.clone(),
             config.clone(),

@@ -3,7 +3,7 @@
 //! Layout:
 //! - config: `$XDG_CONFIG_HOME/review-queue/config.toml`
 //! - data: `$XDG_DATA_HOME/review-queue/` — state.json, repos.json, sync.lock, workdir.json (the
-//!   `crate::workdir` scan cache), `repos/` (every tool-managed canonical clone, keyed by its
+//!   `crate::workdir` scan cache), phab-diffstats.json (Phabricator diffstat cache), `repos/` (every tool-managed canonical clone, keyed by its
 //!   normalized URL - discovered repos live wherever the user's workdir put them instead), and
 //!   `workspaces/{id}` (every review's workspace, independent of where its canonical repo lives;
 //!   keyed by the full canonical id - see `crate::state::ReviewKey::slug` - so ids can't collide
@@ -53,6 +53,11 @@ impl Paths {
 
     pub fn sync_lock_file(&self) -> PathBuf {
         self.data_dir.join("sync.lock")
+    }
+
+    /// Phabricator diffstats keyed by diff PHID - see `crate::source::moz_phab`.
+    pub fn phab_diffstat_cache_file(&self) -> PathBuf {
+        self.data_dir.join("phab-diffstats.json")
     }
 
     /// The `crate::workdir` scan cache.

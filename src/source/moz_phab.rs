@@ -46,7 +46,10 @@
 //!   batched `differential.diff.search` call, then fetches each resulting diff's raw text via
 //!   `differential.getrawdiff` - unlike the above, this one *is* one call per revision, since
 //!   `getrawdiff` has no batch form; see `diff_stats_for`'s own doc comment for why (and for why
-//!   it's `getrawdiff`, not the more obvious-looking `differential.querydiffs`).
+//!   it's `getrawdiff`, not the more obvious-looking `differential.querydiffs`). Diffs are
+//!   immutable, so results are cached by diff PHID and only new diffs are fetched.
+//! - Rate limiting: a `429` makes every call for the next few minutes fail fast with
+//!   `crate::source::RateLimited`, so a throttled sync stops instead of making more requests.
 //!
 //! `fetch_queue` fetches each `Review`'s diffstat itself (via `diff_stats_for`, above) rather than
 //! `rq show`'s TUI fetching it lazily on expand, so the TUI never blocks on Conduit.
@@ -103,7 +106,9 @@
 //! doesn't linger forever.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -114,25 +119,36 @@ use serde_json::{Value, json};
 use crate::config::MozPhabConfig;
 use crate::source::diffstat::{FileChange, format_diffstat};
 use crate::source::{
-    Checkout, Lifecycle, Queue, RepoRef, Review, ReviewKey, ReviewKind, ReviewSource,
+    Checkout, Lifecycle, Queue, RateLimited, RepoRef, Review, ReviewKey, ReviewKind, ReviewSource,
 };
 
 /// This source's hardcoded id-namespace prefix - see [`crate::state::ReviewKey`].
 pub const NAME: &str = "phab";
 
+/// How long after a 429 every `call` fails fast without touching the network. Long enough to
+/// cover the rest of any sync; short enough that a long-running `rq show` recovers on its own.
+const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
 pub struct MozPhabSource {
     cfg: MozPhabConfig,
     client: reqwest::Client,
     token: Option<String>,
+    /// When the last 429 arrived; within `RATE_LIMIT_COOLDOWN` of it every `call` fails fast with
+    /// `RateLimited` instead of hitting the network again.
+    rate_limited_at: Mutex<Option<Instant>>,
+    /// Diffstats keyed by diff PHID - see `diff_stats_for`. `None` disables caching.
+    diffstat_cache: Option<PathBuf>,
 }
 
 impl MozPhabSource {
-    pub async fn new(cfg: MozPhabConfig) -> Result<Self> {
+    pub async fn new(cfg: MozPhabConfig, diffstat_cache: Option<PathBuf>) -> Result<Self> {
         let token = resolve_token(&cfg).await?;
         Ok(Self {
             cfg,
             client: reqwest::Client::new(),
             token,
+            rate_limited_at: Mutex::new(None),
+            diffstat_cache,
         })
     }
 
@@ -142,10 +158,27 @@ impl MozPhabSource {
             cfg,
             client: reqwest::Client::new(),
             token,
+            rate_limited_at: Mutex::new(None),
+            diffstat_cache: None,
         }
     }
 
+    fn rate_limited_error() -> anyhow::Error {
+        RateLimited {
+            name: NAME.to_string(),
+        }
+        .into()
+    }
+
     async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
+        if self
+            .rate_limited_at
+            .lock()
+            .unwrap()
+            .is_some_and(|at| at.elapsed() < RATE_LIMIT_COOLDOWN)
+        {
+            return Err(Self::rate_limited_error());
+        }
         let token = self
             .token
             .as_ref()
@@ -162,6 +195,10 @@ impl MozPhabSource {
             .await
             .with_context(|| format!("POST {url}"))?;
         let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            *self.rate_limited_at.lock().unwrap() = Some(Instant::now());
+            return Err(Self::rate_limited_error());
+        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             bail!("POST {url} failed: {status} {body}");
@@ -295,8 +332,14 @@ impl MozPhabSource {
 
     /// Diffstat for every candidate with an active diff, keyed by revision id - fetched as part
     /// of the same `fetch_queue()` call that builds the `Review`s themselves, not lazily by the
-    /// TUI. Best-effort throughout: any failure just means affected revision(s) get no diffstat,
-    /// never a failed queue fetch.
+    /// TUI. Best-effort: any failure just means affected revision(s) get no diffstat, never a
+    /// failed queue fetch - except `RateLimited`, which is propagated so the whole source stops
+    /// for this run.
+    ///
+    /// A diff (unlike a revision) is immutable, so stats are cached by diff PHID in
+    /// `diffstat_cache` and only diffs not seen on a previous sync are fetched. Without this,
+    /// every sync made one `getrawdiff` call per revision in the queue, which is enough to trip
+    /// Phabricator's rate limiting. The cache is pruned to the current candidates on each write.
     ///
     /// `differential.querydiffs` (the obvious-looking Conduit call for this - a diff's per-file
     /// `changes` with line counts) doesn't work against Mozilla's Phabricator: it's missing from
@@ -315,53 +358,79 @@ impl MozPhabSource {
     async fn diff_stats_for<'a>(
         &self,
         revisions: impl IntoIterator<Item = &'a RevisionItem>,
-    ) -> HashMap<u64, String> {
-        self.diff_stats_for_inner(revisions)
-            .await
-            .unwrap_or_default()
-    }
-
-    async fn diff_stats_for_inner<'a>(
-        &self,
-        revisions: impl IntoIterator<Item = &'a RevisionItem>,
     ) -> Result<HashMap<u64, String>> {
         let phid_to_rev: HashMap<String, u64> = revisions
             .into_iter()
             .filter_map(|r| r.fields.diff_phid.clone().map(|phid| (phid, r.id)))
             .collect();
-        if phid_to_rev.is_empty() {
-            return Ok(HashMap::new());
+
+        let mut cache = self
+            .diffstat_cache
+            .as_deref()
+            .and_then(|path| load_diffstat_cache(path).ok())
+            .unwrap_or_default();
+        // Saved even on failure, so a rate limit midway doesn't throw away what was fetched.
+        let result = self
+            .fetch_missing_diff_stats(&phid_to_rev, &mut cache)
+            .await;
+        cache.retain(|phid, _| phid_to_rev.contains_key(phid));
+        if let Some(path) = &self.diffstat_cache
+            && let Err(e) = save_diffstat_cache(path, &cache)
+        {
+            tracing::warn!("saving diffstat cache: {e:#}");
+        }
+        if let Err(e) = result
+            && RateLimited::is(&e)
+        {
+            return Err(e);
         }
 
+        Ok(cache
+            .into_iter()
+            .map(|(phid, stat)| (phid_to_rev[&phid], stat))
+            .collect())
+    }
+
+    /// Add diffstats, keyed by diff PHID, to `cache` for every diff in `phid_to_rev` not already
+    /// in it.
+    async fn fetch_missing_diff_stats(
+        &self,
+        phid_to_rev: &HashMap<String, u64>,
+        cache: &mut HashMap<String, String>,
+    ) -> Result<()> {
         // Sorted for a deterministic request body, same as `author_phids`/`repo_phids` above.
         let phids: Vec<String> = phid_to_rev
             .keys()
+            .filter(|phid| !cache.contains_key(*phid))
             .cloned()
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
+        if phids.is_empty() {
+            return Ok(());
+        }
         let diffs: Vec<DiffItem> = self
             .search_all(
                 "differential.diff.search",
                 json!({"constraints": {"phids": phids}}),
             )
             .await?;
-        let diff_id_to_rev: HashMap<u64, u64> = diffs
-            .into_iter()
-            .filter_map(|d| phid_to_rev.get(&d.phid).map(|&rev_id| (d.id, rev_id)))
-            .collect();
-
-        let mut out = HashMap::new();
-        for (diff_id, revision_id) in diff_id_to_rev {
-            let Ok(raw) = self
-                .call::<String>("differential.getrawdiff", json!({"diffID": diff_id}))
+        for diff in diffs {
+            if !phid_to_rev.contains_key(&diff.phid) {
+                continue;
+            }
+            let raw = match self
+                .call::<String>("differential.getrawdiff", json!({"diffID": diff.id}))
                 .await
-            else {
-                continue; // one revision's diff failing to fetch shouldn't cost the others
+            {
+                Ok(raw) => raw,
+                Err(e) if RateLimited::is(&e) => return Err(e),
+                // One revision's diff failing to fetch shouldn't cost the others.
+                Err(_) => continue,
             };
-            out.insert(revision_id, format_diffstat(&parse_unified_diff(&raw)));
+            cache.insert(diff.phid, format_diffstat(&parse_unified_diff(&raw)));
         }
-        Ok(out)
+        Ok(())
     }
 
     #[cfg(test)]
@@ -563,7 +632,7 @@ impl ReviewSource for MozPhabSource {
         let mut stacks = self.resolve_stacks(seeds).await?;
         let diff_stats = self
             .diff_stats_for(candidates.iter().map(|(rev, _, _)| rev))
-            .await;
+            .await?;
 
         let mut reviews = Vec::new();
         for (rev, kind, repository_phid) in &candidates {
@@ -659,6 +728,34 @@ impl ReviewSource for MozPhabSource {
         }
         Ok(out)
     }
+}
+
+fn load_diffstat_cache(path: &Path) -> Result<HashMap<String, String>> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Atomic write: temp file in the same directory, then rename over the target.
+fn save_diffstat_cache(path: &Path, cache: &HashMap<String, String>) -> Result<()> {
+    let dir = path
+        .parent()
+        .context("diffstat cache path has no parent directory")?;
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(
+        ".{}.tmp",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    // BTreeMap for a stable on-disk order.
+    let sorted: std::collections::BTreeMap<_, _> = cache.iter().collect();
+    std::fs::write(&tmp, serde_json::to_string_pretty(&sorted)?)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
+    Ok(())
 }
 
 /// `moz-phab patch` leaves a `Differential Revision: https://.../D123` trailer in each commit
@@ -1206,6 +1303,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn call_fails_fast_after_a_rate_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/user.whoami"))
+            .respond_with(ResponseTemplate::new(429))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
+        for _ in 0..2 {
+            let err = src
+                .call::<WhoAmI>("user.whoami", json!({}))
+                .await
+                .unwrap_err();
+            assert!(RateLimited::is(&err), "{err:#}");
+        }
+    }
+
+    #[tokio::test]
     async fn call_surfaces_conduit_errors() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1670,7 +1787,7 @@ mod tests {
             revision_with_diff(1, Some("PHID-DIFF-1")),
             revision_with_diff(2, Some("PHID-DIFF-2")),
         ];
-        let stats = src.diff_stats_for(revisions.iter()).await;
+        let stats = src.diff_stats_for(revisions.iter()).await.unwrap();
 
         assert!(stats[&1].contains("src/main.rs"));
         assert!(stats[&1].ends_with("1 file changed, 2 insertions(+), 1 deletion(-)"));
@@ -1686,7 +1803,7 @@ mod tests {
         let src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
         let revisions = [revision_with_diff(1, None)];
 
-        let stats = src.diff_stats_for(revisions.iter()).await;
+        let stats = src.diff_stats_for(revisions.iter()).await.unwrap();
 
         assert!(stats.is_empty());
     }
@@ -1724,13 +1841,102 @@ mod tests {
             revision_with_diff(1, Some("PHID-DIFF-1")),
             revision_with_diff(2, Some("PHID-DIFF-2")),
         ];
-        let stats = src.diff_stats_for(revisions.iter()).await;
+        let stats = src.diff_stats_for(revisions.iter()).await.unwrap();
 
         assert!(
             !stats.contains_key(&1),
             "the failing revision should just be skipped"
         );
         assert!(stats[&2].contains("ok.rs"));
+    }
+
+    #[tokio::test]
+    async fn diff_stats_for_only_fetches_diffs_missing_from_the_cache() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/differential.diff.search"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(search_response(&[json!({"id": 42, "phid": "PHID-DIFF-1"})])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/differential.getrawdiff"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(call_response(json!(
+                    "diff --git a/ok.rs b/ok.rs\n--- a/ok.rs\n+++ b/ok.rs\n@@ -0,0 +1,1 @@\n+ok\n"
+                ))),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let cache_path = tmp.path().join("phab-diffstats.json");
+        let mut src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
+        src.diffstat_cache = Some(cache_path.clone());
+        let revisions = [revision_with_diff(1, Some("PHID-DIFF-1"))];
+
+        let first = src.diff_stats_for(revisions.iter()).await.unwrap();
+        let second = src.diff_stats_for(revisions.iter()).await.unwrap();
+        assert!(first[&1].contains("ok.rs"));
+        assert_eq!(first, second, "second call served from the cache");
+
+        // A revision that's left the queue (or got a new diff) is pruned from the cache.
+        let revisions = [revision_with_diff(1, None)];
+        assert!(
+            src.diff_stats_for(revisions.iter())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(load_diffstat_cache(&cache_path).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn diff_stats_for_propagates_a_rate_limit_but_caches_what_it_got() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/differential.diff.search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(search_response(&[
+                json!({"id": 42, "phid": "PHID-DIFF-1"}),
+                json!({"id": 43, "phid": "PHID-DIFF-2"}),
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/differential.getrawdiff"))
+            .and(body_string_contains("diffID=42"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(call_response(json!(
+                    "diff --git a/ok.rs b/ok.rs\n--- a/ok.rs\n+++ b/ok.rs\n@@ -0,0 +1,1 @@\n+ok\n"
+                ))),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/differential.getrawdiff"))
+            .and(body_string_contains("diffID=43"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let cache_path = tmp.path().join("phab-diffstats.json");
+        let mut src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
+        src.diffstat_cache = Some(cache_path.clone());
+        let revisions = [
+            revision_with_diff(1, Some("PHID-DIFF-1")),
+            revision_with_diff(2, Some("PHID-DIFF-2")),
+        ];
+
+        let err = src.diff_stats_for(revisions.iter()).await.unwrap_err();
+        assert!(RateLimited::is(&err), "{err:#}");
+        let cache = load_diffstat_cache(&cache_path).unwrap();
+        assert!(cache["PHID-DIFF-1"].contains("ok.rs"));
+        assert!(!cache.contains_key("PHID-DIFF-2"));
     }
 
     #[tokio::test]
@@ -1745,7 +1951,7 @@ mod tests {
         let src = MozPhabSource::for_test(cfg(&server.uri()), Some("t".into()));
         let revisions = [revision_with_diff(1, Some("PHID-DIFF-1"))];
 
-        let stats = src.diff_stats_for(revisions.iter()).await;
+        let stats = src.diff_stats_for(revisions.iter()).await.unwrap();
 
         assert!(
             stats.is_empty(),
