@@ -55,6 +55,22 @@ impl Paths {
         self.data_dir.join("sync.lock")
     }
 
+    /// Open (creating if needed) `sync.lock`, which serializes everything that runs vcs commands
+    /// against canonical repos or rewrites state.json: `rq sync`, `rq fetch`, and the TUI's
+    /// fetches/deletes. Advisory only, per `fd_lock`'s own caveats. Each call opens a fresh file
+    /// descriptor, so separate threads in one process contend on it like separate processes.
+    pub fn open_sync_lock(&self) -> Result<fd_lock::RwLock<std::fs::File>> {
+        self.ensure_dirs()?;
+        let lock_path = self.sync_lock_file();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening {}", lock_path.display()))?;
+        Ok(fd_lock::RwLock::new(file))
+    }
+
     /// Phabricator diffstats keyed by diff PHID - see `crate::source::moz_phab`.
     pub fn phab_diffstat_cache_file(&self) -> PathBuf {
         self.data_dir.join("phab-diffstats.json")

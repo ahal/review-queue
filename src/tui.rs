@@ -850,6 +850,17 @@ fn prompt_delete_workspace(s: &mut Cursive, key: ReviewKey, sharing: usize) {
     s.add_layer(vim_keys(dialog));
 }
 
+/// Run `f` while holding `sync.lock`, blocking until it's free. Every TUI fetch/delete runs vcs
+/// commands against a canonical repo and rewrites state.json, so two in flight at once (on
+/// different stacks in the same repo, or alongside a cron `rq sync`) would race: concurrent
+/// `jj git fetch`es fail with "incorrect old value provided", and the last state.json write
+/// silently drops the other's workspace.
+fn with_sync_lock<T>(paths: &Paths, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let mut lock = paths.open_sync_lock()?;
+    let _guard = lock.write()?;
+    f()
+}
+
 /// Runs `sync::remove_workspace` (forced, discarding any local changes) on a background thread,
 /// showing the same row spinner as a fetch while it works - deleting a big worktree can take a
 /// while.
@@ -874,7 +885,7 @@ fn begin_delete(s: &mut Cursive, key: ReviewKey) {
 
     let cb_sink = s.cb_sink().clone();
     std::thread::spawn(move || {
-        let result = sync::remove_workspace(&paths, &key, true);
+        let result = with_sync_lock(&paths, || sync::remove_workspace(&paths, &key, true));
         done.store(true, Ordering::SeqCst);
         let _ = cb_sink.send(Box::new(move |s| finish_delete(s, key, guard, result)));
     });
@@ -989,13 +1000,15 @@ fn begin_fetch(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing, then: Opt
     let cb_sink = s.cb_sink().clone();
     let worker_key = key.clone();
     std::thread::spawn(move || {
-        let result = handle.block_on(sync::fetch_local(
-            &sources,
-            &paths,
-            &config,
-            &worker_key,
-            on_missing,
-        ));
+        let result = with_sync_lock(&paths, || {
+            handle.block_on(sync::fetch_local(
+                &sources,
+                &paths,
+                &config,
+                &worker_key,
+                on_missing,
+            ))
+        });
         done.store(true, Ordering::SeqCst);
         let _ = cb_sink.send(Box::new(move |s| {
             finish_fetch(s, worker_key, guard, result, cancelled, then, had_workspace)
@@ -1108,7 +1121,9 @@ fn finish_fetch(
             Ok(_) if had_workspace => format!("cancelled fetching {key}; existing workspace kept"),
             Ok(_) => match s
                 .user_data::<Ctx>()
-                .map(|ctx| sync::remove_workspace(&ctx.paths, &key, true))
+                .map(|ctx| {
+                    with_sync_lock(&ctx.paths, || sync::remove_workspace(&ctx.paths, &key, true))
+                })
             {
                 Some(Ok(())) => format!("cancelled fetching {key}; workspace cleaned up"),
                 Some(Err(e)) => format!("cancelled fetching {key}; cleanup failed: {e:#}"),
@@ -1143,13 +1158,15 @@ fn finish_fetch(
 fn do_open_locally(s: &mut Cursive, key: ReviewKey, on_missing: OnMissing, then: Option<usize>) {
     let outcome = s.user_data::<Ctx>().map(|ctx| {
         tokio::task::block_in_place(|| {
-            ctx.handle.clone().block_on(sync::fetch_local(
-                &ctx.sources,
-                &ctx.paths,
-                &ctx.config,
-                &key,
-                on_missing,
-            ))
+            with_sync_lock(&ctx.paths, || {
+                ctx.handle.clone().block_on(sync::fetch_local(
+                    &ctx.sources,
+                    &ctx.paths,
+                    &ctx.config,
+                    &key,
+                    on_missing,
+                ))
+            })
         })
     });
 

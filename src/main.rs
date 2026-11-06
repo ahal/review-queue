@@ -1,7 +1,7 @@
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::Parser;
 use comfy_table::{Table, presets::UTF8_FULL_CONDENSED};
 
@@ -64,27 +64,13 @@ async fn build_sources(config: &Config, paths: &Paths) -> Result<Vec<Box<dyn Rev
     Ok(sources)
 }
 
-/// Hold `sync.lock` for the duration of `f`, refusing to run alongside another `rq sync`/`rq
-/// fetch` (e.g. an overlapping cron invocation). Advisory only, per `fd_lock`'s own caveats.
-fn acquire_sync_lock(paths: &Paths) -> Result<fd_lock::RwLock<std::fs::File>> {
-    paths.ensure_dirs()?;
-    let lock_path = paths.sync_lock_file();
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("opening {}", lock_path.display()))?;
-    Ok(fd_lock::RwLock::new(file))
-}
-
 async fn sync_cmd(
     paths: &Paths,
     config: &Config,
     only_source: Option<&str>,
     dry_run: bool,
 ) -> Result<()> {
-    let mut lock = acquire_sync_lock(paths)?;
+    let mut lock = paths.open_sync_lock()?;
     let _guard = lock.try_write().map_err(|_| {
         anyhow::anyhow!(
             "another `rq sync` or `rq fetch` is already running (lock: {})",
@@ -112,7 +98,7 @@ async fn sync_cmd(
 
 async fn fetch_cmd(paths: &Paths, config: &Config, config_path: &Path, id: &str) -> Result<()> {
     let key = resolve_key(paths, id)?;
-    let mut lock = acquire_sync_lock(paths)?;
+    let mut lock = paths.open_sync_lock()?;
     let _guard = lock.try_write().map_err(|_| {
         anyhow::anyhow!(
             "another `rq sync` or `rq fetch` is already running (lock: {})",
