@@ -64,7 +64,7 @@
 //! # Checkout
 //!
 //! `checkout_spec` returns `Checkout::ExternalCommand { program: "moz-phab", args: ["patch",
-//! "D<id>", "--apply-to", "base", "--yes", "--name", <key>], env }`. `moz-phab patch` handles
+//! "D<id>", "--apply-to", "base", "--yes", "--no-branch"], env }`. `moz-phab patch` handles
 //! everything the earlier implementation did by hand, and does it better:
 //! - Walks the full dependency stack itself (confirmed live: patching a revision automatically
 //!   discovered and applied its parent too, unprompted).
@@ -74,6 +74,11 @@
 //!   to the latest landed ancestor and applies there instead ("Base revision ... is not public
 //!   ... Applying the patch at ... instead" - observed live against `mozilla-central`).
 //! - `--yes` fully suppresses its interactive "patch the full stack?" prompt.
+//! - `--no-branch` stops it creating a git branch / jj bookmark for the patched stack: the `Vcs`
+//!   backends already pin every head under `review-queue/<name>/*`, so an extra `phab-D<id>` ref
+//!   would just be clutter (and on jj, a bookmark the user may later push by accident). Despite
+//!   `moz-phab patch --help` calling it "Git only", its jj path honors it too; `--no-bookmark` is
+//!   the hg-only one.
 //! - Exits 1 on failure (a real patch-doesn't-apply case was observed live), leaving the
 //!   workspace checked out at the resolved base with nothing applied - which is exactly the
 //!   `Status::ApplyFailed` "leave it for inspection" contract the `Vcs` backends already have.
@@ -691,8 +696,7 @@ impl ReviewSource for MozPhabSource {
                 "--apply-to".to_string(),
                 "base".to_string(),
                 "--yes".to_string(),
-                "--name".to_string(),
-                review.key.slug().replace('/', "-"),
+                "--no-branch".to_string(),
             ],
             env,
         })
@@ -1669,8 +1673,7 @@ mod tests {
                         "--apply-to",
                         "base",
                         "--yes",
-                        "--name",
-                        "phab-D1"
+                        "--no-branch"
                     ]
                 );
                 assert!(env.contains(&(

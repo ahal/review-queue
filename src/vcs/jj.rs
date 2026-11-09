@@ -435,8 +435,9 @@ impl Vcs for JjVcs {
         // until it's abandoned, bookmark or not. So abandon every version of the stack (plus
         // anything built on top of it), except commits that something outside the stack still
         // needs - another workspace, another review's pin, a remote/tag, or a bookmark that isn't
-        // on the stack itself. Bookmarks *on* the stack (the pins, and the `phab-D*` ones
-        // `moz-phab patch` creates) aren't protective; `abandon` deletes them along with it.
+        // on the stack itself. Bookmarks *on* the stack (the pins, or e.g. a `phab-D*` one left by
+        // a `moz-phab patch` run without `--no-branch`) aren't protective; `abandon` deletes them
+        // along with it.
         let pins = format!("bookmarks(glob:\"review-queue/{name}/*\")");
         let protected = format!(
             "working_copies() | remote_bookmarks() | tags() | present(trunk()) \
@@ -1026,7 +1027,8 @@ mod tests {
         let head_v2 = vcs
             .update_workspace(&f.canon, &ws, &v2, "moz/D8", "2")
             .unwrap();
-        // What `moz-phab patch` leaves behind on the stack it applies.
+        // What `moz-phab patch` leaves behind on the stack it applies when run without
+        // `--no-branch` (as older checkouts were).
         jj_out(&f.canon, &["bookmark", "create", "-r", &head_v2, "phab-D8"]);
 
         // Unrelated work in another review's workspace must survive.
