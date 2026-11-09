@@ -15,7 +15,8 @@
 //! target is the confirmation to create its workspace. The underlying `git`/`jj` calls cannot
 //! be interrupted, so cancellation detaches from the operation and turns the spinner red.
 //! `finish_fetch` removes newly created workspaces after cancellation. `f` fetches or refreshes
-//! in the background without running a target.
+//! in the background without running a target. `r` runs a full `rq sync` in the background
+//! (under `sync.lock`, like fetches and deletes), then reloads the list from `state.json`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::process::CommandExt;
@@ -51,7 +52,7 @@ const HELP_NAVIGATION: &str = "↑/↓ or j/k    move
 enter         choose target…
 f             fetch
 d             delete workspace
-r             reload
+r             sync & reload
 q / esc       quit
 ?             show this help";
 
@@ -62,8 +63,8 @@ struct Ctx {
     sources: Arc<Vec<Box<dyn ReviewSource>>>,
     handle: tokio::runtime::Handle,
     all: bool,
-    key_w: usize,
-    author_w: usize,
+    /// Spinner frame of the background `rq sync` started by `r`, while one is running.
+    syncing: Option<usize>,
     /// Reviews currently expanded to show their diffstat - any number at once, independently.
     expanded: BTreeSet<ReviewKey>,
     /// Waiting target command (or `$SHELL`) queued by `launch`, drained by `run_event_loop`,
@@ -143,8 +144,7 @@ pub fn run(
         sources: Arc::new(sources),
         handle: tokio::runtime::Handle::current(),
         all,
-        key_w,
-        author_w,
+        syncing: None,
         expanded: BTreeSet::new(),
         pending_run: None,
         targets: targets.clone(),
@@ -195,7 +195,7 @@ pub fn run(
     }
     siv.add_global_callback('d', delete_workspace_selected);
     siv.add_global_callback('f', fetch_selected);
-    siv.add_global_callback('r', reload);
+    siv.add_global_callback('r', sync_and_reload);
 
     run_event_loop(siv)
 }
@@ -1228,12 +1228,107 @@ fn prompt_clone(s: &mut Cursive, key: ReviewKey, url: String, dest: PathBuf, the
     s.add_layer(vim_keys(dialog));
 }
 
+/// `r`: runs a full `rq sync` on a background thread, animating a spinner in the status line,
+/// then reloads the list and summarizes what changed. Takes `sync.lock` like fetches/deletes, so
+/// it waits behind any in-flight one (or a cron `rq sync`) rather than racing it.
+fn sync_and_reload(s: &mut Cursive) {
+    let Some(ctx) = s.user_data::<Ctx>() else {
+        return;
+    };
+    if ctx.syncing.is_some() {
+        set_status(s, "sync already in progress");
+        return;
+    }
+    ctx.syncing = Some(0);
+    let sources = ctx.sources.clone();
+    let paths = ctx.paths.clone();
+    let handle = ctx.handle.clone();
+    set_status(s, format!("{} syncing…", SPINNER_FRAMES[0]));
+
+    let done = Arc::new(AtomicBool::new(false));
+    let ticker_done = done.clone();
+    let ticker_sink = s.cb_sink().clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(120));
+            if ticker_done.load(Ordering::SeqCst) {
+                break;
+            }
+            let sent = ticker_sink.send(Box::new(|s| {
+                let frame = s.user_data::<Ctx>().and_then(|ctx| {
+                    let f = ctx.syncing.as_mut()?;
+                    *f = f.wrapping_add(1);
+                    Some(*f)
+                });
+                if let Some(frame) = frame {
+                    let spin = SPINNER_FRAMES[frame % SPINNER_FRAMES.len()];
+                    set_status(s, format!("{spin} syncing…"));
+                }
+            }));
+            if sent.is_err() {
+                break; // UI gone.
+            }
+        }
+    });
+
+    let cb_sink = s.cb_sink().clone();
+    std::thread::spawn(move || {
+        let result = with_sync_lock(&paths, || {
+            handle.block_on(sync::sync(&sources, &paths, None, false))
+        });
+        done.store(true, Ordering::SeqCst);
+        let _ = cb_sink.send(Box::new(move |s| finish_sync(s, result)));
+    });
+}
+
+fn finish_sync(s: &mut Cursive, result: Result<sync::SyncReport>) {
+    if let Some(ctx) = s.user_data::<Ctx>() {
+        ctx.syncing = None;
+    }
+    let msg = match result {
+        Ok(report) => sync_summary(&report),
+        Err(e) => format!("sync failed: {e:#}"),
+    };
+    reload(s);
+    set_status(s, msg);
+}
+
+/// One-line status-bar summary of a `SyncReport`, surfacing the first error in full since the
+/// status line is the only place it'll show up.
+fn sync_summary(report: &sync::SyncReport) -> String {
+    let mut parts = Vec::new();
+    for (n, what) in [
+        (report.added.len(), "added"),
+        (report.updated.len(), "updated"),
+        (report.removed.len(), "removed"),
+        (report.flagged.len(), "flagged"),
+    ] {
+        if n > 0 {
+            parts.push(format!("{n} {what}"));
+        }
+    }
+    let mut msg = if parts.is_empty() {
+        "synced: no changes".to_string()
+    } else {
+        format!("synced: {}", parts.join(", "))
+    };
+    let n_errors = report.errors.len() + report.source_errors.len();
+    if n_errors > 0 {
+        let first = report
+            .source_errors
+            .first()
+            .map(|(src, e)| format!("source `{src}`: {e}"))
+            .or_else(|| report.errors.first().map(|(k, e)| format!("{k}: {e}")))
+            .unwrap_or_default();
+        msg.push_str(&format!(" ({n_errors} error(s); {first})"));
+    }
+    msg
+}
+
 fn reload(s: &mut Cursive) {
     let loaded = s.user_data::<Ctx>().map(|ctx| {
         (
             load_rows(&ctx.paths, ctx.all),
-            ctx.key_w,
-            ctx.author_w,
             ctx.expanded.clone(),
             ctx.fetching
                 .iter()
@@ -1247,7 +1342,7 @@ fn reload(s: &mut Cursive) {
                 .collect::<Spinners>(),
         )
     });
-    let Some((loaded, key_w, author_w, expanded, spinners)) = loaded else {
+    let Some((loaded, expanded, spinners)) = loaded else {
         return;
     };
     let entries = match loaded {
@@ -1257,6 +1352,8 @@ fn reload(s: &mut Cursive) {
             return;
         }
     };
+    // Recomputed every time so reviews added by a sync widen the columns instead of truncating.
+    let (key_w, author_w) = column_widths(&entries);
 
     s.call_on_name("reviews", |v: &mut SelectView<Row>| {
         let selected = v.selection().map(|row| (*row).clone());
@@ -1916,13 +2013,32 @@ key = "u"
             sources: Arc::new(Vec::new()),
             handle: tokio::runtime::Handle::current(),
             all: true,
-            key_w: 5,
-            author_w: 6,
+            syncing: None,
             expanded: BTreeSet::new(),
             pending_run: None,
             targets: Arc::new(target::resolve(&BTreeMap::new()).unwrap()),
             fetching: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn sync_summary_reports_changes_and_first_error() {
+        let mut report = sync::SyncReport::default();
+        assert_eq!(sync_summary(&report), "synced: no changes");
+        report.added.push(ReviewKey::new("moz", "D1"));
+        report.removed.push(ReviewKey::new("moz", "D2"));
+        report.removed.push(ReviewKey::new("moz", "D3"));
+        assert_eq!(sync_summary(&report), "synced: 1 added, 2 removed");
+        report
+            .errors
+            .push((ReviewKey::new("moz", "D4"), "boom".into()));
+        report
+            .source_errors
+            .push(("moz".into(), "fetching queue: 429".into()));
+        assert_eq!(
+            sync_summary(&report),
+            "synced: 1 added, 2 removed (2 error(s); source `moz`: fetching queue: 429)"
+        );
     }
 
     #[tokio::test]
