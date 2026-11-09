@@ -29,8 +29,9 @@
 //! - `is_dirty`: `@` isn't empty, or `@-` isn't the expected id (the stack tip) or one of its
 //!   ancestors.
 //! - `position`: `jj new <commit>` (never `edit`, which would rewrite the stack).
-//! - `remove_workspace`: `jj workspace forget`, `rm -rf`, and delete every
-//!   `review-queue/<name>/*` bookmark.
+//! - `remove_workspace`: `jj workspace forget`, `rm -rf`, `jj abandon` every version of the stack
+//!   (anything else still depends on stays), and delete every `review-queue/<name>/*` bookmark.
+//!   Deleting the pins alone would leave the stack as anonymous visible heads.
 
 use std::io::Write;
 use std::path::Path;
@@ -429,6 +430,21 @@ impl Vcs for JjVcs {
         if ws.exists() {
             std::fs::remove_dir_all(ws).with_context(|| format!("removing {}", ws.display()))?;
         }
+
+        // Deleting the pins alone isn't enough: unlike git, jj keeps a mutable commit visible
+        // until it's abandoned, bookmark or not. So abandon every version of the stack (plus
+        // anything built on top of it), except commits that something outside the stack still
+        // needs - another workspace, another review's pin, a remote/tag, or a bookmark that isn't
+        // on the stack itself. Bookmarks *on* the stack (the pins, and the `phab-D*` ones
+        // `moz-phab patch` creates) aren't protective; `abandon` deletes them along with it.
+        let pins = format!("bookmarks(glob:\"review-queue/{name}/*\")");
+        let protected = format!(
+            "working_copies() | remote_bookmarks() | tags() | present(trunk()) \
+             | (bookmarks(glob:\"review-queue/*\") ~ {pins}) | (bookmarks() ~ ::{pins})"
+        );
+        let stack = format!("(::{pins} & mutable()):: ~ ::({protected})");
+        self.run(repo, &["abandon", &stack])
+            .with_context(|| format!("abandoning the stack for `{name}`"))?;
 
         let prefix = format!("review-queue/{name}/");
         let listing = self.run(repo, &["bookmark", "list"])?;
@@ -987,6 +1003,125 @@ mod tests {
             trunk_before,
             "canonical repo must be untouched"
         );
+    }
+
+    #[test]
+    fn remove_workspace_abandons_every_version_of_the_stack() {
+        require_jj!();
+        let f = fixture();
+        let vcs = JjVcs;
+        let patch = |t: &str, file: &str| add_file_patch(t, file, "x\n", "Author <a@example.com>");
+        let ws = f._tmp.path().join("ws");
+        let v1 = Checkout::Patches {
+            base: Some(f.base.clone()),
+            patches: vec![patch("add a", "a.txt")],
+        };
+        let v2 = Checkout::Patches {
+            base: Some(f.base.clone()),
+            patches: vec![patch("add a", "a.txt"), patch("add b", "b.txt")],
+        };
+        let head_v1 = vcs
+            .add_workspace(&f.canon, &ws, &v1, "moz/D8", "1")
+            .unwrap();
+        let head_v2 = vcs
+            .update_workspace(&f.canon, &ws, &v2, "moz/D8", "2")
+            .unwrap();
+        // What `moz-phab patch` leaves behind on the stack it applies.
+        jj_out(&f.canon, &["bookmark", "create", "-r", &head_v2, "phab-D8"]);
+
+        // Unrelated work in another review's workspace must survive.
+        let other_ws = f._tmp.path().join("other");
+        let other_head = vcs
+            .add_workspace(
+                &f.canon,
+                &other_ws,
+                &Checkout::Patches {
+                    base: Some(f.base.clone()),
+                    patches: vec![patch("add c", "c.txt")],
+                },
+                "moz/D9",
+                "1",
+            )
+            .unwrap();
+        // As must the user's own bookmarked work stacked on top of the review.
+        jj_out(&f.canon, &["new", "-m", "mine", &head_v2]);
+        jj_out(&f.canon, &["bookmark", "create", "-r", "@", "mine"]);
+        let mine = commit_id(&f.canon, "mine");
+        jj_out(&f.canon, &["new", &f.base]);
+
+        vcs.remove_workspace(&f.canon, &ws, "moz/D8").unwrap();
+
+        let visible = |rev: &str| {
+            !jj_out(
+                &f.canon,
+                &[
+                    "log",
+                    "-r",
+                    &format!("present({rev}) & ::visible_heads()"),
+                    "--no-graph",
+                    "-T",
+                    "commit_id",
+                ],
+            )
+            .is_empty()
+        };
+        assert!(!visible(&head_v1), "old version should be abandoned");
+        assert!(
+            visible(&head_v2),
+            "kept alive by the user's `mine` bookmark"
+        );
+        assert!(visible(&mine));
+        assert!(visible(&other_head), "another review's stack must survive");
+        let bookmarks = jj_out(&f.canon, &["bookmark", "list"]);
+        assert!(!bookmarks.contains("review-queue/moz/D8"), "{bookmarks}");
+        assert!(
+            bookmarks.contains("phab-D8"),
+            "still on a commit `mine` needs: {bookmarks}"
+        );
+    }
+
+    #[test]
+    fn remove_workspace_drops_the_whole_stack_and_its_bookmarks() {
+        require_jj!();
+        let f = fixture();
+        let vcs = JjVcs;
+        let ws = f._tmp.path().join("ws");
+        let head = vcs
+            .add_workspace(
+                &f.canon,
+                &ws,
+                &Checkout::Patches {
+                    base: Some(f.base.clone()),
+                    patches: vec![
+                        add_file_patch("add a", "a.txt", "a\n", "Author <a@example.com>"),
+                        add_file_patch("add b", "b.txt", "b\n", "Author <a@example.com>"),
+                    ],
+                },
+                "moz/D10",
+                "1",
+            )
+            .unwrap();
+        jj_out(&f.canon, &["bookmark", "create", "-r", &head, "phab-D10"]);
+
+        vcs.remove_workspace(&f.canon, &ws, "moz/D10").unwrap();
+
+        assert_eq!(
+            jj_out(
+                &f.canon,
+                &[
+                    "log",
+                    "-r",
+                    "mutable() ~ @",
+                    "--no-graph",
+                    "-T",
+                    "commit_id"
+                ]
+            ),
+            "",
+            "no review commits should be left visible"
+        );
+        let bookmarks = jj_out(&f.canon, &["bookmark", "list"]);
+        assert!(!bookmarks.contains("phab-D10"), "{bookmarks}");
     }
 
     #[test]
