@@ -18,6 +18,9 @@ pub struct Config {
     /// `workdir`. Set by answering "always" to the clone prompt (see `set_auto_clone`).
     #[serde(default)]
     pub auto_clone: bool,
+    /// Create workspaces during sync for newly-seen reviews only.
+    #[serde(default)]
+    pub auto_workspace: bool,
     #[serde(default)]
     pub targets: BTreeMap<String, TargetConfig>,
 
@@ -200,6 +203,14 @@ ignore_repos = ["mozilla/some-noisy-repo"]
         );
         assert_eq!(cfg.workdir, Some(PathBuf::from("~/dev")));
         assert!(!cfg.auto_clone);
+        assert!(!cfg.auto_workspace);
+    }
+
+    #[test]
+    fn parses_auto_workspace() {
+        let cfg: Config = toml::from_str("auto_workspace = true").unwrap();
+        assert!(cfg.auto_workspace);
+        assert!(!Config::default().auto_workspace);
     }
 
     #[test]

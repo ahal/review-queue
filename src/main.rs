@@ -91,7 +91,8 @@ async fn sync_cmd(
             known.join(", ")
         );
     }
-    let report = sync::sync(&sources, paths, only_source, dry_run).await?;
+    let mut report = sync::sync(&sources, paths, only_source, dry_run).await?;
+    sync::auto_workspace(&sources, paths, config, &mut report, dry_run).await?;
     print_sync_report(&report, dry_run);
     Ok(())
 }
@@ -246,6 +247,10 @@ fn print_sync_report(report: &SyncReport, dry_run: bool) {
     for key in &report.added {
         println!("{verb} {key}");
     }
+    let verb = if dry_run { "would fetch" } else { "fetched" };
+    for key in &report.fetched {
+        println!("{verb} {key}");
+    }
     let verb = if dry_run { "would update" } else { "updated" };
     for key in &report.updated {
         println!("{verb} {key}");
@@ -264,6 +269,7 @@ fn print_sync_report(report: &SyncReport, dry_run: bool) {
         eprintln!("error syncing source `{source}`: {err}");
     }
     if report.added.is_empty()
+        && report.fetched.is_empty()
         && report.updated.is_empty()
         && report.removed.is_empty()
         && report.flagged.is_empty()

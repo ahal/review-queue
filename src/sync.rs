@@ -6,7 +6,8 @@
 //! stack of one. See `stacks` for how reviews are grouped.
 //!
 //! `rq sync` (this module's `sync()`) only ever tracks metadata and updates/removes *existing*
-//! workspaces - it never creates one. Per source, per run:
+//! workspaces. With `auto_workspace` enabled, a separate step then creates workspaces for
+//! newly-seen reviews after sync has saved state. Per source, per run:
 //! 1. `fetch_queue()` - reviews currently waiting on you.
 //! 2. New reviews are recorded with no workspace (see `fetch_local()` for that); tracked ones get
 //!    their metadata (including `version` and `ancestors`) refreshed.
@@ -34,7 +35,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{Config, VcsKind};
 use crate::paths::Paths;
-use crate::repo::{OnMissing, RepoStore};
+use crate::repo::{NeedsClone, OnMissing, RepoStore};
 use crate::source::{Lifecycle, RateLimited, Review, ReviewSource};
 use crate::stacks::{self, Stack};
 use crate::state::{ReviewEntry, ReviewKey, State, Status, Workspace};
@@ -49,6 +50,12 @@ const STACK_SCAN_DEPTH: usize = 200;
 #[derive(Debug, Default)]
 pub struct SyncReport {
     pub added: Vec<ReviewKey>,
+    /// Workspaces created by `auto_workspace`, or that it would create on a dry run.
+    pub fetched: Vec<ReviewKey>,
+    /// The bottom-most newly added review of each stack that has no workspace: what
+    /// `auto_workspace` would fetch. Computed from sync's in-memory state, so it's also right
+    /// on a dry run, when nothing is saved.
+    pub new_stacks: Vec<ReviewKey>,
     pub updated: Vec<ReviewKey>,
     pub removed: Vec<ReviewKey>,
     /// Review + human-readable reason it was flagged instead of touched (dirty, apply failure).
@@ -162,11 +169,68 @@ pub async fn sync(
         &mut report,
     )
     .await;
+    report.new_stacks = new_stacks(&state, &report.added);
 
     if !dry_run {
         state.save(&paths.state_file())?;
     }
     Ok(report)
+}
+
+/// For each stack containing a newly added, still-queued review and no workspace yet, its
+/// bottom-most such review. A new review joining an already checked-out stack is skipped:
+/// `reconcile_workspaces` has already folded it into that workspace.
+fn new_stacks(state: &State, added: &[ReviewKey]) -> Vec<ReviewKey> {
+    let candidates: BTreeSet<&ReviewKey> = added
+        .iter()
+        .filter(|key| state.get(key).is_some_and(|e| e.in_queue && !e.resolved))
+        .collect();
+    stacks::group(state.iter())
+        .into_iter()
+        .filter(|stack| {
+            !stack.members.iter().any(|member| {
+                state
+                    .get(member)
+                    .is_some_and(|e| state.workspace_of(e).is_some())
+            })
+        })
+        .filter_map(|stack| stack.members.into_iter().find(|k| candidates.contains(k)))
+        .collect()
+}
+
+/// Create a workspace for each of `report.new_stacks` after `sync` has saved state. The caller
+/// must keep holding the sync lock: `fetch_local` loads and saves state independently.
+pub async fn auto_workspace(
+    sources: &[Box<dyn ReviewSource>],
+    paths: &Paths,
+    config: &Config,
+    report: &mut SyncReport,
+    dry_run: bool,
+) -> Result<()> {
+    if !config.auto_workspace {
+        return Ok(());
+    }
+    if dry_run {
+        report.fetched.extend(report.new_stacks.iter().cloned());
+        return Ok(());
+    }
+
+    let on_missing = if config.auto_clone {
+        OnMissing::Clone
+    } else {
+        OnMissing::Ask
+    };
+    for key in report.new_stacks.clone() {
+        match fetch_local(sources, paths, config, &key, on_missing).await {
+            Ok(_) => report.fetched.push(key),
+            Err(e) if e.downcast_ref::<NeedsClone>().is_some() => report.flagged.push((
+                key,
+                "no local checkout; run `rq fetch` or set auto_clone".into(),
+            )),
+            Err(e) => report.errors.push((key, format!("{e:#}"))),
+        }
+    }
+    Ok(())
 }
 
 /// Record a review from this run's queue: new ones are added with no workspace, tracked ones
@@ -808,7 +872,11 @@ mod tests {
         let paths = paths_in(work_tmp.path());
         let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
 
-        let report = sync(&sources, &paths, None, false).await.unwrap();
+        let mut report = sync(&sources, &paths, None, false).await.unwrap();
+        auto_workspace(&sources, &paths, &Config::default(), &mut report, false)
+            .await
+            .unwrap();
+        assert!(report.fetched.is_empty());
 
         assert_eq!(report.added, vec![ReviewKey::new("gh", "moz/proj/1")]);
         let state = State::load(&paths.state_file()).unwrap();
@@ -1505,6 +1573,228 @@ mod tests {
         assert!(entry.in_queue);
         assert!(!entry.resolved);
         assert_eq!(entry.version, sha);
+    }
+
+    fn auto_workspace_config() -> Config {
+        Config {
+            auto_workspace: true,
+            auto_clone: true,
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_workspace_fetches_new_review_once_and_respects_deletion() {
+        use std::sync::atomic::Ordering;
+
+        let repos = make_repos();
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        let source = StackSource::new(&repos.upstream);
+        source.set_queue(vec![source.review(1, &[], "1")]);
+        let calls = source.checkout_calls.clone();
+        let sources: Vec<Box<dyn ReviewSource>> = vec![Box::new(source)];
+        let config = auto_workspace_config();
+        let mut report = sync(&sources, &paths, None, false).await.unwrap();
+        auto_workspace(&sources, &paths, &config, &mut report, false)
+            .await
+            .unwrap();
+        assert_eq!(report.fetched, vec![stk(1)]);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let state = State::load(&paths.state_file()).unwrap();
+        let ws_path = state.workspace_for(&stk(1)).unwrap().workspace_path.clone();
+        assert!(ws_path.join("D1.txt").exists());
+
+        let mut report = sync(&sources, &paths, None, false).await.unwrap();
+        auto_workspace(&sources, &paths, &config, &mut report, false)
+            .await
+            .unwrap();
+        assert!(report.fetched.is_empty());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        remove_workspace(&paths, &stk(1), false).unwrap();
+        let mut report = sync(&sources, &paths, None, false).await.unwrap();
+        auto_workspace(&sources, &paths, &config, &mut report, false)
+            .await
+            .unwrap();
+        assert!(report.fetched.is_empty());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(!ws_path.exists());
+        assert!(
+            State::load(&paths.state_file())
+                .unwrap()
+                .workspace_for(&stk(1))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_workspace_does_not_backfill_previously_tracked_reviews() {
+        let (_repos, _tmp, paths, sources) = stack_fixture();
+        sync(&sources, &paths, None, false).await.unwrap();
+        let mut report = sync(&sources, &paths, None, false).await.unwrap();
+        auto_workspace(
+            &sources,
+            &paths,
+            &auto_workspace_config(),
+            &mut report,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(report.fetched.is_empty());
+        assert_eq!(
+            State::load(&paths.state_file())
+                .unwrap()
+                .workspaces()
+                .count(),
+            0
+        );
+        assert!(!paths.repos_file().exists());
+    }
+
+    #[tokio::test]
+    async fn auto_workspace_fetches_three_review_stack_once_at_bottom() {
+        let repos = make_repos();
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        let source = StackSource::new(&repos.upstream);
+        source.set_queue(vec![
+            source.review(3, &[1, 2], "1"),
+            source.review(2, &[1], "1"),
+            source.review(1, &[], "1"),
+        ]);
+        let calls = source.checkout_calls.clone();
+        let sources: Vec<Box<dyn ReviewSource>> = vec![Box::new(source)];
+        let mut report = sync(&sources, &paths, None, false).await.unwrap();
+        auto_workspace(
+            &sources,
+            &paths,
+            &auto_workspace_config(),
+            &mut report,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.fetched, vec![stk(1)]);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let state = State::load(&paths.state_file()).unwrap();
+        assert_eq!(state.workspaces().count(), 1);
+        let ws = state.workspace_for(&stk(3)).unwrap();
+        assert_eq!(ws.tip, stk(3));
+        assert!(ws.workspace_path.join("D1.txt").exists());
+        assert!(!ws.workspace_path.join("D2.txt").exists());
+        assert!(!ws.workspace_path.join("D3.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn auto_workspace_does_not_fetch_new_member_of_existing_workspace() {
+        let (repos, _tmp, paths, sources) = stack_fixture();
+        let config = auto_workspace_config();
+        let mut report = sync(&sources, &paths, None, false).await.unwrap();
+        auto_workspace(&sources, &paths, &config, &mut report, false)
+            .await
+            .unwrap();
+        let next = StackSource::new(&repos.upstream);
+        next.set_queue(vec![
+            next.review(1, &[], "1"),
+            next.review(2, &[1], "1"),
+            next.review(3, &[1, 2], "1"),
+        ]);
+        let calls = next.checkout_calls.clone();
+        let sources: Vec<Box<dyn ReviewSource>> = vec![Box::new(next)];
+        let mut report = sync(&sources, &paths, None, true).await.unwrap();
+        auto_workspace(&sources, &paths, &config, &mut report, true)
+            .await
+            .unwrap();
+        assert_eq!(report.added, vec![stk(3)]);
+        assert!(report.fetched.is_empty(), "dry run: {:?}", report.fetched);
+        let mut report = sync(&sources, &paths, None, false).await.unwrap();
+        assert_eq!(report.added, vec![stk(3)]);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        auto_workspace(&sources, &paths, &config, &mut report, false)
+            .await
+            .unwrap();
+        assert!(report.fetched.is_empty());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn auto_workspace_dry_run_reports_candidates_without_writing_state() {
+        let (_repos, _tmp, paths, sources) = stack_fixture();
+        let mut report = sync(&sources, &paths, None, true).await.unwrap();
+        auto_workspace(
+            &sources,
+            &paths,
+            &auto_workspace_config(),
+            &mut report,
+            true,
+        )
+        .await
+        .unwrap();
+        // One stack of two new reviews: one workspace, at the bottom.
+        assert_eq!(report.added.len(), 2);
+        assert_eq!(report.fetched, vec![stk(1)]);
+        assert!(!paths.state_file().exists());
+        assert!(!paths.repos_file().exists());
+        assert!(!paths.workspace_dir(&stk(1).slug()).exists());
+    }
+
+    #[tokio::test]
+    async fn auto_workspace_flags_missing_checkout_without_cloning() {
+        let (_repos, _tmp, paths, sources) = stack_fixture();
+        let config = Config {
+            auto_workspace: true,
+            ..Config::default()
+        };
+        let mut report = sync(&sources, &paths, None, false).await.unwrap();
+        auto_workspace(&sources, &paths, &config, &mut report, false)
+            .await
+            .unwrap();
+        assert!(report.errors.is_empty());
+        assert!(report.fetched.is_empty());
+        assert_eq!(
+            report.flagged,
+            vec![(
+                stk(1),
+                "no local checkout; run `rq fetch` or set auto_clone".into()
+            )]
+        );
+        assert_eq!(
+            State::load(&paths.state_file())
+                .unwrap()
+                .workspaces()
+                .count(),
+            0
+        );
+        assert!(!paths.repos_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn auto_workspace_continues_after_errors_and_does_not_retry() {
+        let repos = make_repos();
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        let source = StackSource::new(&repos.upstream);
+        source.set_queue(vec![source.review(1, &[], "1"), source.review(2, &[], "1")]);
+        source
+            .rate_limited
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let calls = source.checkout_calls.clone();
+        let sources: Vec<Box<dyn ReviewSource>> = vec![Box::new(source)];
+        let config = auto_workspace_config();
+        let mut report = sync(&sources, &paths, None, false).await.unwrap();
+        auto_workspace(&sources, &paths, &config, &mut report, false)
+            .await
+            .unwrap();
+        assert_eq!(report.errors.len(), 2);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let mut report = sync(&sources, &paths, None, false).await.unwrap();
+        auto_workspace(&sources, &paths, &config, &mut report, false)
+            .await
+            .unwrap();
+        assert!(report.errors.is_empty());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

@@ -9,7 +9,8 @@
 //! runs the selection, and Esc closes it; other characters are ignored. Configured targets run
 //! commands, optionally fetching first
 //! and suspending the TUI until they exit. See `run_event_loop` for why suspension tears down
-//! and recreates the backend. `rq sync` itself never creates workspaces (see `crate::sync`).
+//! and recreates the backend. `rq sync` creates workspaces for newly-seen reviews only with
+//! `auto_workspace` enabled.
 //! `d` deletes the selected workspace after confirmation, discarding local changes, or cancels
 //! an in-flight fetch. Fetching runs on a background thread with a row spinner; choosing a
 //! target is the confirmation to create its workspace. The underlying `git`/`jj` calls cannot
@@ -1242,6 +1243,7 @@ fn sync_and_reload(s: &mut Cursive) {
     ctx.syncing = Some(0);
     let sources = ctx.sources.clone();
     let paths = ctx.paths.clone();
+    let config = ctx.config.clone();
     let handle = ctx.handle.clone();
     set_status(s, format!("{} syncing…", SPINNER_FRAMES[0]));
 
@@ -1274,7 +1276,11 @@ fn sync_and_reload(s: &mut Cursive) {
     let cb_sink = s.cb_sink().clone();
     std::thread::spawn(move || {
         let result = with_sync_lock(&paths, || {
-            handle.block_on(sync::sync(&sources, &paths, None, false))
+            handle.block_on(async {
+                let mut report = sync::sync(&sources, &paths, None, false).await?;
+                sync::auto_workspace(&sources, &paths, &config, &mut report, false).await?;
+                Ok(report)
+            })
         });
         done.store(true, Ordering::SeqCst);
         let _ = cb_sink.send(Box::new(move |s| finish_sync(s, result)));
@@ -1299,6 +1305,7 @@ fn sync_summary(report: &sync::SyncReport) -> String {
     let mut parts = Vec::new();
     for (n, what) in [
         (report.added.len(), "added"),
+        (report.fetched.len(), "fetched"),
         (report.updated.len(), "updated"),
         (report.removed.len(), "removed"),
         (report.flagged.len(), "flagged"),
@@ -2028,7 +2035,11 @@ key = "u"
         report.added.push(ReviewKey::new("moz", "D1"));
         report.removed.push(ReviewKey::new("moz", "D2"));
         report.removed.push(ReviewKey::new("moz", "D3"));
-        assert_eq!(sync_summary(&report), "synced: 1 added, 2 removed");
+        report.fetched.push(ReviewKey::new("moz", "D1"));
+        assert_eq!(
+            sync_summary(&report),
+            "synced: 1 added, 1 fetched, 2 removed"
+        );
         report
             .errors
             .push((ReviewKey::new("moz", "D4"), "boom".into()));
@@ -2037,7 +2048,7 @@ key = "u"
             .push(("moz".into(), "fetching queue: 429".into()));
         assert_eq!(
             sync_summary(&report),
-            "synced: 1 added, 2 removed (2 error(s); source `moz`: fetching queue: 429)"
+            "synced: 1 added, 1 fetched, 2 removed (2 error(s); source `moz`: fetching queue: 429)"
         );
     }
 

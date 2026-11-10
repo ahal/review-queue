@@ -30,8 +30,11 @@ workspace in `$SHELL`. Use `h`/`l` or left/right to expand/collapse details, `f`
 In the target picker, arrows or `j`/`k` move the selection, Enter or `l` runs it, and Esc
 closes the picker. Other character keys are ignored; target shortcuts only work in the main list.
 
-`rq sync` updates existing workspaces and removes them once their review resolves. It never
-creates one. Use `rq fetch` or a workspace target in the TUI for that. Choosing a target starts
+`rq sync` updates existing workspaces and removes them once every review in their stack resolves.
+With `auto_workspace = true`, it also creates workspaces for newly-seen reviews. Existing reviews
+are not backfilled, failed fetches are not retried, and deleting a workspace with `d` is permanent
+across syncs. Use `rq fetch` or a workspace target in the TUI to create one manually. Sync never
+prompts; enable `auto_clone` to clone missing repositories automatically. Choosing a target starts
 fetching without a workspace confirmation; rq still asks before cloning a missing repository
 unless `auto_clone` is enabled.
 
@@ -50,6 +53,7 @@ eval "$(rq shell-init zsh)"
 # Existing checkouts under here are used as canonical repos instead of cloning.
 workdir = "~/dev"
 # auto_clone = true         # clone without asking when no checkout is found
+# auto_workspace = true     # sync creates workspaces for newly-seen reviews
 # data_dir = "~/.local/share/review-queue"
 
 [source.github]
