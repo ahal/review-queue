@@ -1,4 +1,4 @@
-//! Jj backend. Shells out only to the `jj` CLI (never raw `git`) plus the standalone `patch(1)`
+//! Jj backend. Shells out only to the `jj` CLI (raw `git` only for the index refresh below) plus the standalone `patch(1)`
 //! tool for applying diffs - a secondary `jj workspace add`'d directory has no `.git` of its
 //! own (only the canonical repo's own default workspace is colocated with git), so `git apply`
 //! isn't available there. `jj commit` snapshots the working copy directly, so `patch(1)` editing
@@ -20,6 +20,11 @@
 //!   user.name=...`/`user.email=...` on whichever call creates the commit that will receive that
 //!   patch (the initial `workspace add`/`new` for the first patch, the previous patch's `commit`
 //!   for the rest). Verified with a local spike before relying on it.
+//! - `add_workspace` ends with a best-effort `git update-index -q --refresh` when the new
+//!   workspace has a `.git` (newer jj colocates secondary workspaces as git worktrees, whose
+//!   index it writes without stat data). Otherwise the first `git status` there re-hashes
+//!   every file - minutes in a large repo - and tools that run status read-only (e.g. Claude
+//!   Code's startup snapshot) pay that on every run. This is the only raw `git` call.
 //! - Every `add_workspace`/`update_workspace` call pins its resulting head under a
 //!   `review-queue/<name>/<version>` bookmark (`jj bookmark create`/`set`). This isn't optional
 //!   bookkeeping the way it might seem: a spike showed that without it, a force-pushed PR branch
@@ -60,6 +65,17 @@ impl JjVcs {
             );
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Give a colocated workspace's git index real stat data (see the module docs). Failure
+    /// only costs a slow first `git status`, so it is ignored.
+    fn refresh_git_index(ws: &Path) {
+        if ws.join(".git").exists() {
+            let _ = Command::new("git")
+                .current_dir(ws)
+                .args(["update-index", "-q", "--refresh"])
+                .output();
+        }
     }
 
     fn revision_exists(&self, repo: &Path, rev: &str) -> bool {
@@ -330,6 +346,7 @@ impl Vcs for JjVcs {
             .with_context(|| format!("creating jj workspace at {}", ws.display()))?;
 
         self.apply_checkout(ws, checkout)?;
+        Self::refresh_git_index(ws);
 
         let head = self.head_id(ws)?;
         self.pin(repo, name, version, &head)?;
@@ -642,6 +659,39 @@ mod tests {
         git(fork, &["add", filename]);
         git(fork, &["commit", "-q", "-m", "second pr change"]);
         git_rev_parse(fork, "HEAD")
+    }
+
+    #[test]
+    fn add_workspace_leaves_a_refreshed_git_index() {
+        require_jj!();
+        let f = fixture();
+        let vcs = JjVcs;
+        let ws = f._tmp.path().join("ws");
+        let checkout = Checkout::Patches {
+            base: Some(f.base.clone()),
+            patches: vec![add_file_patch(
+                "one",
+                "a.txt",
+                "a\n",
+                "Test <test@example.com>",
+            )],
+        };
+        vcs.add_workspace(&f.canon, &ws, &checkout, "phab/D1", "v1")
+            .unwrap();
+        if !ws.join(".git").exists() {
+            return; // Older jj: no git worktree, so no index to refresh.
+        }
+        let out = Command::new("git")
+            .current_dir(&ws)
+            .args(["ls-files", "--debug"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&out.stdout);
+        assert!(listing.contains("mtime:"), "{listing}");
+        assert!(
+            !listing.contains("mtime: 0:0"),
+            "stat-less entries left: {listing}"
+        );
     }
 
     #[test]
