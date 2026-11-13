@@ -385,6 +385,12 @@ async fn reconcile_workspaces(
             continue;
         }
 
+        // A failed build has no trustworthy head to probe, so `is_dirty` would read it as dirty
+        // and `fetch_local` would then hand it back as-is. Leave it to `fetch_local` to rebuild.
+        if ws.status == Status::ApplyFailed {
+            continue;
+        }
+
         // The stack this workspace belongs to; prefer the one still containing its old tip.
         let stack = stacks::stack_containing(&stacks, &ws.tip)
             .or_else(|| stacks::stack_containing(&stacks, live[0]));
@@ -1227,6 +1233,75 @@ mod tests {
         assert!(report.flagged.is_empty());
         let state = State::load(&paths.state_file()).unwrap();
         assert!(state.workspace_for(&key).is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_failed_workspace_is_left_for_fetch_local_to_rebuild() {
+        let repos = make_repos();
+        let sha1 = git_rev_parse(&repos.fork, "HEAD");
+        let server = MockServer::start().await;
+        mount_search(&server, true).await;
+        mount_pull(
+            &server,
+            pull_json("moz", "proj", &repos.upstream, &repos.fork, &sha1, "open"),
+        )
+        .await;
+
+        let work_tmp = TempDir::new().unwrap();
+        let paths = paths_in(work_tmp.path());
+        let config = Config::default();
+        let key = ReviewKey::new("gh", "moz/proj/1");
+        let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
+        sync(&sources, &paths, None, false).await.unwrap();
+        let ws_path = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone)
+            .await
+            .unwrap();
+        drop(server);
+
+        // Simulate a build that failed after the directory was created.
+        let mut state = State::load(&paths.state_file()).unwrap();
+        let (id, mut ws) = state
+            .workspaces()
+            .map(|(id, ws)| (id.clone(), ws.clone()))
+            .next()
+            .unwrap();
+        ws.status = Status::ApplyFailed;
+        ws.head_id = String::new();
+        state.insert_workspace(id, ws);
+        state.save(&paths.state_file()).unwrap();
+
+        // The PR gets a new commit pushed.
+        std::fs::write(repos.fork.join("pr2.txt"), "more change\n").unwrap();
+        git(&repos.fork, &["add", "pr2.txt"]);
+        git(&repos.fork, &["commit", "-q", "-m", "pr change 2"]);
+        let sha2 = git_rev_parse(&repos.fork, "HEAD");
+        expose_pr_ref(&repos.upstream, &repos.fork, "feature", 1);
+
+        let server = MockServer::start().await;
+        mount_search(&server, true).await;
+        mount_pull(
+            &server,
+            pull_json("moz", "proj", &repos.upstream, &repos.fork, &sha2, "open"),
+        )
+        .await;
+        let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
+
+        let report = sync(&sources, &paths, None, false).await.unwrap();
+        assert!(report.flagged.is_empty(), "must not be flagged dirty");
+        let state = State::load(&paths.state_file()).unwrap();
+        assert_eq!(
+            state.workspace_for(&key).unwrap().status,
+            Status::ApplyFailed
+        );
+
+        fetch_local(&sources, &paths, &config, &key, OnMissing::Clone)
+            .await
+            .unwrap();
+        let state = State::load(&paths.state_file()).unwrap();
+        let ws = state.workspace_for(&key).unwrap();
+        assert_eq!(ws.status, Status::Ready);
+        assert_eq!(ws.version, sha2);
+        assert!(ws_path.is_dir());
     }
 
     #[tokio::test]
