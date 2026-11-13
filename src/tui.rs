@@ -251,7 +251,10 @@ fn run_event_loop(mut siv: Cursive) -> Result<()> {
                         &mut siv,
                         format!("`{label}` exited with {status} in {}", path.display()),
                     ),
-                    Err(e) => set_status(&mut siv, format!("failed to launch `{label}`: {e}")),
+                    Err(e) => set_status(
+                        &mut siv,
+                        format!("failed to launch `{label}` in {}: {e}", path.display()),
+                    ),
                 }
             }
         }
@@ -357,7 +360,10 @@ fn launch(s: &mut Cursive, key: ReviewKey, workspace: Option<PathBuf>, idx: usiz
                 }
             });
         }
-        Err(e) => set_status(s, format!("failed to launch `{label}`: {e}")),
+        Err(e) => set_status(
+            s,
+            format!("failed to launch `{label}` in {}: {e}", run.cwd.display()),
+        ),
     }
 }
 
@@ -955,11 +961,11 @@ fn run_target(s: &mut Cursive, key: ReviewKey, idx: usize) {
         set_status(s, msg);
         return;
     }
-    // A workspace left `ApplyFailed` doesn't count: `fetch_local` tears it down and rebuilds it,
-    // which on a large repo takes long enough to freeze the UI if run inline.
+    // A workspace left `ApplyFailed` (or deleted from disk) doesn't count: `fetch_local` tears it
+    // down and rebuilds it, which on a large repo takes long enough to freeze the UI if run inline.
     let has_workspace = State::load(&ctx.paths.state_file()).ok().is_some_and(|st| {
         st.workspace_for(&key)
-            .is_some_and(|ws| ws.status != Status::ApplyFailed)
+            .is_some_and(|ws| ws.status != Status::ApplyFailed && ws.workspace_path.is_dir())
     });
 
     if has_workspace {
@@ -1120,12 +1126,11 @@ fn finish_fetch(
     if cancelled.load(Ordering::SeqCst) {
         let status = match &result {
             Ok(_) if had_workspace => format!("cancelled fetching {key}; existing workspace kept"),
-            Ok(_) => match s
-                .user_data::<Ctx>()
-                .map(|ctx| {
-                    with_sync_lock(&ctx.paths, || sync::remove_workspace(&ctx.paths, &key, true))
+            Ok(_) => match s.user_data::<Ctx>().map(|ctx| {
+                with_sync_lock(&ctx.paths, || {
+                    sync::remove_workspace(&ctx.paths, &key, true)
                 })
-            {
+            }) {
                 Some(Ok(())) => format!("cancelled fetching {key}; workspace cleaned up"),
                 Some(Err(e)) => format!("cancelled fetching {key}; cleanup failed: {e:#}"),
                 None => format!("cancelled fetching {key}"),

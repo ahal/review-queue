@@ -375,6 +375,16 @@ async fn reconcile_workspaces(
             continue;
         }
 
+        // Deleted out from under us: forget it rather than probing it (which errors, and would
+        // otherwise read as dirty), so the next open rebuilds it from scratch.
+        if !ws.workspace_path.is_dir() {
+            if !dry_run {
+                let _ = vcs_for(ws.vcs).remove_workspace(&ws.repo_path, &ws.workspace_path, &id);
+                state.remove_workspace(&id);
+            }
+            continue;
+        }
+
         // The stack this workspace belongs to; prefer the one still containing its old tip.
         let stack = stacks::stack_containing(&stacks, &ws.tip)
             .or_else(|| stacks::stack_containing(&stacks, live[0]));
@@ -491,10 +501,10 @@ fn remove_finished_workspace(
 /// make sure `key`, a review already tracked by a prior `sync()`, has a workspace - the one for
 /// its whole stack - then move that workspace to `key`'s own patch. If the stack is already
 /// checked out this is just the move (skipped when the workspace has local changes, which are
-/// never disturbed); an `ApplyFailed` workspace is instead cleaned up and rebuilt, since handing
-/// back a broken/empty path again would just repeat the failure silently. This is the on-demand
-/// counterpart to `sync()`'s deliberate refusal to create workspaces on its own - see the module
-/// docs.
+/// never disturbed); an `ApplyFailed` (or deleted) workspace is instead cleaned up and rebuilt,
+/// since handing back a broken/empty path again would just repeat the failure silently. This is
+/// the on-demand counterpart to `sync()`'s deliberate refusal to create workspaces on its own -
+/// see the module docs.
 ///
 /// Under `OnMissing::Ask`, a repo with no local checkout surfaces as a `repo::NeedsClone` error
 /// (`downcast_ref` it) rather than cloning - callers should confirm with the user and retry with
@@ -532,7 +542,7 @@ pub async fn fetch_local(
         .with_context(|| format!("no configured source named `{}`", key.source))?;
 
     if let Some(ws) = state.workspace(&stack_id).cloned() {
-        if ws.status != Status::ApplyFailed {
+        if ws.status != Status::ApplyFailed && ws.workspace_path.is_dir() {
             position_at(source.as_ref(), &ws, key);
             state.save(&paths.state_file())?;
             return Ok(ws.workspace_path);
@@ -1176,6 +1186,47 @@ mod tests {
         let entry = state.get(&key).unwrap();
         assert!(!entry.in_queue);
         assert!(state.workspace_of(entry).unwrap().workspace_path.exists());
+    }
+
+    #[tokio::test]
+    async fn deleted_workspace_is_forgotten_and_rebuilt() {
+        let repos = make_repos();
+        let sha1 = git_rev_parse(&repos.fork, "HEAD");
+        let server = MockServer::start().await;
+        mount_search(&server, true).await;
+        mount_pull(
+            &server,
+            pull_json("moz", "proj", &repos.upstream, &repos.fork, &sha1, "open"),
+        )
+        .await;
+
+        let work_tmp = TempDir::new().unwrap();
+        let paths = paths_in(work_tmp.path());
+        let config = Config::default();
+        let key = ReviewKey::new("gh", "moz/proj/1");
+        let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
+        sync(&sources, &paths, None, false).await.unwrap();
+        let ws_path = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone)
+            .await
+            .unwrap();
+
+        // Deleted out from under us, then opened again before any sync notices.
+        std::fs::remove_dir_all(&ws_path).unwrap();
+        let reopened = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone)
+            .await
+            .unwrap();
+        assert_eq!(reopened, ws_path);
+        assert!(
+            ws_path.is_dir(),
+            "fetch_local must rebuild a deleted workspace"
+        );
+
+        // Deleted again, then a sync runs: it must forget the workspace, not flag it dirty.
+        std::fs::remove_dir_all(&ws_path).unwrap();
+        let report = sync(&sources, &paths, None, false).await.unwrap();
+        assert!(report.flagged.is_empty());
+        let state = State::load(&paths.state_file()).unwrap();
+        assert!(state.workspace_for(&key).is_none());
     }
 
     #[tokio::test]
