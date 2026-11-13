@@ -116,6 +116,12 @@ async fn fetch_cmd(paths: &Paths, config: &Config, config_path: &Path, id: &str)
     loop {
         match sync::fetch_local(&sources, paths, config, &key, on_missing).await {
             Ok(ws_path) => {
+                if let Some(note) = State::load(&paths.state_file())
+                    .ok()
+                    .and_then(|st| sync::partial_note(&st, &key))
+                {
+                    eprintln!("warning: {note}");
+                }
                 println!("{}", ws_path.display());
                 return Ok(());
             }

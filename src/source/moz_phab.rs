@@ -1667,14 +1667,7 @@ mod tests {
                 assert_eq!(program, "moz-phab");
                 assert_eq!(
                     args,
-                    vec![
-                        "patch",
-                        "D1",
-                        "--apply-to",
-                        "base",
-                        "--yes",
-                        "--no-branch"
-                    ]
+                    vec!["patch", "D1", "--apply-to", "base", "--yes", "--no-branch"]
                 );
                 assert!(env.contains(&(
                     "MOZPHAB_PHABRICATOR_API_TOKEN".to_string(),

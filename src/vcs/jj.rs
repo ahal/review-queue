@@ -45,7 +45,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::source::{Checkout, Patch};
-use crate::vcs::Vcs;
+use crate::vcs::{PartialApply, Vcs};
 
 pub struct JjVcs;
 
@@ -149,24 +149,29 @@ impl JjVcs {
         }
     }
 
-    /// Apply `diff` to the tree at `ws` with the standalone `patch(1)` tool.
+    /// Apply `diff` to the tree at `ws` with the standalone `patch(1)` tool. A dry run goes
+    /// first so a patch that doesn't apply leaves the tree untouched, rather than half-applied
+    /// with `.rej`/`.orig` files that jj may not even track (and so can't `restore` away).
     fn apply_diff(&self, ws: &Path, diff: &str) -> Result<()> {
         let mut file = tempfile::NamedTempFile::new().context("creating temp patch file")?;
         file.write_all(diff.as_bytes())
             .context("writing temp patch file")?;
 
-        let output = Command::new("patch")
-            .current_dir(ws)
-            .args(["-p1", "-i"])
-            .arg(file.path())
-            .output()
-            .context("running `patch`")?;
-        if !output.status.success() {
-            bail!(
-                "`patch -p1` in {} failed: {}",
-                ws.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+        for dry_run in [true, false] {
+            let mut cmd = Command::new("patch");
+            cmd.current_dir(ws).args(["-p1", "-i"]).arg(file.path());
+            if dry_run {
+                cmd.arg("--dry-run");
+            }
+            let output = cmd.output().context("running `patch`")?;
+            if !output.status.success() {
+                bail!(
+                    "`patch -p1` in {} failed: {}\n{}",
+                    ws.display(),
+                    String::from_utf8_lossy(&output.stderr).trim(),
+                    String::from_utf8_lossy(&output.stdout).trim(),
+                );
+            }
         }
         Ok(())
     }
@@ -280,6 +285,48 @@ impl JjVcs {
         Ok(())
     }
 
+    /// After `apply_checkout` failed in `ws` (built on `base`), keep whatever part of the stack
+    /// did apply: discard the failed patch's leftovers from `@`, and if `@-` is a new commit
+    /// (not `base` or one of its ancestors, where an external command may have moved to), pin
+    /// it and report a `PartialApply`. Anything else hands back the original error.
+    fn salvage(
+        &self,
+        repo: &Path,
+        ws: &Path,
+        base: &str,
+        name: &str,
+        version: &str,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        if self.run(ws, &["restore"]).is_err() {
+            return error;
+        }
+        let Ok(head) = self.head_id(ws) else {
+            return error;
+        };
+        let applied = self
+            .run(
+                ws,
+                &[
+                    "log",
+                    "-r",
+                    &format!("{head} ~ ::{base}"),
+                    "--no-graph",
+                    "-T",
+                    "commit_id",
+                ],
+            )
+            .is_ok_and(|out| !out.is_empty());
+        if !applied || self.pin(repo, name, version, &head).is_err() {
+            return error;
+        }
+        PartialApply {
+            head,
+            message: format!("{error:#}"),
+        }
+        .into()
+    }
+
     fn workspace_name(name: &str) -> String {
         format!("rq-{}", name.replace('/', "-"))
     }
@@ -345,8 +392,12 @@ impl Vcs for JjVcs {
         self.run(repo, &arg_refs)
             .with_context(|| format!("creating jj workspace at {}", ws.display()))?;
 
-        self.apply_checkout(ws, checkout)?;
+        let base = self.head_id(ws)?;
+        let applied = self.apply_checkout(ws, checkout);
         Self::refresh_git_index(ws);
+        if let Err(e) = applied {
+            return Err(self.salvage(repo, ws, &base, name, version, e));
+        }
 
         let head = self.head_id(ws)?;
         self.pin(repo, name, version, &head)?;
@@ -374,7 +425,10 @@ impl Vcs for JjVcs {
         self.run(ws, &arg_refs)
             .with_context(|| format!("updating jj workspace at {}", ws.display()))?;
 
-        self.apply_checkout(ws, checkout)?;
+        let base = self.head_id(ws)?;
+        if let Err(e) = self.apply_checkout(ws, checkout) {
+            return Err(self.salvage(repo, ws, &base, name, version, e));
+        }
 
         let head = self.head_id(ws)?;
         self.pin(repo, name, version, &head)?;
@@ -907,6 +961,64 @@ mod tests {
             .unwrap();
 
         assert_eq!(commit_id(&ws, "@--"), f.base);
+    }
+
+    /// A patch that adds `partial.txt` but then fails on `README.md`, whose line it expects
+    /// isn't there - so `patch(1)` applies the first file and leaves a `.rej` for the second.
+    fn failing_patch(title: &str) -> Patch {
+        let mut patch = add_file_patch(title, "partial.txt", "x\n", "Bad <bad@example.com>");
+        patch.diff.push_str(
+            "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-nope\n+changed\n",
+        );
+        patch
+    }
+
+    #[test]
+    fn a_stack_failing_partway_keeps_the_patches_that_applied() {
+        require_jj!();
+        let f = fixture();
+        let vcs = JjVcs;
+        let ws = f._tmp.path().join("ws");
+        let checkout = Checkout::Patches {
+            base: Some(f.base.clone()),
+            patches: vec![
+                add_file_patch("add a", "a.txt", "aaa\n", "A <a@example.com>"),
+                failing_patch("bad"),
+            ],
+        };
+
+        let err = vcs
+            .add_workspace(&f.canon, &ws, &checkout, "moz/D1", "1")
+            .unwrap_err();
+        let partial = err
+            .downcast_ref::<PartialApply>()
+            .expect("expected a PartialApply");
+
+        assert_eq!(partial.head, commit_id(&ws, "@-"));
+        assert!(ws.join("a.txt").exists());
+        assert!(
+            !ws.join("partial.txt").exists() && !ws.join("README.md.rej").exists(),
+            "the failed patch's leftovers must be discarded"
+        );
+        assert!(!vcs.is_dirty(&ws, &partial.head).unwrap());
+        assert_eq!(commit_id(&f.canon, "review-queue/moz/D1/1"), partial.head);
+    }
+
+    #[test]
+    fn a_stack_failing_on_its_first_patch_is_not_partial() {
+        require_jj!();
+        let f = fixture();
+        let vcs = JjVcs;
+        let ws = f._tmp.path().join("ws");
+        let checkout = Checkout::Patches {
+            base: Some(f.base.clone()),
+            patches: vec![failing_patch("bad")],
+        };
+
+        let err = vcs
+            .add_workspace(&f.canon, &ws, &checkout, "moz/D1", "1")
+            .unwrap_err();
+        assert!(err.downcast_ref::<PartialApply>().is_none());
     }
 
     #[test]

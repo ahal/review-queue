@@ -13,6 +13,17 @@ use crate::source::Checkout;
 pub mod git;
 pub mod jj;
 
+/// Returned (`downcast_ref` it) by `add_workspace`/`update_workspace` when the checkout failed
+/// partway, after at least one patch had landed. The workspace is left clean, sitting on `head`
+/// (the last patch that applied), and pinned like a successful build would be.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct PartialApply {
+    pub head: String,
+    /// The underlying failure, already rendered with its context chain.
+    pub message: String,
+}
+
 pub trait Vcs {
     /// Fetch `refspec_or_sha` into the canonical repo if not already present.
     fn ensure_commit(&self, repo: &Path, refspec_or_sha: &str) -> Result<()>;
@@ -20,7 +31,7 @@ pub trait Vcs {
     /// Create a new worktree/workspace at `ws` from the canonical `repo`, applying `checkout`.
     /// `name` is the review's key slug (e.g. `moz/D12345`), used to namespace the ref that pins
     /// this `version` so it survives future updates; see `update_workspace`. Returns the
-    /// resulting head id.
+    /// resulting head id, or a `PartialApply` error if only part of the stack applied.
     fn add_workspace(
         &self,
         repo: &Path,
@@ -34,7 +45,8 @@ pub trait Vcs {
     /// workspace pointed at before this call remains reachable afterwards (each call pins its
     /// own resulting head under a `name`/`version`-namespaced ref rather than overwriting the
     /// previous one), so old versions stay available for interdiffing until `remove_workspace`
-    /// drops them all. Returns the new head id.
+    /// drops them all. Returns the new head id, or a `PartialApply` error if only part of the
+    /// stack applied.
     fn update_workspace(
         &self,
         repo: &Path,

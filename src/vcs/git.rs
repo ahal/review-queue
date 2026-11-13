@@ -13,7 +13,9 @@
 //! - `remove_workspace`: `git worktree remove`, plus every `refs/review-queue/<name>/*` ref.
 //!
 //! A failed patch application leaves the workspace in place (the caller should record
-//! `Status::ApplyFailed`) rather than being silently cleaned up.
+//! `Status::ApplyFailed`) rather than being silently cleaned up - unless earlier patches had
+//! already been committed, in which case the failed one's leftovers are discarded and the
+//! workspace is kept on the last good patch as a `PartialApply`.
 
 use std::io::Write;
 use std::path::Path;
@@ -22,7 +24,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::source::{Checkout, Patch};
-use crate::vcs::Vcs;
+use crate::vcs::{PartialApply, Vcs};
 
 pub struct GitVcs;
 
@@ -184,6 +186,43 @@ impl GitVcs {
         }
     }
 
+    /// After `apply_checkout` failed in `ws` (built on `base`), keep whatever part of the stack
+    /// did apply: discard the failed patch's leftovers, and if HEAD is a new commit (not `base`
+    /// or one of its ancestors, where an external command may have moved to), pin it and
+    /// report a `PartialApply`. Anything else hands back the original error.
+    fn salvage(
+        &self,
+        repo: &Path,
+        ws: &Path,
+        base: &str,
+        name: &str,
+        version: &str,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        if self.run(ws, &["reset", "-q", "--hard"]).is_err()
+            || self.run(ws, &["clean", "-fdq"]).is_err()
+        {
+            return error;
+        }
+        let Ok(head) = self.run(ws, &["rev-parse", "HEAD"]) else {
+            return error;
+        };
+        let behind_base = Command::new("git")
+            .current_dir(ws)
+            .args(["merge-base", "--is-ancestor", &head, base])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(true);
+        if behind_base || self.pin_ref(repo, name, version, &head).is_err() {
+            return error;
+        }
+        PartialApply {
+            head,
+            message: format!("{error:#}"),
+        }
+        .into()
+    }
+
     fn pin_ref(&self, repo: &Path, name: &str, version: &str, head: &str) -> Result<()> {
         self.run(
             repo,
@@ -227,7 +266,9 @@ impl Vcs for GitVcs {
         self.run(repo, &["worktree", "add", "--detach", &ws_str, &base])
             .with_context(|| format!("creating worktree at {}", ws.display()))?;
 
-        self.apply_checkout(ws, checkout)?;
+        if let Err(e) = self.apply_checkout(ws, checkout) {
+            return Err(self.salvage(repo, ws, &base, name, version, e));
+        }
 
         let head = self.run(ws, &["rev-parse", "HEAD"])?;
         self.pin_ref(repo, name, version, &head)?;
@@ -247,7 +288,9 @@ impl Vcs for GitVcs {
         self.run(ws, &["checkout", "--detach", &base])
             .with_context(|| format!("checking out {base} in {}", ws.display()))?;
 
-        self.apply_checkout(ws, checkout)?;
+        if let Err(e) = self.apply_checkout(ws, checkout) {
+            return Err(self.salvage(repo, ws, &base, name, version, e));
+        }
 
         let head = self.run(ws, &["rev-parse", "HEAD"])?;
         self.pin_ref(repo, name, version, &head)?;
@@ -521,6 +564,63 @@ mod tests {
         git(&ws, &["commit", "-q", "-m", "local"]);
 
         assert!(vcs.is_dirty(&ws, &tip).unwrap());
+    }
+
+    /// A patch that adds `partial.txt` but then fails on `README.md`, whose line it expects
+    /// isn't there.
+    fn failing_patch(title: &str) -> Patch {
+        let mut patch = add_file_patch(title, "partial.txt", "x\n");
+        patch.diff.push_str(
+            "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-nope\n+changed\n",
+        );
+        patch
+    }
+
+    #[test]
+    fn a_stack_failing_partway_keeps_the_patches_that_applied() {
+        let f = fixture();
+        let vcs = GitVcs;
+        let ws = f._tmp.path().join("ws");
+        let checkout = Checkout::Patches {
+            base: Some(f.base.clone()),
+            patches: vec![
+                add_file_patch("add a", "a.txt", "aaa\n"),
+                failing_patch("bad"),
+            ],
+        };
+
+        let err = vcs
+            .add_workspace(&f.canon, &ws, &checkout, "moz/D1", "1")
+            .unwrap_err();
+        let partial = err
+            .downcast_ref::<PartialApply>()
+            .expect("expected a PartialApply");
+
+        assert_eq!(partial.head, rev_parse(&ws, "HEAD"));
+        assert_eq!(rev_parse(&ws, "HEAD~1"), f.base);
+        assert!(ws.join("a.txt").exists());
+        assert!(!ws.join("partial.txt").exists());
+        assert!(!vcs.is_dirty(&ws, &partial.head).unwrap());
+        assert_eq!(
+            rev_parse(&f.canon, "refs/review-queue/moz/D1/1"),
+            partial.head
+        );
+    }
+
+    #[test]
+    fn a_stack_failing_on_its_first_patch_is_not_partial() {
+        let f = fixture();
+        let vcs = GitVcs;
+        let ws = f._tmp.path().join("ws");
+        let checkout = Checkout::Patches {
+            base: Some(f.base.clone()),
+            patches: vec![failing_patch("bad")],
+        };
+
+        let err = vcs
+            .add_workspace(&f.canon, &ws, &checkout, "moz/D1", "1")
+            .unwrap_err();
+        assert!(err.downcast_ref::<PartialApply>().is_none());
     }
 
     #[test]

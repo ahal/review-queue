@@ -665,6 +665,7 @@ mod tests {
                 status: crate::state::Status::Ready,
                 tip: crate::state::ReviewKey::new("phab", "D1"),
                 version: "1".into(),
+                unapplied: Vec::new(),
             },
         );
         state

@@ -50,6 +50,10 @@ pub enum Status {
     ApplyFailed,
     /// Local modifications (or a HEAD that doesn't match state) prevented an update or removal.
     Dirty,
+    /// The stack applied only up to some patch: `head_id` is the last one that did, and
+    /// `Workspace::unapplied` lists the reviews that are missing. Usable as-is, and only rebuilt
+    /// once the stack changes, since retrying the same patches would just fail the same way.
+    Partial,
 }
 
 /// A local worktree/workspace fetched for a stack of reviews (a lone review is a stack of one) -
@@ -72,6 +76,9 @@ pub struct Workspace {
     pub tip: ReviewKey,
     /// The tip's `version` as of the last build; a change means some patch in the stack changed.
     pub version: String,
+    /// Reviews in the stack whose patch isn't in a `Status::Partial` workspace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unapplied: Vec<ReviewKey>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

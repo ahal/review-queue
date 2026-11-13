@@ -39,9 +39,9 @@ use crate::repo::{NeedsClone, OnMissing, RepoStore};
 use crate::source::{Lifecycle, RateLimited, Review, ReviewSource};
 use crate::stacks::{self, Stack};
 use crate::state::{ReviewEntry, ReviewKey, State, Status, Workspace};
-use crate::vcs::Vcs;
 use crate::vcs::git::GitVcs;
 use crate::vcs::jj::JjVcs;
+use crate::vcs::{PartialApply, Vcs};
 
 /// How far back from a stack's tip to look for a member's commit; comfortably deeper than any
 /// realistic stack.
@@ -222,7 +222,15 @@ pub async fn auto_workspace(
     };
     for key in report.new_stacks.clone() {
         match fetch_local(sources, paths, config, &key, on_missing).await {
-            Ok(_) => report.fetched.push(key),
+            Ok(_) => {
+                if let Some(note) = State::load(&paths.state_file())
+                    .ok()
+                    .and_then(|st| partial_note(&st, &key))
+                {
+                    report.flagged.push((key.clone(), note));
+                }
+                report.fetched.push(key);
+            }
             Err(e) if e.downcast_ref::<NeedsClone>().is_some() => report.flagged.push((
                 key,
                 "no local checkout; run `rq fetch` or set auto_clone".into(),
@@ -456,14 +464,33 @@ async fn reconcile_workspaces(
                 ws.tip = tip.key.clone();
                 ws.version = tip.version.clone();
                 ws.status = Status::Ready;
+                ws.unapplied.clear();
                 state.insert_workspace(id, ws);
                 report.updated.push(tip.key.clone());
             }
-            Err(e) => {
-                ws.status = Status::ApplyFailed;
-                state.insert_workspace(id, ws);
-                report.errors.push((tip.key.clone(), e.to_string()));
-            }
+            Err(e) => match e.downcast::<PartialApply>() {
+                Ok(partial) => {
+                    ws.unapplied = unapplied_members(
+                        source.as_ref(),
+                        vcs.as_ref(),
+                        &ws.workspace_path,
+                        &partial.head,
+                        &stack.members,
+                    );
+                    ws.head_id = partial.head;
+                    ws.tip = tip.key.clone();
+                    ws.version = tip.version.clone();
+                    ws.status = Status::Partial;
+                    let note = partial_note_for(&ws);
+                    state.insert_workspace(id, ws);
+                    report.flagged.push((tip.key.clone(), note));
+                }
+                Err(e) => {
+                    ws.status = Status::ApplyFailed;
+                    state.insert_workspace(id, ws);
+                    report.errors.push((tip.key.clone(), e.to_string()));
+                }
+            },
         }
     }
 }
@@ -582,11 +609,23 @@ pub async fn fetch_local(
     }
 
     let outcome = vcs.add_workspace(&canon.path, &ws_path, &checkout, &stack_id, &review.version);
-    let (status, head_id) = match &outcome {
-        Ok(head) => (Status::Ready, head.clone()),
+    let (status, head_id, unapplied) = match &outcome {
+        Ok(head) => (Status::Ready, head.clone(), Vec::new()),
+        // The part of the stack that applied is still worth reviewing.
+        Err(e) if let Some(partial) = e.downcast_ref::<PartialApply>() => (
+            Status::Partial,
+            partial.head.clone(),
+            unapplied_members(
+                source.as_ref(),
+                vcs.as_ref(),
+                &ws_path,
+                &partial.head,
+                &stack.members,
+            ),
+        ),
         // Recorded anyway (with the workspace left in place, per the vcs backends' own
         // contract) so `rq show`/`rq path` can point at it for inspection.
-        Err(_) => (Status::ApplyFailed, String::new()),
+        Err(_) => (Status::ApplyFailed, String::new(), Vec::new()),
     };
     let ws = Workspace {
         repo_path: canon.path.clone(),
@@ -596,6 +635,7 @@ pub async fn fetch_local(
         status,
         tip: tip.key.clone(),
         version: tip.version.clone(),
+        unapplied,
     };
     state.insert_workspace(stack_id.clone(), ws.clone());
     for member in &stack.members {
@@ -604,12 +644,52 @@ pub async fn fetch_local(
             state.insert(e);
         }
     }
-    if outcome.is_ok() {
+    if status != Status::ApplyFailed {
         position_at(source.as_ref(), &ws, key);
     }
     state.save(&paths.state_file())?;
     repo_store.save()?;
-    outcome.map(|_| ws_path)
+    match outcome {
+        Err(e) if status == Status::ApplyFailed => Err(e),
+        _ => Ok(ws_path),
+    }
+}
+
+/// The members of a stack with no commit reachable from `head` in the workspace at `ws_path`.
+fn unapplied_members(
+    source: &dyn ReviewSource,
+    vcs: &dyn Vcs,
+    ws_path: &std::path::Path,
+    head: &str,
+    members: &[ReviewKey],
+) -> Vec<ReviewKey> {
+    let Ok(commits) = vcs.commits(ws_path, head, STACK_SCAN_DEPTH) else {
+        return Vec::new();
+    };
+    members
+        .iter()
+        .filter(|k| !commits.iter().any(|(_, msg)| source.is_commit_for(k, msg)))
+        .cloned()
+        .collect()
+}
+
+/// A warning to show alongside `key`'s workspace if its stack only partially applied.
+pub fn partial_note(state: &State, key: &ReviewKey) -> Option<String> {
+    state
+        .workspace_for(key)
+        .filter(|ws| ws.status == Status::Partial)
+        .map(partial_note_for)
+}
+
+fn partial_note_for(ws: &Workspace) -> String {
+    if ws.unapplied.is_empty() {
+        return "stack only partially applied".into();
+    }
+    let missing: Vec<String> = ws.unapplied.iter().map(ReviewKey::slug).collect();
+    format!(
+        "stack only partially applied; {} didn't apply",
+        missing.join(", ")
+    )
 }
 
 /// Best-effort: move a stack's workspace to `key`'s patch. Never disturbs a workspace with local
@@ -1537,6 +1617,8 @@ mod tests {
         /// When set, `checkout_spec` fails with `RateLimited`.
         rate_limited: std::sync::atomic::AtomicBool,
         checkout_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Ids whose patch doesn't apply.
+        broken: std::sync::Mutex<Vec<String>>,
     }
 
     impl StackSource {
@@ -1547,6 +1629,7 @@ mod tests {
                 lifecycle: std::sync::Mutex::new(Lifecycle::Open),
                 rate_limited: Default::default(),
                 checkout_calls: Default::default(),
+                broken: Default::default(),
             }
         }
 
@@ -1588,6 +1671,15 @@ mod tests {
         }
     }
 
+    /// A patch that conflicts with D1's: it expects `D1.txt` to hold a line it never has.
+    fn broken_patch_for(id: &str) -> crate::source::Patch {
+        crate::source::Patch {
+            diff: "diff --git a/D1.txt b/D1.txt\n--- a/D1.txt\n+++ b/D1.txt\n@@ -1 +1 @@\n-nope\n+changed\n"
+                .into(),
+            ..patch_for(id)
+        }
+    }
+
     #[async_trait::async_trait]
     impl ReviewSource for StackSource {
         fn name(&self) -> &str {
@@ -1611,11 +1703,18 @@ mod tests {
             if self.rate_limited.load(Ordering::Relaxed) {
                 return Err(RateLimited { name: "stk".into() }.into());
             }
+            let broken = self.broken.lock().unwrap();
             let patches = review
                 .ancestors
                 .iter()
                 .chain(std::iter::once(&review.key))
-                .map(|k| patch_for(&k.id))
+                .map(|k| {
+                    if broken.contains(&k.id) {
+                        broken_patch_for(&k.id)
+                    } else {
+                        patch_for(&k.id)
+                    }
+                })
                 .collect();
             Ok(crate::source::Checkout::Patches {
                 base: None,
@@ -2023,6 +2122,66 @@ mod tests {
         assert_eq!(report.updated, vec![stk(2)]);
         let state = State::load(&paths.state_file()).unwrap();
         assert_eq!(state.workspace_for(&stk(2)).unwrap().version, "2");
+    }
+
+    #[tokio::test]
+    async fn a_stack_that_applies_partway_is_kept_until_it_changes() {
+        let repos = make_repos();
+        let work_tmp = TempDir::new().unwrap();
+        let paths = paths_in(work_tmp.path());
+        let config = Config::default();
+        let source = StackSource::new(&repos.upstream);
+        source.set_queue(vec![
+            source.review(1, &[], "1"),
+            source.review(2, &[1], "1"),
+            source.review(3, &[1, 2], "1"),
+        ]);
+        source.broken.lock().unwrap().push("D2".into());
+        let checkout_calls = source.checkout_calls.clone();
+        let sources: Vec<Box<dyn ReviewSource>> = vec![Box::new(source)];
+        sync(&sources, &paths, None, false).await.unwrap();
+
+        let ws_path = fetch_local(&sources, &paths, &config, &stk(3), OnMissing::Clone)
+            .await
+            .expect("a partially applied stack is still a usable workspace");
+        assert!(ws_path.join("D1.txt").exists());
+        assert!(!ws_path.join("D3.txt").exists());
+        let state = State::load(&paths.state_file()).unwrap();
+        let ws = state.workspace_for(&stk(3)).unwrap();
+        assert_eq!(ws.status, Status::Partial);
+        assert_eq!(ws.unapplied, vec![stk(2), stk(3)]);
+        assert_eq!(
+            partial_note(&state, &stk(1)).unwrap(),
+            "stack only partially applied; stk/D2, stk/D3 didn't apply"
+        );
+
+        // Neither reopening nor an unchanged sync retries the same broken patches.
+        let calls = checkout_calls.load(std::sync::atomic::Ordering::Relaxed);
+        fetch_local(&sources, &paths, &config, &stk(1), OnMissing::Clone)
+            .await
+            .unwrap();
+        let report = sync(&sources, &paths, None, false).await.unwrap();
+        assert!(report.flagged.is_empty(), "{:?}", report.flagged);
+        assert_eq!(
+            checkout_calls.load(std::sync::atomic::Ordering::Relaxed),
+            calls
+        );
+
+        // The author fixes D2: the next sync rebuilds the whole stack.
+        let next = StackSource::new(&repos.upstream);
+        next.set_queue(vec![
+            next.review(1, &[], "1"),
+            next.review(2, &[1], "2"),
+            next.review(3, &[1, 2], "2"),
+        ]);
+        let sources: Vec<Box<dyn ReviewSource>> = vec![Box::new(next)];
+        let report = sync(&sources, &paths, None, false).await.unwrap();
+        assert_eq!(report.updated, vec![stk(3)]);
+        let state = State::load(&paths.state_file()).unwrap();
+        let ws = state.workspace_for(&stk(3)).unwrap();
+        assert_eq!(ws.status, Status::Ready);
+        assert!(ws.unapplied.is_empty());
+        assert!(partial_note(&state, &stk(3)).is_none());
     }
 
     #[tokio::test]

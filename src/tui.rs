@@ -127,7 +127,7 @@ pub fn run(
     all: bool,
 ) -> Result<()> {
     let targets = Arc::new(target::resolve(&config.targets)?);
-    let entries = load_rows(&paths, all)?;
+    let (entries, unapplied) = load_rows(&paths, all)?;
     if entries.is_empty() {
         println!("No reviews tracked yet. Run `rq sync` first.");
         return Ok(());
@@ -160,6 +160,7 @@ pub fn run(
         &BTreeSet::new(),
         terminal_width(),
         &Spinners::new(),
+        &unapplied,
     ) {
         select.add_item(label, row);
     }
@@ -244,9 +245,10 @@ fn run_event_loop(mut siv: Cursive) -> Result<()> {
                 let key = &run.key;
                 let path = &run.cwd;
                 match result {
-                    Ok(status) if status.success() => {
-                        set_status(&mut siv, format!("back from {key} ({})", path.display()))
-                    }
+                    Ok(status) if status.success() => set_status(
+                        &mut siv,
+                        with_note(format!("back from {key} ({})", path.display()), &run.note),
+                    ),
                     Ok(status) => set_status(
                         &mut siv,
                         format!("`{label}` exited with {status} in {}", path.display()),
@@ -268,6 +270,15 @@ struct PendingRun {
     workspace: Option<PathBuf>,
     url: String,
     command: Option<String>,
+    /// Appended to the status line, e.g. that the stack only partially applied.
+    note: Option<String>,
+}
+
+fn with_note(msg: String, note: &Option<String>) -> String {
+    match note {
+        Some(note) => format!("{msg} - {note}"),
+        None => msg,
+    }
 }
 
 /// Builds a target command or an interactive `$SHELL` with the review's environment.
@@ -305,9 +316,11 @@ fn launch(s: &mut Cursive, key: ReviewKey, workspace: Option<PathBuf>, idx: usiz
     let Some(ctx) = s.user_data::<Ctx>() else {
         return;
     };
-    let url = State::load(&ctx.paths.state_file())
-        .ok()
+    let state = State::load(&ctx.paths.state_file()).ok();
+    let url = state
+        .as_ref()
         .and_then(|st| st.get(&key).map(|e| e.url.clone()));
+    let note = state.as_ref().and_then(|st| sync::partial_note(st, &key));
     let Some(url) = url else {
         set_status(s, format!("`{key}` is no longer tracked"));
         return;
@@ -334,6 +347,7 @@ fn launch(s: &mut Cursive, key: ReviewKey, workspace: Option<PathBuf>, idx: usiz
         workspace,
         url,
         command,
+        note,
     };
     if wait {
         ctx.pending_run = Some(run);
@@ -347,7 +361,10 @@ fn launch(s: &mut Cursive, key: ReviewKey, workspace: Option<PathBuf>, idx: usiz
         .process_group(0);
     match cmd.spawn() {
         Ok(mut child) => {
-            set_status(s, format!("opened {key} ({})", run.cwd.display()));
+            set_status(
+                s,
+                with_note(format!("opened {key} ({})", run.cwd.display()), &run.note),
+            );
             // Reap the child so it doesn't linger as a zombie, and surface a failure.
             let sink = s.cb_sink().clone();
             std::thread::spawn(move || {
@@ -367,15 +384,21 @@ fn launch(s: &mut Cursive, key: ReviewKey, workspace: Option<PathBuf>, idx: usiz
     }
 }
 
-fn load_rows(paths: &Paths, all: bool) -> Result<Vec<ReviewEntry>> {
+/// The reviews to list, plus those missing from a partially applied workspace.
+fn load_rows(paths: &Paths, all: bool) -> Result<(Vec<ReviewEntry>, BTreeSet<ReviewKey>)> {
     let state = State::load(&paths.state_file())?;
-    Ok(order_by_stack(
+    let unapplied = state
+        .workspaces()
+        .flat_map(|(_, ws)| ws.unapplied.iter().cloned())
+        .collect();
+    let entries = order_by_stack(
         state
             .iter()
             .filter(|e| all || e.in_queue)
             .cloned()
             .collect(),
-    ))
+    );
+    Ok((entries, unapplied))
 }
 
 /// Reorders `entries` so every stack's reviews sit together, bottom-most first. A stack shows up
@@ -462,6 +485,7 @@ fn row_label(
     expanded: bool,
     link: Option<Link>,
     spin: Option<Spin>,
+    unapplied: bool,
 ) -> StyledString {
     let marker = if expanded { '\u{25be}' } else { '\u{25b8}' };
 
@@ -477,6 +501,9 @@ fn row_label(
             SPINNER_FRAMES[spin.frame % SPINNER_FRAMES.len()],
             ansi(color),
         );
+    } else if unapplied {
+        // In a workspace whose stack only applied partway, but this review's patch didn't.
+        out.append_styled("\u{2717}", ansi(BaseColor::Red));
     } else if e.stack_id.is_some() {
         out.append_styled("\u{2913}", ansi(BaseColor::Cyan));
     } else {
@@ -612,6 +639,7 @@ fn build_rows(
     expanded: &BTreeSet<ReviewKey>,
     width: usize,
     spinners: &Spinners,
+    unapplied: &BTreeSet<ReviewKey>,
 ) -> Vec<(StyledString, Row)> {
     // Which multi-review stack (by index into `stacks`) each review belongs to. A lone review
     // isn't drawn as a stack.
@@ -641,7 +669,15 @@ fn build_rows(
         // A stack shares one workspace, so its spinner runs on every member.
         let spin = spinners.get(stack.map_or(&e.key, |st| &st.tip)).copied();
         rows.push((
-            row_label(e, key_w, author_w, is_expanded, link, spin),
+            row_label(
+                e,
+                key_w,
+                author_w,
+                is_expanded,
+                link,
+                spin,
+                unapplied.contains(&e.key),
+            ),
             Row::Entry(e.key.clone()),
         ));
         if is_expanded {
@@ -1147,7 +1183,15 @@ fn finish_fetch(
             if let Some(idx) = then {
                 launch(s, key, Some(path), idx);
             } else {
-                set_status(s, format!("fetched {key} ({})", path.display()));
+                let note = s.user_data::<Ctx>().and_then(|ctx| {
+                    State::load(&ctx.paths.state_file())
+                        .ok()
+                        .and_then(|st| sync::partial_note(&st, &key))
+                });
+                set_status(
+                    s,
+                    with_note(format!("fetched {key} ({})", path.display()), &note),
+                );
             }
             reload(s);
         }
@@ -1357,8 +1401,8 @@ fn reload(s: &mut Cursive) {
     let Some((loaded, expanded, spinners)) = loaded else {
         return;
     };
-    let entries = match loaded {
-        Ok(entries) => entries,
+    let (entries, unapplied) = match loaded {
+        Ok(loaded) => loaded,
         Err(e) => {
             set_status(s, format!("reload failed: {e:#}"));
             return;
@@ -1377,6 +1421,7 @@ fn reload(s: &mut Cursive) {
             &expanded,
             terminal_width(),
             &spinners,
+            &unapplied,
         );
         for (label, row) in rows {
             v.add_item(label, row);
@@ -1546,6 +1591,7 @@ key = "u"
             workspace: Some(PathBuf::from("/tmp")),
             url: "https://example.com/D1".into(),
             command: Some("echo hello".into()),
+            note: None,
         };
         let (_, cmd) = build_command(&run);
         assert_eq!(cmd.get_program(), "sh");
@@ -1633,7 +1679,15 @@ key = "u"
                 cancelling: false,
             },
         )]);
-        let rows = build_rows(&entries, 6, 6, &BTreeSet::new(), 100, &spinners);
+        let rows = build_rows(
+            &entries,
+            6,
+            6,
+            &BTreeSet::new(),
+            100,
+            &spinners,
+            &BTreeSet::new(),
+        );
 
         assert_eq!(rows.len(), 4);
         assert!(
@@ -1671,6 +1725,7 @@ key = "u"
             &BTreeSet::new(),
             100,
             &Spinners::new(),
+            &BTreeSet::new(),
         );
         let author_col: Vec<usize> = rows
             .iter()
@@ -1690,7 +1745,15 @@ key = "u"
     #[test]
     fn collapsed_entries_produce_one_row_each() {
         let entries = vec![entry("D1", None), entry("D2", None)];
-        let rows = build_rows(&entries, 5, 6, &BTreeSet::new(), 100, &Spinners::new());
+        let rows = build_rows(
+            &entries,
+            5,
+            6,
+            &BTreeSet::new(),
+            100,
+            &Spinners::new(),
+            &BTreeSet::new(),
+        );
         assert_eq!(rows.len(), 2);
         assert!(matches!(&rows[0].1, Row::Entry(k) if k.id == "D1"));
         assert!(matches!(&rows[1].1, Row::Entry(k) if k.id == "D2"));
@@ -1710,6 +1773,7 @@ key = "u"
             &BTreeSet::from([expanded.clone()]),
             100,
             &Spinners::new(),
+            &BTreeSet::new(),
         );
 
         // D1's entry row, its title + blank line, its two diffstat lines, then D2's entry row.
@@ -1736,6 +1800,7 @@ key = "u"
             &BTreeSet::from([d1.clone(), d2.clone()]),
             100,
             &Spinners::new(),
+            &BTreeSet::new(),
         );
 
         // D1's entry + title/blank + its diffstat line, then the same for D2 - expanding D2 must
@@ -1804,7 +1869,15 @@ key = "u"
         assert_eq!(lines.last().unwrap(), "      ");
 
         let expanded = BTreeSet::from([e.key.clone()]);
-        let rows = build_rows(&[e], 5, 6, &expanded, 100, &Spinners::new());
+        let rows = build_rows(
+            &[e],
+            5,
+            6,
+            &expanded,
+            100,
+            &Spinners::new(),
+            &BTreeSet::new(),
+        );
         // entry + title/description lines + diffstat line
         assert_eq!(rows.len(), 1 + lines.len() + 1);
     }
@@ -1828,17 +1901,34 @@ key = "u"
     #[test]
     fn a_fetching_row_shows_a_spinner_instead_of_the_workspace_icon() {
         let e = entry("D1", None);
-        let plain = row_label(&e, 5, 6, false, None, None).source().to_string();
+        let plain = row_label(&e, 5, 6, false, None, None, false)
+            .source()
+            .to_string();
         let spin = Spin {
             frame: 0,
             cancelling: false,
         };
-        let spinning = row_label(&e, 5, 6, false, None, Some(spin))
+        let spinning = row_label(&e, 5, 6, false, None, Some(spin), false)
             .source()
             .to_string();
         assert!(spinning.contains(SPINNER_FRAMES[0]));
         assert!(!plain.contains(SPINNER_FRAMES[0]));
         assert_eq!(plain.chars().count(), spinning.chars().count());
+    }
+
+    #[test]
+    fn a_review_missing_from_a_partial_workspace_is_marked() {
+        let mut e = entry("D1", None);
+        e.stack_id = Some("moz/D1".into());
+        let fetched = row_label(&e, 5, 6, false, None, None, false)
+            .source()
+            .to_string();
+        let missing = row_label(&e, 5, 6, false, None, None, true)
+            .source()
+            .to_string();
+        assert!(fetched.contains('\u{2913}'));
+        assert!(missing.contains('\u{2717}') && !missing.contains('\u{2913}'));
+        assert_eq!(fetched.chars().count(), missing.chars().count());
     }
 
     #[tokio::test]
@@ -1965,6 +2055,7 @@ key = "u"
             &BTreeSet::from([expanded]),
             100,
             &Spinners::new(),
+            &BTreeSet::new(),
         ) {
             select.add_item(label, row);
         }
@@ -1993,6 +2084,7 @@ key = "u"
             &BTreeSet::from([expanded]),
             100,
             &Spinners::new(),
+            &BTreeSet::new(),
         ) {
             select.add_item(label, row);
         }
