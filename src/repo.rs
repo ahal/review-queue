@@ -96,6 +96,15 @@ impl Registry {
     }
 }
 
+/// Every tool-managed clone recorded in `repos.json`, whether or not it still exists.
+pub fn tool_managed_paths(paths: &Paths) -> Result<Vec<PathBuf>> {
+    Ok(Registry::load(&paths.repos_file())?
+        .repos
+        .into_values()
+        .map(|e| e.path)
+        .collect())
+}
+
 /// A rescan is skipped if the cache is younger than this - covers the ask/confirm/retry round
 /// trip and bursts of `rq fetch` calls, without letting a real miss go undetected for long.
 const RESCAN_THROTTLE: chrono::Duration = chrono::Duration::seconds(60);

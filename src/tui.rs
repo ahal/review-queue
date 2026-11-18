@@ -1358,6 +1358,7 @@ fn sync_summary(report: &sync::SyncReport) -> String {
         (report.updated.len(), "updated"),
         (report.removed.len(), "removed"),
         (report.flagged.len(), "flagged"),
+        (report.pruned.len(), "pruned"),
     ] {
         if n > 0 {
             parts.push(format!("{n} {what}"));

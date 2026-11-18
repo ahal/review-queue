@@ -20,22 +20,27 @@
 //! Finally each existing workspace is reconciled against its stack: reviews newly chained onto a
 //! checked-out stack join its workspace; a workspace whose tip or tip `version` changed is
 //! updated in place if clean (`update_workspace`), or flagged if dirty; one whose reviews have
-//! all resolved is removed, discarding any local changes. This is the only
-//! workspace-removal path; there's no separate prune step.
+//! all resolved is removed, discarding any local changes.
+//!
+//! Last, `prune_orphans` sweeps up whatever a removal that didn't finish left behind: workspace
+//! directories under `workspaces/` that state doesn't know about, `rq` workspaces still
+//! registered in a canonical repo, and `review-queue/<name>/*` pins with no workspace. An
+//! orphan with local changes is flagged instead of removed. Then the owner/repo directories
+//! removals left empty are deleted.
 //!
 //! `fetch_local()` is the on-demand counterpart - resolving a canonical repo (asking before
 //! cloning one, unless told otherwise) and creating a workspace for a single already-tracked
 //! review's stack, or, if it already has one, moving it to that review's patch. It's what `rq
 //! fetch` and the fetch hotkey in `rq show`'s TUI call; `sync()` never calls it itself.
 
-use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
 use crate::config::{Config, VcsKind};
 use crate::paths::Paths;
-use crate::repo::{NeedsClone, OnMissing, RepoStore};
+use crate::repo::{self, NeedsClone, OnMissing, RepoStore};
 use crate::source::{Lifecycle, RateLimited, Review, ReviewSource};
 use crate::stacks::{self, Stack};
 use crate::state::{ReviewEntry, ReviewKey, State, Status, Workspace};
@@ -63,6 +68,10 @@ pub struct SyncReport {
     pub errors: Vec<(ReviewKey, String)>,
     /// Source name + error for a source that failed as a whole; its reviews are left as-is.
     pub source_errors: Vec<(String, String)>,
+    /// Leftover workspaces/pins no tracked review owns, removed by `prune_orphans`.
+    pub pruned: Vec<String>,
+    /// Leftovers `prune_orphans` found but left alone (local changes, or removal failed).
+    pub prune_flagged: Vec<(String, String)>,
 }
 
 fn vcs_for(kind: VcsKind) -> Box<dyn Vcs> {
@@ -117,6 +126,14 @@ pub async fn sync(
         }
     }
 
+    // Gathered before `reconcile_workspaces` forgets any workspace, so a repo whose last
+    // workspace goes this run still gets checked for leftovers.
+    let mut repos_to_check: BTreeSet<PathBuf> = state
+        .workspaces()
+        .map(|(_, ws)| ws.repo_path.clone())
+        .collect();
+    repos_to_check.extend(repo::tool_managed_paths(paths).unwrap_or_default());
+
     let sources_by_name: HashMap<&str, &Box<dyn ReviewSource>> =
         sources.iter().map(|s| (s.name(), s)).collect();
     let mut ids_by_source: HashMap<String, Vec<String>> = HashMap::new();
@@ -169,6 +186,14 @@ pub async fn sync(
         &mut report,
     )
     .await;
+    prune_orphans(
+        paths,
+        &state,
+        repos_to_check,
+        only_source,
+        dry_run,
+        &mut report,
+    );
     report.new_stacks = new_stacks(&state, &report.added);
 
     if !dry_run {
@@ -530,6 +555,245 @@ fn remove_finished_workspace(
     report.removed.extend(members.iter().cloned());
 }
 
+/// Which backend made the workspace or repo at `dir`, if it's one at all. jj is checked first,
+/// since jj workspaces and repos may be colocated with git.
+fn vcs_of_dir(dir: &Path) -> Option<VcsKind> {
+    if dir.join(".jj").exists() {
+        Some(VcsKind::Jj)
+    } else if dir.join(".git").exists() {
+        Some(VcsKind::Git)
+    } else {
+        None
+    }
+}
+
+/// `path`, with symlinks resolved if it exists, so paths from state and from a vcs compare
+/// equal however each was spelled.
+fn normalized(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Every workspace directory under `root` (recursively, not descending into workspaces).
+fn workspace_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let dir = entry.path();
+        if vcs_of_dir(&dir).is_some() {
+            found.push(dir);
+        } else {
+            found.extend(workspace_dirs(&dir));
+        }
+    }
+    found
+}
+
+/// Delete every directory under `root` left with nothing in it (`root` itself excepted), such
+/// as the owner/repo directories of removed workspaces. Never descends into a workspace.
+/// Returns whether `root` ended up empty.
+fn remove_empty_dirs(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    let mut empty = true;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if entry.file_type().is_ok_and(|t| t.is_dir())
+            && vcs_of_dir(&dir).is_none()
+            && remove_empty_dirs(&dir)
+            && std::fs::remove_dir(&dir).is_ok()
+        {
+            continue;
+        }
+        empty = false;
+    }
+    empty
+}
+
+/// Delete `path`'s ancestors below `root` that are left empty, nearest first.
+fn remove_empty_parents(path: &Path, root: &Path) {
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if !d.starts_with(root) || d == root || std::fs::remove_dir(d).is_err() {
+            break;
+        }
+        dir = d.parent();
+    }
+}
+
+/// The stack id an orphaned workspace at `path` was created under: its path below
+/// `workspaces/`. Older layouts kept `workspaces/` elsewhere in the data dir, so failing that,
+/// whatever follows the last `workspaces` component.
+fn orphan_slug(paths: &Paths, path: &Path) -> String {
+    if let Ok(rel) = path.strip_prefix(paths.workspaces_dir()) {
+        return rel.to_string_lossy().into_owned();
+    }
+    let components: Vec<_> = path.components().collect();
+    let tail = match components
+        .iter()
+        .rposition(|c| c.as_os_str() == "workspaces")
+    {
+        Some(i) => components[i + 1..].iter().collect::<PathBuf>(),
+        None => path.file_name().map(PathBuf::from).unwrap_or_default(),
+    };
+    tail.to_string_lossy().into_owned()
+}
+
+/// Remove one leftover workspace (or, if `ws` doesn't exist, whatever's still registered or
+/// pinned for it in `repo`) unless it has local changes. Returns whether it was removed.
+fn remove_orphan(
+    vcs: &dyn Vcs,
+    repo: &Path,
+    ws: &Path,
+    slug: &str,
+    label: String,
+    dry_run: bool,
+    report: &mut SyncReport,
+) -> bool {
+    if ws.exists() && vcs.has_local_changes(ws).unwrap_or(true) {
+        report
+            .prune_flagged
+            .push((label, "local changes; not removed".into()));
+        return false;
+    }
+    if !dry_run
+        && let Err(e) = vcs.remove_workspace(repo, ws, slug)
+        // e.g. a git worktree whose registration is already gone, which `worktree remove`
+        // refuses; any pins left over are picked up by the next sync.
+        && (!ws.exists() || std::fs::remove_dir_all(ws).is_err())
+    {
+        report.prune_flagged.push((label, format!("{e:#}")));
+        return false;
+    }
+    report.pruned.push(label);
+    true
+}
+
+/// Clean up what no tracked workspace accounts for - see the module docs. `repos` are the
+/// canonical repos to check for leftover registrations and pins, on top of those any orphaned
+/// workspace directory points at.
+fn prune_orphans(
+    paths: &Paths,
+    state: &State,
+    repos: BTreeSet<PathBuf>,
+    only_source: Option<&str>,
+    dry_run: bool,
+    report: &mut SyncReport,
+) {
+    let known_ids: BTreeSet<&str> = state.workspaces().map(|(id, _)| id.as_str()).collect();
+    let known_paths: BTreeSet<PathBuf> = state
+        .workspaces()
+        .map(|(_, ws)| normalized(&ws.workspace_path))
+        .collect();
+    let in_scope = |slug: &str| only_source.is_none_or(|o| slug.split('/').next() == Some(o));
+    let data_dir = normalized(paths.data_dir());
+
+    let mut repos: BTreeMap<PathBuf, VcsKind> = repos
+        .into_iter()
+        .filter_map(|r| vcs_of_dir(&r).map(|kind| (r, kind)))
+        .collect();
+    // Workspace paths already dealt with (removed or flagged), and the names whose pins went
+    // with them.
+    let mut handled: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut handled_names: BTreeSet<String> = BTreeSet::new();
+
+    for dir in workspace_dirs(&paths.workspaces_dir()) {
+        let slug = orphan_slug(paths, &dir);
+        if known_paths.contains(&normalized(&dir))
+            || known_ids.contains(slug.as_str())
+            || !in_scope(&slug)
+        {
+            continue;
+        }
+        let label = format!("{slug} ({})", dir.display());
+        handled.insert(normalized(&dir));
+        handled_names.insert(slug.clone());
+        let Some(kind) = vcs_of_dir(&dir) else {
+            continue;
+        };
+        let vcs = vcs_for(kind);
+        let repo = match vcs.canonical_repo(&dir) {
+            Ok(repo) => repo,
+            Err(e) => {
+                report
+                    .prune_flagged
+                    .push((label, format!("can't find its repo: {e:#}")));
+                continue;
+            }
+        };
+        let repo_kind = vcs_of_dir(&repo).unwrap_or(kind);
+        repos.entry(repo.clone()).or_insert(repo_kind);
+        remove_orphan(
+            vcs_for(repo_kind).as_ref(),
+            &repo,
+            &dir,
+            &slug,
+            label,
+            dry_run,
+            report,
+        );
+    }
+
+    for (repo, kind) in repos {
+        let vcs = vcs_for(kind);
+        let residue = match vcs.residue(&repo) {
+            Ok(residue) => residue,
+            Err(e) => {
+                report.prune_flagged.push((
+                    repo.display().to_string(),
+                    format!("checking for leftovers: {e:#}"),
+                ));
+                continue;
+            }
+        };
+        for root in residue.workspaces {
+            let slug = orphan_slug(paths, &root);
+            let norm = normalized(&root);
+            // Only ever touch workspaces inside our own data dir.
+            if !norm.starts_with(&data_dir)
+                || known_paths.contains(&norm)
+                || handled.contains(&norm)
+                || known_ids.contains(slug.as_str())
+                || !in_scope(&slug)
+            {
+                continue;
+            }
+            handled.insert(norm);
+            handled_names.insert(slug.clone());
+            let label = format!(
+                "{slug} ({}, registered in {})",
+                root.display(),
+                repo.display()
+            );
+            remove_orphan(vcs.as_ref(), &repo, &root, &slug, label, dry_run, report);
+        }
+        for name in residue.pins {
+            if known_ids.contains(name.as_str())
+                || handled_names.contains(&name)
+                || !in_scope(&name)
+            {
+                continue;
+            }
+            let ws = paths.workspace_dir(&name);
+            // Something's there that wasn't removed above; leave its pins with it.
+            if ws.exists() {
+                continue;
+            }
+            let label = format!("{name} (pins in {})", repo.display());
+            remove_orphan(vcs.as_ref(), &repo, &ws, &name, label, dry_run, report);
+        }
+    }
+
+    if !dry_run {
+        remove_empty_dirs(&paths.workspaces_dir());
+    }
+}
+
 /// Resolve a canonical repo (asking before cloning one, unless `on_missing` says otherwise) and
 /// make sure `key`, a review already tracked by a prior `sync()`, has a workspace - the one for
 /// its whole stack - then move that workspace to `key`'s own patch. If the stack is already
@@ -777,6 +1041,7 @@ pub fn remove_workspace(paths: &Paths, key: &ReviewKey, force: bool) -> Result<(
         }
     }
 
+    remove_empty_parents(&ws.workspace_path, &paths.workspaces_dir());
     state.remove_workspace(&stack_id);
     state.for_each_entry_mut(|e| {
         if e.stack_id.as_deref() == Some(stack_id.as_str()) {
@@ -1223,6 +1488,7 @@ mod tests {
 
         assert_eq!(report.removed, vec![ReviewKey::new("gh", "moz/proj/1")]);
         assert!(!ws_path.exists());
+        assert!(!paths.workspaces_dir().join("gh").exists());
         assert!(
             State::load(&paths.state_file())
                 .unwrap()
@@ -2272,5 +2538,183 @@ mod tests {
         let state = State::load(&paths.state_file()).unwrap();
         assert!(state.workspace_for(&stk(2)).is_none());
         assert!(state.get(&stk(2)).unwrap().stack_id.is_none());
+    }
+
+    /// A tracked PR with a workspace, which state then loses track of while everything stays on
+    /// disk and in the canonical repo - as an interrupted removal would leave it. Returns the
+    /// workspace and canonical repo paths.
+    async fn orphaned_workspace(
+        repos: &Repos,
+        paths: &Paths,
+        server: &MockServer,
+    ) -> (PathBuf, PathBuf) {
+        let sha = git_rev_parse(&repos.fork, "HEAD");
+        mount_search(server, true).await;
+        mount_pull(
+            server,
+            pull_json("moz", "proj", &repos.upstream, &repos.fork, &sha, "open"),
+        )
+        .await;
+        let key = ReviewKey::new("gh", "moz/proj/1");
+        let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(server)];
+        sync(&sources, paths, None, false).await.unwrap();
+        let ws_path = fetch_local(&sources, paths, &Config::default(), &key, OnMissing::Clone)
+            .await
+            .unwrap();
+
+        let mut state = State::load(&paths.state_file()).unwrap();
+        let id = state.get(&key).unwrap().stack_id.clone().unwrap();
+        let canon = state.remove_workspace(&id).unwrap().repo_path;
+        state.for_each_entry_mut(|e| e.stack_id = None);
+        state.save(&paths.state_file()).unwrap();
+        (ws_path, canon)
+    }
+
+    fn worktrees_and_pins(canon: &Path) -> (usize, String) {
+        let worktrees = Command::new("git")
+            .current_dir(canon)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        let refs = Command::new("git")
+            .current_dir(canon)
+            .args(["for-each-ref", "refs/review-queue/"])
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&worktrees.stdout)
+                .lines()
+                .filter(|l| l.starts_with("worktree "))
+                .count(),
+            String::from_utf8_lossy(&refs.stdout).trim().to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn orphaned_workspace_directory_is_pruned_with_its_pins() {
+        let repos = make_repos();
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        let server = MockServer::start().await;
+        let (ws_path, canon) = orphaned_workspace(&repos, &paths, &server).await;
+
+        let report = sync(&[github_source(&server)], &paths, None, false)
+            .await
+            .unwrap();
+
+        assert_eq!(report.pruned.len(), 1, "{report:?}");
+        assert!(report.prune_flagged.is_empty(), "{report:?}");
+        assert!(!ws_path.exists());
+        assert_eq!(worktrees_and_pins(&canon), (1, String::new()));
+        // The owner/repo directories it sat in went with it.
+        assert!(!paths.workspaces_dir().join("gh").exists());
+    }
+
+    #[tokio::test]
+    async fn stale_registration_and_pins_without_a_directory_are_pruned() {
+        let repos = make_repos();
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        let server = MockServer::start().await;
+        let (ws_path, canon) = orphaned_workspace(&repos, &paths, &server).await;
+        std::fs::remove_dir_all(&ws_path).unwrap();
+
+        let report = sync(&[github_source(&server)], &paths, None, false)
+            .await
+            .unwrap();
+
+        assert_eq!(report.pruned.len(), 1, "{report:?}");
+        assert_eq!(worktrees_and_pins(&canon), (1, String::new()));
+        assert!(!paths.workspaces_dir().join("gh").exists());
+    }
+
+    #[tokio::test]
+    async fn orphaned_workspace_with_local_changes_is_flagged_not_removed() {
+        let repos = make_repos();
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        let server = MockServer::start().await;
+        let (ws_path, canon) = orphaned_workspace(&repos, &paths, &server).await;
+        std::fs::write(ws_path.join("notes.txt"), "mine\n").unwrap();
+
+        let report = sync(&[github_source(&server)], &paths, None, false)
+            .await
+            .unwrap();
+
+        assert!(report.pruned.is_empty(), "{report:?}");
+        assert_eq!(report.prune_flagged.len(), 1, "{report:?}");
+        assert!(ws_path.join("notes.txt").exists());
+        let (worktrees, pins) = worktrees_and_pins(&canon);
+        assert_eq!(worktrees, 2);
+        assert!(!pins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_orphans_without_removing_them() {
+        let repos = make_repos();
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        let server = MockServer::start().await;
+        let (ws_path, _canon) = orphaned_workspace(&repos, &paths, &server).await;
+
+        let report = sync(&[github_source(&server)], &paths, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(report.pruned.len(), 1, "{report:?}");
+        assert!(ws_path.exists());
+    }
+
+    #[tokio::test]
+    async fn only_source_leaves_other_sources_orphans_alone() {
+        let repos = make_repos();
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        let server = MockServer::start().await;
+        let (ws_path, _canon) = orphaned_workspace(&repos, &paths, &server).await;
+
+        let report = sync(&[github_source(&server)], &paths, Some("phab"), false)
+            .await
+            .unwrap();
+
+        assert!(report.pruned.is_empty(), "{report:?}");
+        assert!(ws_path.exists());
+    }
+
+    #[test]
+    fn empty_dirs_are_removed_but_workspaces_and_files_are_kept() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("gh/a/b")).unwrap();
+        std::fs::create_dir_all(root.join("gh/c/ws/.git")).unwrap();
+        std::fs::create_dir_all(root.join("gh/c/ws/empty")).unwrap();
+        std::fs::create_dir_all(root.join("phab/kept")).unwrap();
+        std::fs::write(root.join("phab/kept/file"), "").unwrap();
+
+        remove_empty_dirs(root);
+
+        assert!(!root.join("gh/a").exists());
+        assert!(root.join("gh/c/ws/empty").exists());
+        assert!(root.join("phab/kept/file").exists());
+        assert!(root.exists());
+    }
+
+    #[test]
+    fn orphan_slug_handles_the_old_layout() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        assert_eq!(
+            orphan_slug(&paths, &paths.workspace_dir("phab/D1")),
+            "phab/D1"
+        );
+        assert_eq!(
+            orphan_slug(
+                &paths,
+                &paths
+                    .data_dir()
+                    .join("repos/github.com/o/r/workspaces/gh/o/r/4")
+            ),
+            "gh/o/r/4"
+        );
     }
 }

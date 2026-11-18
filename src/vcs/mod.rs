@@ -4,7 +4,8 @@
 //! Operations on the same canonical repo must be serialized (a per-repo mutex, added when the
 //! sync engine lands); different repos and sources can run concurrently.
 
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
@@ -22,6 +23,24 @@ pub struct PartialApply {
     pub head: String,
     /// The underlying failure, already rendered with its context chain.
     pub message: String,
+}
+
+/// What a canonical repo has registered that `rq` may have left behind; see `Vcs::residue`.
+#[derive(Debug, Default)]
+pub struct Residue {
+    /// The root of every secondary workspace/worktree registered in the repo (the main checkout
+    /// excluded), whoever made it and whether or not it still exists on disk. The caller tells
+    /// its own apart by path.
+    pub workspaces: Vec<PathBuf>,
+    /// Every `name` with at least one ref/bookmark pinned under `review-queue/<name>/`.
+    pub pins: BTreeSet<String>,
+}
+
+/// `name` from a `review-queue/<name>/<version>` pin, if `pin` is one.
+pub(crate) fn pin_name(pin: &str) -> Option<&str> {
+    let rest = pin.strip_prefix("review-queue/")?;
+    let (name, version) = rest.rsplit_once('/')?;
+    (!name.is_empty() && !version.is_empty()).then_some(name)
 }
 
 pub trait Vcs {
@@ -72,7 +91,21 @@ pub trait Vcs {
     /// Remove the worktree/workspace and every ref/bookmark `add_workspace`/`update_workspace`
     /// pinned for it under `name`. Callers only ever call this on a workspace `is_dirty` has
     /// already confirmed is clean - there's no way to force-remove a dirty one.
+    /// Forgets the workspace registered at `ws` even if it isn't named after `name` (or no
+    /// longer exists on disk), and is a no-op for the registration if there's none, so it also
+    /// cleans up pins left with no workspace at all.
     fn remove_workspace(&self, repo: &Path, ws: &Path, name: &str) -> Result<()>;
+
+    /// Every secondary workspace and pinned name in the canonical `repo`, for finding what a
+    /// removal that never finished left behind.
+    fn residue(&self, repo: &Path) -> Result<Residue>;
+
+    /// The canonical repo the workspace at `ws` was created from.
+    fn canonical_repo(&self, ws: &Path) -> Result<PathBuf>;
+
+    /// True if the workspace's working copy has uncommitted changes. Unlike `is_dirty`, needs
+    /// no expected head, so it works on a workspace `rq` has lost track of.
+    fn has_local_changes(&self, ws: &Path) -> Result<bool>;
 }
 
 /// Parse `commits()` output: records separated by `\x1e`, fields by `\x1f`.
@@ -132,6 +165,19 @@ pub(crate) fn clean_output(raw: &[u8]) -> String {
         .join("\n")
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod pin_name_tests {
+    use super::pin_name;
+
+    #[test]
+    fn strips_prefix_and_version() {
+        assert_eq!(pin_name("review-queue/gh/o/r/4/abc"), Some("gh/o/r/4"));
+        assert_eq!(pin_name("review-queue/phab/D1/2"), Some("phab/D1"));
+        assert_eq!(pin_name("review-queue/D1"), None);
+        assert_eq!(pin_name("main"), None);
+    }
 }
 
 #[cfg(test)]

@@ -39,13 +39,13 @@
 //!   Deleting the pins alone would leave the stack as anonymous visible heads.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
 use crate::source::{Checkout, Patch};
-use crate::vcs::{PartialApply, Vcs};
+use crate::vcs::{PartialApply, Residue, Vcs, pin_name};
 
 pub struct JjVcs;
 
@@ -330,6 +330,40 @@ impl JjVcs {
     fn workspace_name(name: &str) -> String {
         format!("rq-{}", name.replace('/', "-"))
     }
+
+    /// `(name, root)` of every workspace registered in `repo`, the default one included.
+    fn registered_workspaces(&self, repo: &Path) -> Result<Vec<(String, PathBuf)>> {
+        let raw = self.run(
+            repo,
+            &[
+                "workspace",
+                "list",
+                "--ignore-working-copy",
+                "-T",
+                "name ++ \"\\x1f\" ++ root ++ \"\\n\"",
+            ],
+        )?;
+        Ok(raw
+            .lines()
+            .filter_map(|l| l.split_once('\x1f'))
+            .map(|(name, root)| (name.to_string(), PathBuf::from(root)))
+            .collect())
+    }
+
+    /// Every bookmark name in `repo` (local only).
+    fn bookmarks(&self, repo: &Path) -> Result<Vec<String>> {
+        let raw = self.run(
+            repo,
+            &[
+                "bookmark",
+                "list",
+                "--ignore-working-copy",
+                "-T",
+                "if(!remote, name ++ \"\\n\")",
+            ],
+        )?;
+        Ok(raw.lines().map(str::to_string).collect())
+    }
 }
 
 /// Split `"Name <email>"` into its parts.
@@ -496,8 +530,14 @@ impl Vcs for JjVcs {
 
     fn remove_workspace(&self, repo: &Path, ws: &Path, name: &str) -> Result<()> {
         let ws_name = Self::workspace_name(name);
-        self.run(repo, &["workspace", "forget", &ws_name])
-            .with_context(|| format!("forgetting jj workspace `{ws_name}`"))?;
+        let registered = self
+            .registered_workspaces(repo)?
+            .into_iter()
+            .find(|(n, root)| *n == ws_name || (n != "default" && root == ws));
+        if let Some((registered_name, _)) = registered {
+            self.run(repo, &["workspace", "forget", &registered_name])
+                .with_context(|| format!("forgetting jj workspace `{registered_name}`"))?;
+        }
         if ws.exists() {
             std::fs::remove_dir_all(ws).with_context(|| format!("removing {}", ws.display()))?;
         }
@@ -518,20 +558,55 @@ impl Vcs for JjVcs {
         self.run(repo, &["abandon", &stack])
             .with_context(|| format!("abandoning the stack for `{name}`"))?;
 
-        let prefix = format!("review-queue/{name}/");
-        let listing = self.run(repo, &["bookmark", "list"])?;
-        for line in listing.lines() {
-            if line.starts_with(char::is_whitespace) {
-                continue; // indented lines are per-remote tracking info, not bookmark names
-            }
-            let Some((bookmark_name, _)) = line.split_once(':') else {
-                continue;
-            };
-            if bookmark_name.starts_with(&prefix) {
-                self.run(repo, &["bookmark", "delete", bookmark_name])?;
-            }
+        let pins: Vec<String> = self
+            .bookmarks(repo)?
+            .into_iter()
+            .filter(|b| pin_name(b) == Some(name))
+            .collect();
+        for pin in pins {
+            self.run(repo, &["bookmark", "delete", &pin])?;
         }
         Ok(())
+    }
+
+    fn residue(&self, repo: &Path) -> Result<Residue> {
+        Ok(Residue {
+            workspaces: self
+                .registered_workspaces(repo)?
+                .into_iter()
+                .filter(|(name, _)| name != "default")
+                .map(|(_, root)| root)
+                .collect(),
+            pins: self
+                .bookmarks(repo)?
+                .iter()
+                .filter_map(|b| pin_name(b))
+                .map(str::to_string)
+                .collect(),
+        })
+    }
+
+    fn canonical_repo(&self, ws: &Path) -> Result<PathBuf> {
+        // A secondary workspace's `.jj/repo` is a file holding the path (relative to `.jj`) of
+        // the canonical repo's `.jj/repo` directory.
+        let dot_jj = ws.join(".jj");
+        let pointer = dot_jj.join("repo");
+        let target = std::fs::read_to_string(&pointer)
+            .with_context(|| format!("reading {}", pointer.display()))?;
+        let store = dot_jj.join(target.trim());
+        let store = store
+            .canonicalize()
+            .with_context(|| format!("resolving {}", store.display()))?;
+        store
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .with_context(|| format!("{} isn't inside a repo", store.display()))
+    }
+
+    fn has_local_changes(&self, ws: &Path) -> Result<bool> {
+        let diff = self.run(ws, &["diff", "--summary", "-r", "@"])?;
+        Ok(!diff.is_empty())
     }
 }
 
@@ -1166,6 +1241,56 @@ mod tests {
             trunk_before,
             "canonical repo must be untouched"
         );
+    }
+
+    #[test]
+    fn residue_and_canonical_repo_find_a_workspace_and_its_pins() {
+        require_jj!();
+        let f = fixture();
+        let vcs = JjVcs;
+        let ws = f._tmp.path().join("ws");
+        let checkout = Checkout::Patches {
+            base: Some(f.base.clone()),
+            patches: vec![],
+        };
+        vcs.add_workspace(&f.canon, &ws, &checkout, "moz/D8", "1")
+            .unwrap();
+
+        let residue = vcs.residue(&f.canon).unwrap();
+        assert_eq!(residue.workspaces, vec![ws.canonicalize().unwrap()]);
+        assert_eq!(residue.pins.into_iter().collect::<Vec<_>>(), vec!["moz/D8"]);
+        assert_eq!(
+            vcs.canonical_repo(&ws).unwrap(),
+            f.canon.canonicalize().unwrap()
+        );
+        assert!(!vcs.has_local_changes(&ws).unwrap());
+        fs::write(ws.join("scratch.txt"), "local\n").unwrap();
+        assert!(vcs.has_local_changes(&ws).unwrap());
+    }
+
+    #[test]
+    fn remove_workspace_forgets_by_path_and_tolerates_no_registration() {
+        require_jj!();
+        let f = fixture();
+        let vcs = JjVcs;
+        let ws = f._tmp.path().join("ws");
+        let checkout = Checkout::Patches {
+            base: Some(f.base.clone()),
+            patches: vec![],
+        };
+        vcs.add_workspace(&f.canon, &ws, &checkout, "moz/D9", "1")
+            .unwrap();
+        let root = vcs.residue(&f.canon).unwrap().workspaces.remove(0);
+
+        // Named after a different slug (e.g. a since-changed layout): still found by its path.
+        vcs.remove_workspace(&f.canon, &root, "elsewhere/D9")
+            .unwrap();
+        assert!(vcs.residue(&f.canon).unwrap().workspaces.is_empty());
+        assert!(!ws.exists());
+
+        // Nothing registered any more; only the pins are left to clean up.
+        vcs.remove_workspace(&f.canon, &ws, "moz/D9").unwrap();
+        assert!(vcs.residue(&f.canon).unwrap().pins.is_empty());
     }
 
     #[test]

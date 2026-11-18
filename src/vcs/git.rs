@@ -18,13 +18,13 @@
 //! workspace is kept on the last good patch as a `PartialApply`.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
 use crate::source::{Checkout, Patch};
-use crate::vcs::{PartialApply, Vcs};
+use crate::vcs::{PartialApply, Residue, Vcs, pin_name};
 
 pub struct GitVcs;
 
@@ -360,6 +360,43 @@ impl Vcs for GitVcs {
             self.run(repo, &["update-ref", "-d", r])?;
         }
         Ok(())
+    }
+
+    fn residue(&self, repo: &Path) -> Result<Residue> {
+        let listing = self.run(repo, &["worktree", "list", "--porcelain"])?;
+        // The first entry is always the main worktree.
+        let workspaces = listing
+            .lines()
+            .filter_map(|l| l.strip_prefix("worktree "))
+            .skip(1)
+            .map(PathBuf::from)
+            .collect();
+        let refs = self.run(
+            repo,
+            &["for-each-ref", "--format=%(refname)", "refs/review-queue/"],
+        )?;
+        let pins = refs
+            .lines()
+            .filter_map(|r| r.strip_prefix("refs/"))
+            .filter_map(pin_name)
+            .map(str::to_string)
+            .collect();
+        Ok(Residue { workspaces, pins })
+    }
+
+    fn canonical_repo(&self, ws: &Path) -> Result<PathBuf> {
+        let common = self.run(
+            ws,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        Path::new(&common)
+            .parent()
+            .map(Path::to_path_buf)
+            .with_context(|| format!("{common} isn't inside a repo"))
+    }
+
+    fn has_local_changes(&self, ws: &Path) -> Result<bool> {
+        Ok(!self.run(ws, &["status", "--porcelain"])?.is_empty())
     }
 }
 
@@ -730,6 +767,30 @@ mod tests {
             vcs.is_dirty(&ws, "0000000000000000000000000000000000000000")
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn residue_and_canonical_repo_find_a_worktree_and_its_pins() {
+        let f = fixture();
+        let vcs = GitVcs;
+        let ws = f._tmp.path().join("ws");
+        let checkout = Checkout::Patches {
+            base: Some(f.base.clone()),
+            patches: vec![],
+        };
+        vcs.add_workspace(&f.canon, &ws, &checkout, "moz/D8", "1")
+            .unwrap();
+
+        let residue = vcs.residue(&f.canon).unwrap();
+        assert_eq!(residue.workspaces, vec![ws.canonicalize().unwrap()]);
+        assert_eq!(residue.pins.into_iter().collect::<Vec<_>>(), vec!["moz/D8"]);
+        assert_eq!(
+            vcs.canonical_repo(&ws).unwrap(),
+            f.canon.canonicalize().unwrap()
+        );
+        assert!(!vcs.has_local_changes(&ws).unwrap());
+        fs::write(ws.join("scratch.txt"), "local\n").unwrap();
+        assert!(vcs.has_local_changes(&ws).unwrap());
     }
 
     #[test]

@@ -268,6 +268,13 @@ fn print_sync_report(report: &SyncReport, dry_run: bool) {
     for (key, reason) in &report.flagged {
         println!("flagged {key}: {reason}");
     }
+    let verb = if dry_run { "would prune" } else { "pruned" };
+    for leftover in &report.pruned {
+        println!("{verb} leftover {leftover}");
+    }
+    for (leftover, reason) in &report.prune_flagged {
+        eprintln!("warning: leftover {leftover}: {reason}");
+    }
     for (key, err) in &report.errors {
         eprintln!("error syncing {key}: {err}");
     }
@@ -279,6 +286,8 @@ fn print_sync_report(report: &SyncReport, dry_run: bool) {
         && report.updated.is_empty()
         && report.removed.is_empty()
         && report.flagged.is_empty()
+        && report.pruned.is_empty()
+        && report.prune_flagged.is_empty()
         && report.errors.is_empty()
         && report.source_errors.is_empty()
     {
