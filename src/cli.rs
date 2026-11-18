@@ -15,8 +15,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Fetch review queues and update existing workspaces, removing one once its review resolves
-    /// and is clean. Never creates a new workspace - use `rq fetch` (or the open-locally hotkey
+    /// Fetch review queues and update existing workspaces, removing one once its review
+    /// resolves. Never creates a new workspace - use `rq fetch` (or the open-locally hotkey
     /// in `rq show`) for that.
     Sync {
         /// Only sync the named source ("gh" or "phab").

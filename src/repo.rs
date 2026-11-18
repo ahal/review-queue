@@ -334,6 +334,7 @@ pub struct RepoListEntry {
 }
 
 fn clone_repo(url: &str, dest: &Path) -> Result<()> {
+    tracing::info!("cloning {url} into {}", dest.display());
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;

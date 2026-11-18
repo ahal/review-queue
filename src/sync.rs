@@ -97,8 +97,16 @@ pub async fn sync(
         if only_source.is_some_and(|o| o != source.name()) {
             continue;
         }
+        tracing::info!("fetching review queue from `{}`", source.name());
         let queue = match source.fetch_queue().await {
-            Ok(queue) => queue,
+            Ok(queue) => {
+                tracing::info!(
+                    "`{}`: {} reviews in queue",
+                    source.name(),
+                    queue.reviews.len() + queue.errors.len()
+                );
+                queue
+            }
             Err(e) => {
                 // Without its queue there's no telling which of its reviews left it, so don't
                 // check any of their statuses either.
@@ -154,6 +162,10 @@ pub async fn sync(
         let Some(source) = sources_by_name.get(source_name.as_str()) else {
             continue;
         };
+        tracing::info!(
+            "checking status of {} reviews no longer in the `{source_name}` queue",
+            ids.len()
+        );
         let statuses = match source.fetch_status(&ids).await {
             Ok(statuses) => statuses,
             Err(e) => {
@@ -175,6 +187,7 @@ pub async fn sync(
         }
     }
 
+    tracing::info!("reconciling workspaces");
     reconcile_workspaces(
         sources,
         only_source,
@@ -184,6 +197,7 @@ pub async fn sync(
         &mut report,
     )
     .await;
+    tracing::info!("checking for leftover workspaces");
     prune_orphans(
         paths,
         &state,
@@ -244,6 +258,7 @@ pub async fn auto_workspace(
         OnMissing::Ask
     };
     for key in report.new_stacks.clone() {
+        tracing::info!("creating workspace for {key}");
         match fetch_local(sources, paths, config, &key, on_missing).await {
             Ok(_) => {
                 if let Some(note) = State::load(&paths.state_file())
@@ -402,6 +417,7 @@ async fn reconcile_workspaces(
             .collect();
 
         if live.is_empty() {
+            tracing::info!("removing workspace for resolved stack {id}");
             remove_finished_workspace(&id, &ws, &members, state, dry_run, report);
             continue;
         }
@@ -445,6 +461,7 @@ async fn reconcile_workspaces(
         let Some(source) = sources.iter().find(|s| s.name() == tip.key.source) else {
             continue;
         };
+        tracing::info!("updating workspace for {} to {}", tip.key, tip.version);
         let vcs = vcs_for(ws.vcs);
         let review = review_from_entry(&tip);
         let checkout = match source.checkout_spec(&review, &ws.repo_path).await {
@@ -639,6 +656,9 @@ fn remove_orphan(
     dry_run: bool,
     report: &mut SyncReport,
 ) -> bool {
+    if !dry_run {
+        tracing::info!("removing leftover {label}");
+    }
     if !dry_run
         && let Err(e) = vcs.remove_workspace(repo, ws, slug)
         // e.g. a git worktree whose registration is already gone, which `worktree remove`

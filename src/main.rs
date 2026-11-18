@@ -18,8 +18,8 @@ use review_queue::tui;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
     let cli = Cli::parse();
+    init_logging(&cli);
 
     let paths = Paths::discover()?;
     let config_path = cli.config.clone().unwrap_or_else(|| paths.config_file());
@@ -48,6 +48,25 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Log to stderr, filtered by `RUST_LOG`. Without it, `rq sync` shows its progress at info
+/// level; everything else only shows errors, since `rq show`'s TUI runs sync in-process and
+/// stray log lines would draw over it.
+fn init_logging(cli: &Cli) {
+    let default = match cli.command {
+        Some(Command::Sync { .. }) => "review_queue=info",
+        _ => "error",
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .without_time()
+        .with_target(false)
+        .init();
 }
 
 /// Build a `ReviewSource` for each configured source.
