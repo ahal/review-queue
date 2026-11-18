@@ -31,12 +31,13 @@ In the target picker, arrows or `j`/`k` move the selection, Enter or `l` runs it
 closes the picker. Other character keys are ignored; target shortcuts only work in the main list.
 
 `rq sync` updates existing workspaces and removes them once every review in their stack resolves.
-With `auto_workspace = true`, it also creates workspaces for newly-seen reviews. Existing reviews
-are not backfilled, failed fetches are not retried, and deleting a workspace with `d` is permanent
-across syncs. Use `rq fetch` or a workspace target in the TUI to create one manually. Sync never
-prompts; enable `auto_clone` to clone missing repositories automatically. Choosing a target starts
-fetching without a workspace confirmation; rq still asks before cloning a missing repository
-unless `auto_clone` is enabled.
+With `auto_workspace = true`, every sync also creates a workspace for each queued stack that
+doesn't have one, and rebuilds one that failed to apply once its stack changes. Failed fetches are
+retried on the next sync, and a workspace deleted with `d` comes back on the next sync while its
+review is still in your queue. Use `rq fetch` or a workspace target in the TUI to create one
+manually. Sync never prompts; enable `auto_clone` to clone missing repositories automatically.
+Choosing a target starts fetching without a workspace confirmation; rq still asks before cloning a
+missing repository unless `auto_clone` is enabled.
 
 `rq shell-init <shell>` prints an `rqcd` function that picks a review with `fzf` and `cd`s
 into its workspace (needs `jq` and `fzf`):
@@ -53,7 +54,7 @@ eval "$(rq shell-init zsh)"
 # Existing checkouts under here are used as canonical repos instead of cloning.
 workdir = "~/dev"
 # auto_clone = true         # clone without asking when no checkout is found
-# auto_workspace = true     # sync creates workspaces for newly-seen reviews
+# auto_workspace = true     # sync creates workspaces for every queued review
 # data_dir = "~/.local/share/review-queue"
 
 [source.github]

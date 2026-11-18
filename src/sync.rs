@@ -7,7 +7,7 @@
 //!
 //! `rq sync` (this module's `sync()`) only ever tracks metadata and updates/removes *existing*
 //! workspaces. With `auto_workspace` enabled, a separate step then creates workspaces for
-//! newly-seen reviews after sync has saved state. Per source, per run:
+//! queued stacks that have none after sync has saved state. Per source, per run:
 //! 1. `fetch_queue()` - reviews currently waiting on you.
 //! 2. New reviews are recorded with no workspace (see `fetch_local()` for that); tracked ones get
 //!    their metadata (including `version` and `ancestors`) refreshed.
@@ -55,10 +55,10 @@ pub struct SyncReport {
     pub added: Vec<ReviewKey>,
     /// Workspaces created by `auto_workspace`, or that it would create on a dry run.
     pub fetched: Vec<ReviewKey>,
-    /// The bottom-most newly added review of each stack that has no workspace: what
+    /// The bottom-most queued review of each stack that needs a workspace built: what
     /// `auto_workspace` would fetch. Computed from sync's in-memory state, so it's also right
     /// on a dry run, when nothing is saved.
-    pub new_stacks: Vec<ReviewKey>,
+    pub missing_stacks: Vec<ReviewKey>,
     pub updated: Vec<ReviewKey>,
     pub removed: Vec<ReviewKey>,
     /// Review + human-readable reason it was flagged (e.g. a partial apply).
@@ -206,7 +206,7 @@ pub async fn sync(
         dry_run,
         &mut report,
     );
-    report.new_stacks = new_stacks(&state, &report.added);
+    report.missing_stacks = missing_stacks(&state);
 
     if !dry_run {
         state.save(&paths.state_file())?;
@@ -214,28 +214,36 @@ pub async fn sync(
     Ok(report)
 }
 
-/// For each stack containing a newly added, still-queued review and no workspace yet, its
-/// bottom-most such review. A new review joining an already checked-out stack is skipped:
-/// `reconcile_workspaces` has already folded it into that workspace.
-fn new_stacks(state: &State, added: &[ReviewKey]) -> Vec<ReviewKey> {
-    let candidates: BTreeSet<&ReviewKey> = added
-        .iter()
-        .filter(|key| state.get(key).is_some_and(|e| e.in_queue && !e.resolved))
-        .collect();
+/// For each stack with a still-queued review that needs a workspace built, its bottom-most such
+/// review. A stack needs one if none of its members has a workspace, or if its workspace failed
+/// to apply and the stack has changed since (`reconcile_workspaces` leaves those alone, and
+/// retrying an unchanged stack would just fail the same way).
+fn missing_stacks(state: &State) -> Vec<ReviewKey> {
     stacks::group(state.iter())
         .into_iter()
         .filter(|stack| {
-            !stack.members.iter().any(|member| {
-                state
-                    .get(member)
-                    .is_some_and(|e| state.workspace_of(e).is_some())
-            })
+            let ws = stack
+                .members
+                .iter()
+                .find_map(|member| state.get(member).and_then(|e| state.workspace_of(e)));
+            match ws {
+                None => true,
+                Some(ws) if ws.status == Status::ApplyFailed => state
+                    .get(&stack.tip)
+                    .is_some_and(|tip| ws.tip != tip.key || ws.version != tip.version),
+                Some(_) => false,
+            }
         })
-        .filter_map(|stack| stack.members.into_iter().find(|k| candidates.contains(k)))
+        .filter_map(|stack| {
+            stack
+                .members
+                .into_iter()
+                .find(|k| state.get(k).is_some_and(|e| e.in_queue && !e.resolved))
+        })
         .collect()
 }
 
-/// Create a workspace for each of `report.new_stacks` after `sync` has saved state. The caller
+/// Create a workspace for each of `report.missing_stacks` after `sync` has saved state. The caller
 /// must keep holding the sync lock: `fetch_local` loads and saves state independently.
 pub async fn auto_workspace(
     sources: &[Box<dyn ReviewSource>],
@@ -248,7 +256,7 @@ pub async fn auto_workspace(
         return Ok(());
     }
     if dry_run {
-        report.fetched.extend(report.new_stacks.iter().cloned());
+        report.fetched.extend(report.missing_stacks.iter().cloned());
         return Ok(());
     }
 
@@ -257,7 +265,7 @@ pub async fn auto_workspace(
     } else {
         OnMissing::Ask
     };
-    for key in report.new_stacks.clone() {
+    for key in report.missing_stacks.clone() {
         tracing::info!("creating workspace for {key}");
         match fetch_local(sources, paths, config, &key, on_missing).await {
             Ok(_) => {
@@ -1997,7 +2005,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_workspace_fetches_new_review_once_and_respects_deletion() {
+    async fn auto_workspace_fetches_once_and_recreates_a_deleted_workspace() {
         use std::sync::atomic::Ordering;
 
         let repos = make_repos();
@@ -2030,19 +2038,13 @@ mod tests {
         auto_workspace(&sources, &paths, &config, &mut report, false)
             .await
             .unwrap();
-        assert!(report.fetched.is_empty());
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        assert!(!ws_path.exists());
-        assert!(
-            State::load(&paths.state_file())
-                .unwrap()
-                .workspace_for(&stk(1))
-                .is_none()
-        );
+        assert_eq!(report.fetched, vec![stk(1)]);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(ws_path.join("D1.txt").exists());
     }
 
     #[tokio::test]
-    async fn auto_workspace_does_not_backfill_previously_tracked_reviews() {
+    async fn auto_workspace_backfills_previously_tracked_reviews() {
         let (_repos, _tmp, paths, sources) = stack_fixture();
         sync(&sources, &paths, None, false).await.unwrap();
         let mut report = sync(&sources, &paths, None, false).await.unwrap();
@@ -2055,15 +2057,62 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(report.fetched.is_empty());
+        assert_eq!(report.fetched, vec![stk(1)]);
         assert_eq!(
             State::load(&paths.state_file())
                 .unwrap()
                 .workspaces()
                 .count(),
-            0
+            1
         );
-        assert!(!paths.repos_file().exists());
+    }
+
+    #[tokio::test]
+    async fn auto_workspace_rebuilds_an_apply_failed_workspace_once_its_stack_changes() {
+        use std::sync::atomic::Ordering;
+
+        let repos = make_repos();
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        let source = StackSource::new(&repos.upstream);
+        source.set_queue(vec![source.review(1, &[], "1")]);
+        source.broken.lock().unwrap().push("D1".into());
+        let calls = source.checkout_calls.clone();
+        let sources: Vec<Box<dyn ReviewSource>> = vec![Box::new(source)];
+        let config = auto_workspace_config();
+
+        let mut report = sync(&sources, &paths, None, false).await.unwrap();
+        auto_workspace(&sources, &paths, &config, &mut report, false)
+            .await
+            .unwrap();
+        assert_eq!(report.errors.len(), 1, "{report:?}");
+        let state = State::load(&paths.state_file()).unwrap();
+        assert_eq!(
+            state.workspace_for(&stk(1)).unwrap().status,
+            Status::ApplyFailed
+        );
+
+        // Unchanged: retrying would just fail the same way.
+        let mut report = sync(&sources, &paths, None, false).await.unwrap();
+        auto_workspace(&sources, &paths, &config, &mut report, false)
+            .await
+            .unwrap();
+        assert!(report.fetched.is_empty());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let next = StackSource::new(&repos.upstream);
+        next.set_queue(vec![next.review(1, &[], "2")]);
+        let sources: Vec<Box<dyn ReviewSource>> = vec![Box::new(next)];
+        let mut report = sync(&sources, &paths, None, false).await.unwrap();
+        auto_workspace(&sources, &paths, &config, &mut report, false)
+            .await
+            .unwrap();
+        assert_eq!(report.fetched, vec![stk(1)], "{report:?}");
+        let state = State::load(&paths.state_file()).unwrap();
+        let ws = state.workspace_for(&stk(1)).unwrap();
+        assert_eq!(ws.status, Status::Ready);
+        assert_eq!(ws.version, "2");
+        assert!(ws.workspace_path.join("D1.txt").exists());
     }
 
     #[tokio::test]
@@ -2184,7 +2233,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_workspace_continues_after_errors_and_does_not_retry() {
+    async fn auto_workspace_continues_after_errors_and_retries_next_sync() {
         let repos = make_repos();
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(tmp.path());
@@ -2206,8 +2255,8 @@ mod tests {
         auto_workspace(&sources, &paths, &config, &mut report, false)
             .await
             .unwrap();
-        assert!(report.errors.is_empty());
-        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(report.errors.len(), 2);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 4);
     }
 
     #[tokio::test]

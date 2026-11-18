@@ -9,7 +9,7 @@
 //! runs the selection, and Esc closes it; other characters are ignored. Configured targets run
 //! commands, optionally fetching first
 //! and suspending the TUI until they exit. See `run_event_loop` for why suspension tears down
-//! and recreates the backend. `rq sync` creates workspaces for newly-seen reviews only with
+//! and recreates the backend. `rq sync` creates workspaces for queued reviews only with
 //! `auto_workspace` enabled.
 //! `d` deletes the selected workspace after confirmation, or cancels an in-flight fetch.
 //! Fetching runs on a background thread with a row spinner; choosing a target is the

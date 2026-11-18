@@ -18,7 +18,7 @@ pub struct Config {
     /// `workdir`. Set by answering "always" to the clone prompt (see `set_auto_clone`).
     #[serde(default)]
     pub auto_clone: bool,
-    /// Create workspaces during sync for newly-seen reviews only.
+    /// Create workspaces during sync for every queued stack that doesn't have one.
     #[serde(default)]
     pub auto_workspace: bool,
     #[serde(default)]
