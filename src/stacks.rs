@@ -93,6 +93,7 @@ mod tests {
             resolved: false,
             last_synced: chrono::Utc::now(),
             stack_id: None,
+            workspace_dismissed: false,
             ancestors: ancestors.iter().map(|a| k(a)).collect(),
             diff_stat: None,
             description: None,

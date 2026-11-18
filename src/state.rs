@@ -106,6 +106,10 @@ pub struct ReviewEntry {
     /// Every member of a stack shares one.
     #[serde(default)]
     pub stack_id: Option<String>,
+    /// The user deleted this review's workspace (`d` in the TUI), so `auto_workspace` leaves its
+    /// stack alone. Cleared when a workspace is fetched for it again on request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub workspace_dismissed: bool,
     /// The review's ancestors within its stack, bottom-most first, excluding itself and any
     /// already-landed ones. Ancestors needn't be tracked themselves (you may not be a reviewer
     /// on them).
@@ -301,6 +305,7 @@ mod tests {
             resolved: false,
             last_synced: chrono::Utc::now(),
             stack_id: None,
+            workspace_dismissed: false,
             ancestors: Vec::new(),
             diff_stat: None,
             description: None,

@@ -33,11 +33,11 @@ closes the picker. Other character keys are ignored; target shortcuts only work 
 `rq sync` updates existing workspaces and removes them once every review in their stack resolves.
 With `auto_workspace = true`, every sync also creates a workspace for each queued stack that
 doesn't have one, and rebuilds one that failed to apply once its stack changes. Failed fetches are
-retried on the next sync, and a workspace deleted with `d` comes back on the next sync while its
-review is still in your queue. Use `rq fetch` or a workspace target in the TUI to create one
-manually. Sync never prompts; enable `auto_clone` to clone missing repositories automatically.
-Choosing a target starts fetching without a workspace confirmation; rq still asks before cloning a
-missing repository unless `auto_clone` is enabled.
+retried on the next sync. A workspace you delete with `d` stays deleted, even if its stack gets a
+new revision, until you fetch it again with `rq fetch` or a workspace target in the TUI, which is
+also how you create one manually. Sync never prompts; enable `auto_clone` to clone missing
+repositories automatically. Choosing a target starts fetching without a workspace confirmation;
+rq still asks before cloning a missing repository unless `auto_clone` is enabled.
 
 `rq shell-init <shell>` prints an `rqcd` function that picks a review with `fzf` and `cd`s
 into its workspace (needs `jq` and `fzf`):

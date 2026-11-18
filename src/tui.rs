@@ -1454,6 +1454,7 @@ mod tests {
             resolved: false,
             last_synced: chrono::Utc::now(),
             stack_id: None,
+            workspace_dismissed: false,
             ancestors: Vec::new(),
             diff_stat: diff_stat.map(String::from),
             description: None,

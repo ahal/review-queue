@@ -217,10 +217,17 @@ pub async fn sync(
 /// For each stack with a still-queued review that needs a workspace built, its bottom-most such
 /// review. A stack needs one if none of its members has a workspace, or if its workspace failed
 /// to apply and the stack has changed since (`reconcile_workspaces` leaves those alone, and
-/// retrying an unchanged stack would just fail the same way).
+/// retrying an unchanged stack would just fail the same way). Stacks with a member whose
+/// workspace the user deleted are skipped, including ones that grew a new review since.
 fn missing_stacks(state: &State) -> Vec<ReviewKey> {
     stacks::group(state.iter())
         .into_iter()
+        .filter(|stack| {
+            !stack
+                .members
+                .iter()
+                .any(|member| state.get(member).is_some_and(|e| e.workspace_dismissed))
+        })
         .filter(|stack| {
             let ws = stack
                 .members
@@ -306,6 +313,7 @@ fn record_review(review: &Review, state: &mut State, report: &mut SyncReport) {
                 resolved: false,
                 last_synced: chrono::Utc::now(),
                 stack_id: None,
+                workspace_dismissed: false,
                 ancestors: Vec::new(),
                 diff_stat: None,
                 description: None,
@@ -910,6 +918,7 @@ pub async fn fetch_local(
     for member in &stack.members {
         if let Some(mut e) = state.get(member).cloned() {
             e.stack_id = Some(stack_id.clone());
+            e.workspace_dismissed = false;
             state.insert(e);
         }
     }
@@ -985,6 +994,7 @@ fn position_at(source: &dyn ReviewSource, ws: &Workspace, key: &ReviewKey) {
 /// Acts regardless of `resolved`/`in_queue`, unlike `sync()`'s own resolved-and-clean removal
 /// path, and on every review in the stack, since they share the one workspace. Whatever the
 /// backend's own `remove_workspace` can't clean up is finished off with a raw directory removal.
+/// The members are marked `workspace_dismissed` so `auto_workspace` doesn't recreate it.
 pub fn remove_workspace(paths: &Paths, key: &ReviewKey) -> Result<()> {
     let mut state = State::load(&paths.state_file())?;
     let entry = state
@@ -1013,6 +1023,7 @@ pub fn remove_workspace(paths: &Paths, key: &ReviewKey) -> Result<()> {
     state.for_each_entry_mut(|e| {
         if e.stack_id.as_deref() == Some(stack_id.as_str()) {
             e.stack_id = None;
+            e.workspace_dismissed = true;
         }
     });
     state.save(&paths.state_file())
@@ -1756,6 +1767,7 @@ mod tests {
             resolved: false,
             last_synced: chrono::Utc::now(),
             stack_id: None,
+            workspace_dismissed: false,
             ancestors: Vec::new(),
             diff_stat: None,
             description: None,
@@ -2005,7 +2017,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_workspace_fetches_once_and_recreates_a_deleted_workspace() {
+    async fn auto_workspace_fetches_once_and_leaves_a_deleted_workspace_alone() {
         use std::sync::atomic::Ordering;
 
         let repos = make_repos();
@@ -2038,8 +2050,28 @@ mod tests {
         auto_workspace(&sources, &paths, &config, &mut report, false)
             .await
             .unwrap();
-        assert_eq!(report.fetched, vec![stk(1)]);
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(report.fetched.is_empty());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(!ws_path.exists());
+
+        // A new revision of the stack doesn't bring it back either.
+        let next = StackSource::new(&repos.upstream);
+        next.set_queue(vec![next.review(1, &[], "2")]);
+        let next_calls = next.checkout_calls.clone();
+        let sources: Vec<Box<dyn ReviewSource>> = vec![Box::new(next)];
+        let mut report = sync(&sources, &paths, None, false).await.unwrap();
+        auto_workspace(&sources, &paths, &config, &mut report, false)
+            .await
+            .unwrap();
+        assert!(report.fetched.is_empty());
+        assert_eq!(next_calls.load(Ordering::Relaxed), 0);
+
+        // Fetching it by hand clears the dismissal, so a later deletion is needed to stop sync.
+        fetch_local(&sources, &paths, &config, &stk(1), OnMissing::Ask)
+            .await
+            .unwrap();
+        let state = State::load(&paths.state_file()).unwrap();
+        assert!(!state.get(&stk(1)).unwrap().workspace_dismissed);
         assert!(ws_path.join("D1.txt").exists());
     }
 
