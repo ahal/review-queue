@@ -11,9 +11,9 @@
 //! and suspending the TUI until they exit. See `run_event_loop` for why suspension tears down
 //! and recreates the backend. `rq sync` creates workspaces for newly-seen reviews only with
 //! `auto_workspace` enabled.
-//! `d` deletes the selected workspace after confirmation, discarding local changes, or cancels
-//! an in-flight fetch. Fetching runs on a background thread with a row spinner; choosing a
-//! target is the confirmation to create its workspace. The underlying `git`/`jj` calls cannot
+//! `d` deletes the selected workspace after confirmation, or cancels an in-flight fetch.
+//! Fetching runs on a background thread with a row spinner; choosing a target is the
+//! confirmation to create its workspace. The underlying `git`/`jj` calls cannot
 //! be interrupted, so cancellation detaches from the operation and turns the spinner red.
 //! `finish_fetch` removes newly created workspaces after cancellation. `f` fetches or refreshes
 //! in the background without running a target. `r` runs a full `rq sync` in the background
@@ -870,8 +870,7 @@ fn delete_workspace_selected(s: &mut Cursive) {
     }
 }
 
-/// Confirms before deleting a workspace. Local changes are always discarded - there's no second
-/// prompt for a dirty workspace.
+/// Confirms before deleting a workspace.
 fn prompt_delete_workspace(s: &mut Cursive, key: ReviewKey, sharing: usize) {
     let text = if sharing > 1 {
         format!(
@@ -904,9 +903,8 @@ fn with_sync_lock<T>(paths: &Paths, f: impl FnOnce() -> Result<T>) -> Result<T> 
     f()
 }
 
-/// Runs `sync::remove_workspace` (forced, discarding any local changes) on a background thread,
-/// showing the same row spinner as a fetch while it works - deleting a big worktree can take a
-/// while.
+/// Runs `sync::remove_workspace` on a background thread, showing the same row spinner as a
+/// fetch while it works - deleting a big worktree can take a while.
 fn begin_delete(s: &mut Cursive, key: ReviewKey) {
     let guard = fetch_guard(s, &key);
     let Some(ctx) = s.user_data::<Ctx>() else {
@@ -928,7 +926,7 @@ fn begin_delete(s: &mut Cursive, key: ReviewKey) {
 
     let cb_sink = s.cb_sink().clone();
     std::thread::spawn(move || {
-        let result = with_sync_lock(&paths, || sync::remove_workspace(&paths, &key, true));
+        let result = with_sync_lock(&paths, || sync::remove_workspace(&paths, &key));
         done.store(true, Ordering::SeqCst);
         let _ = cb_sink.send(Box::new(move |s| finish_delete(s, key, guard, result)));
     });
@@ -1162,11 +1160,10 @@ fn finish_fetch(
     if cancelled.load(Ordering::SeqCst) {
         let status = match &result {
             Ok(_) if had_workspace => format!("cancelled fetching {key}; existing workspace kept"),
-            Ok(_) => match s.user_data::<Ctx>().map(|ctx| {
-                with_sync_lock(&ctx.paths, || {
-                    sync::remove_workspace(&ctx.paths, &key, true)
-                })
-            }) {
+            Ok(_) => match s
+                .user_data::<Ctx>()
+                .map(|ctx| with_sync_lock(&ctx.paths, || sync::remove_workspace(&ctx.paths, &key)))
+            {
                 Some(Ok(())) => format!("cancelled fetching {key}; workspace cleaned up"),
                 Some(Err(e)) => format!("cancelled fetching {key}; cleanup failed: {e:#}"),
                 None => format!("cancelled fetching {key}"),

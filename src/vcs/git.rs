@@ -3,14 +3,15 @@
 //! - `add_workspace`: `git worktree add --detach <ws> <base|commit>`, then for
 //!   `Checkout::Patches`, apply each patch bottom-to-top with `git apply --index --3way` and
 //!   commit it.
-//! - `update_workspace`: `git checkout --detach` onto the new base, then re-apply patches.
+//! - `update_workspace`: `git checkout --force --detach` onto the new base and `git clean`,
+//!   then re-apply patches.
 //!   Every `add_workspace`/`update_workspace` call pins its resulting head under
 //!   `refs/review-queue/<name>/<version>` (`git update-ref`, never overwritten), so a prior
 //!   version stays reachable once a later call moves the workspace on.
-//! - `is_dirty`: `git status --porcelain` is non-empty, or HEAD isn't the expected id (the stack
-//!   tip) or one of its ancestors.
-//! - `position`: `git checkout --detach <commit>`, to sit on one patch of a stack.
-//! - `remove_workspace`: `git worktree remove`, plus every `refs/review-queue/<name>/*` ref.
+//! - `position`: `git checkout --force --detach <commit>` and `git clean`, to sit on one patch
+//!   of a stack.
+//! - `remove_workspace`: `git worktree remove --force`, plus every `refs/review-queue/<name>/*`
+//!   ref.
 //!
 //! A failed patch application leaves the workspace in place (the caller should record
 //! `Status::ApplyFailed`) rather than being silently cleaned up - unless earlier patches had
@@ -223,6 +224,14 @@ impl GitVcs {
         .into()
     }
 
+    /// Check out `rev` detached, throwing away any local changes and untracked files.
+    fn force_checkout(&self, ws: &Path, rev: &str) -> Result<()> {
+        self.run(ws, &["checkout", "-q", "--force", "--detach", rev])
+            .with_context(|| format!("checking out {rev} in {}", ws.display()))?;
+        self.run(ws, &["clean", "-fdq"])?;
+        Ok(())
+    }
+
     fn pin_ref(&self, repo: &Path, name: &str, version: &str, head: &str) -> Result<()> {
         self.run(
             repo,
@@ -285,8 +294,7 @@ impl Vcs for GitVcs {
     ) -> Result<String> {
         let base = self.resolve_target(repo, checkout)?;
 
-        self.run(ws, &["checkout", "--detach", &base])
-            .with_context(|| format!("checking out {base} in {}", ws.display()))?;
+        self.force_checkout(ws, &base)?;
 
         if let Err(e) = self.apply_checkout(ws, checkout) {
             return Err(self.salvage(repo, ws, &base, name, version, e));
@@ -297,30 +305,8 @@ impl Vcs for GitVcs {
         Ok(head)
     }
 
-    fn is_dirty(&self, ws: &Path, expected_head: &str) -> Result<bool> {
-        let status = self.run(ws, &["status", "--porcelain"])?;
-        if !status.is_empty() {
-            return Ok(true);
-        }
-        let head = self.run(ws, &["rev-parse", "HEAD"])?;
-        if head == expected_head {
-            return Ok(false);
-        }
-        // Positioned on an earlier patch of the stack is fine; anything else isn't.
-        let is_ancestor = Command::new("git")
-            .current_dir(ws)
-            .args(["merge-base", "--is-ancestor", &head, expected_head])
-            .output()
-            .with_context(|| format!("running `git merge-base` in {}", ws.display()))?
-            .status
-            .success();
-        Ok(!is_ancestor)
-    }
-
     fn position(&self, ws: &Path, commit: &str) -> Result<()> {
-        self.run(ws, &["checkout", "--detach", commit])
-            .with_context(|| format!("checking out {commit} in {}", ws.display()))?;
-        Ok(())
+        self.force_checkout(ws, commit)
     }
 
     fn commits(&self, ws: &Path, tip: &str, limit: usize) -> Result<Vec<(String, String)>> {
@@ -340,7 +326,7 @@ impl Vcs for GitVcs {
     fn remove_workspace(&self, repo: &Path, ws: &Path, name: &str) -> Result<()> {
         if ws.exists() {
             let ws_str = ws.to_string_lossy().to_string();
-            self.run(repo, &["worktree", "remove", &ws_str])
+            self.run(repo, &["worktree", "remove", "--force", &ws_str])
                 .with_context(|| format!("removing worktree at {}", ws.display()))?;
         } else {
             // Already deleted from disk: drop the now-dangling worktree registration.
@@ -393,10 +379,6 @@ impl Vcs for GitVcs {
             .parent()
             .map(Path::to_path_buf)
             .with_context(|| format!("{common} isn't inside a repo"))
-    }
-
-    fn has_local_changes(&self, ws: &Path) -> Result<bool> {
-        Ok(!self.run(ws, &["status", "--porcelain"])?.is_empty())
     }
 }
 
@@ -553,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn position_moves_within_a_stack_without_counting_as_dirty() {
+    fn position_moves_within_a_stack() {
         let f = fixture();
         let checkout = Checkout::Patches {
             base: Some(f.base.clone()),
@@ -575,32 +557,9 @@ mod tests {
 
         vcs.position(&ws, &commits[1].0).unwrap();
         assert!(!ws.join("b.txt").exists());
-        assert!(!vcs.is_dirty(&ws, &tip).unwrap());
 
         vcs.position(&ws, &tip).unwrap();
         assert!(ws.join("b.txt").exists());
-    }
-
-    #[test]
-    fn a_commit_outside_the_stack_is_dirty() {
-        let f = fixture();
-        let checkout = Checkout::Patches {
-            base: Some(f.base.clone()),
-            patches: vec![add_file_patch("add a", "a.txt", "aaa\n")],
-        };
-        let vcs = GitVcs;
-        let ws = f._tmp.path().join("ws");
-        let tip = vcs
-            .add_workspace(&f.canon, &ws, &checkout, "moz/D1", "1")
-            .unwrap();
-
-        git(&ws, &["config", "user.name", "test"]);
-        git(&ws, &["config", "user.email", "test@example.com"]);
-        fs::write(ws.join("mine.txt"), "x\n").unwrap();
-        git(&ws, &["add", "mine.txt"]);
-        git(&ws, &["commit", "-q", "-m", "local"]);
-
-        assert!(vcs.is_dirty(&ws, &tip).unwrap());
     }
 
     /// A patch that adds `partial.txt` but then fails on `README.md`, whose line it expects
@@ -637,7 +596,7 @@ mod tests {
         assert_eq!(rev_parse(&ws, "HEAD~1"), f.base);
         assert!(ws.join("a.txt").exists());
         assert!(!ws.join("partial.txt").exists());
-        assert!(!vcs.is_dirty(&ws, &partial.head).unwrap());
+        assert!(vcs.run(&ws, &["status", "--porcelain"]).unwrap().is_empty());
         assert_eq!(
             rev_parse(&f.canon, "refs/review-queue/moz/D1/1"),
             partial.head
@@ -744,29 +703,29 @@ mod tests {
     }
 
     #[test]
-    fn is_dirty_detects_local_changes_and_head_mismatch() {
+    fn position_discards_local_changes() {
         let f = fixture();
-        let vcs = GitVcs;
-        let ws = f._tmp.path().join("ws");
         let checkout = Checkout::Patches {
             base: Some(f.base.clone()),
-            patches: vec![],
+            patches: vec![
+                add_file_patch("add a", "a.txt", "aaa\n"),
+                add_file_patch("add b", "b.txt", "bbb\n"),
+            ],
         };
-        let head = vcs
+        let vcs = GitVcs;
+        let ws = f._tmp.path().join("ws");
+        let tip = vcs
             .add_workspace(&f.canon, &ws, &checkout, "moz/D5", "1")
             .unwrap();
+        let commits = vcs.commits(&ws, &tip, 10).unwrap();
 
-        assert!(!vcs.is_dirty(&ws, &head).unwrap());
-
+        fs::write(ws.join("b.txt"), "edited\n").unwrap();
         fs::write(ws.join("untracked.txt"), "oops\n").unwrap();
-        assert!(vcs.is_dirty(&ws, &head).unwrap());
+        vcs.position(&ws, &commits[1].0).unwrap();
 
-        fs::remove_file(ws.join("untracked.txt")).unwrap();
-        assert!(!vcs.is_dirty(&ws, &head).unwrap());
-        assert!(
-            vcs.is_dirty(&ws, "0000000000000000000000000000000000000000")
-                .unwrap()
-        );
+        assert!(!ws.join("b.txt").exists());
+        assert!(!ws.join("untracked.txt").exists());
+        assert!(vcs.run(&ws, &["status", "--porcelain"]).unwrap().is_empty());
     }
 
     #[test]
@@ -788,9 +747,6 @@ mod tests {
             vcs.canonical_repo(&ws).unwrap(),
             f.canon.canonicalize().unwrap()
         );
-        assert!(!vcs.has_local_changes(&ws).unwrap());
-        fs::write(ws.join("scratch.txt"), "local\n").unwrap();
-        assert!(vcs.has_local_changes(&ws).unwrap());
     }
 
     #[test]
@@ -806,6 +762,7 @@ mod tests {
             .unwrap();
 
         let canon_head_before = rev_parse(&f.canon, "HEAD");
+        fs::write(ws.join("scratch.txt"), "local\n").unwrap();
 
         vcs.remove_workspace(&f.canon, &ws, "moz/D6").unwrap();
 

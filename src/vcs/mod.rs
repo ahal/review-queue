@@ -60,7 +60,7 @@ pub trait Vcs {
         version: &str,
     ) -> Result<String>;
 
-    /// Re-point an existing, clean workspace at a new `checkout`/`version`. The commit the
+    /// Re-point an existing workspace at a new `checkout`/`version`. The commit the
     /// workspace pointed at before this call remains reachable afterwards (each call pins its
     /// own resulting head under a `name`/`version`-namespaced ref rather than overwriting the
     /// previous one), so old versions stay available for interdiffing until `remove_workspace`
@@ -75,13 +75,8 @@ pub trait Vcs {
         version: &str,
     ) -> Result<String>;
 
-    /// True if the workspace has local modifications, or its head isn't `expected_head` (the
-    /// stack tip) or one of its ancestors - either case means `sync` must not touch it silently.
-    /// Sitting on an earlier patch of the stack (see `position`) is not dirty.
-    fn is_dirty(&self, ws: &Path, expected_head: &str) -> Result<bool>;
-
-    /// Move a clean workspace to `commit`, one of the patches reachable from the stack tip. Never
-    /// rewrites any of the stack's commits, so the tip stays valid for `is_dirty`.
+    /// Move a workspace to `commit`, one of the patches reachable from the stack tip. Never
+    /// rewrites any of the stack's commits.
     fn position(&self, ws: &Path, commit: &str) -> Result<()>;
 
     /// Up to `limit` commits reachable from `tip` (newest first) as `(commit id, message)`, so a
@@ -89,8 +84,7 @@ pub trait Vcs {
     fn commits(&self, ws: &Path, tip: &str, limit: usize) -> Result<Vec<(String, String)>>;
 
     /// Remove the worktree/workspace and every ref/bookmark `add_workspace`/`update_workspace`
-    /// pinned for it under `name`. Callers only ever call this on a workspace `is_dirty` has
-    /// already confirmed is clean - there's no way to force-remove a dirty one.
+    /// pinned for it under `name`.
     /// Forgets the workspace registered at `ws` even if it isn't named after `name` (or no
     /// longer exists on disk), and is a no-op for the registration if there's none, so it also
     /// cleans up pins left with no workspace at all.
@@ -102,10 +96,6 @@ pub trait Vcs {
 
     /// The canonical repo the workspace at `ws` was created from.
     fn canonical_repo(&self, ws: &Path) -> Result<PathBuf>;
-
-    /// True if the workspace's working copy has uncommitted changes. Unlike `is_dirty`, needs
-    /// no expected head, so it works on a workspace `rq` has lost track of.
-    fn has_local_changes(&self, ws: &Path) -> Result<bool>;
 }
 
 /// Parse `commits()` output: records separated by `\x1e`, fields by `\x1f`.

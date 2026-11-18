@@ -19,14 +19,12 @@
 //!
 //! Finally each existing workspace is reconciled against its stack: reviews newly chained onto a
 //! checked-out stack join its workspace; a workspace whose tip or tip `version` changed is
-//! updated in place if clean (`update_workspace`), or flagged if dirty; one whose reviews have
-//! all resolved is removed, discarding any local changes.
+//! updated in place (`update_workspace`); one whose reviews have all resolved is removed.
 //!
 //! Last, `prune_orphans` sweeps up whatever a removal that didn't finish left behind: workspace
 //! directories under `workspaces/` that state doesn't know about, `rq` workspaces still
-//! registered in a canonical repo, and `review-queue/<name>/*` pins with no workspace. An
-//! orphan with local changes is flagged instead of removed. Then the owner/repo directories
-//! removals left empty are deleted.
+//! registered in a canonical repo, and `review-queue/<name>/*` pins with no workspace. Then the
+//! owner/repo directories removals left empty are deleted.
 //!
 //! `fetch_local()` is the on-demand counterpart - resolving a canonical repo (asking before
 //! cloning one, unless told otherwise) and creating a workspace for a single already-tracked
@@ -63,14 +61,14 @@ pub struct SyncReport {
     pub new_stacks: Vec<ReviewKey>,
     pub updated: Vec<ReviewKey>,
     pub removed: Vec<ReviewKey>,
-    /// Review + human-readable reason it was flagged instead of touched (dirty, apply failure).
+    /// Review + human-readable reason it was flagged (e.g. a partial apply).
     pub flagged: Vec<(ReviewKey, String)>,
     pub errors: Vec<(ReviewKey, String)>,
     /// Source name + error for a source that failed as a whole; its reviews are left as-is.
     pub source_errors: Vec<(String, String)>,
     /// Leftover workspaces/pins no tracked review owns, removed by `prune_orphans`.
     pub pruned: Vec<String>,
-    /// Leftovers `prune_orphans` found but left alone (local changes, or removal failed).
+    /// Leftovers `prune_orphans` found but couldn't remove.
     pub prune_flagged: Vec<(String, String)>,
 }
 
@@ -408,8 +406,7 @@ async fn reconcile_workspaces(
             continue;
         }
 
-        // Deleted out from under us: forget it rather than probing it (which errors, and would
-        // otherwise read as dirty), so the next open rebuilds it from scratch.
+        // Deleted out from under us: forget it, so the next open rebuilds it from scratch.
         if !ws.workspace_path.is_dir() {
             if !dry_run {
                 let _ = vcs_for(ws.vcs).remove_workspace(&ws.repo_path, &ws.workspace_path, &id);
@@ -418,8 +415,7 @@ async fn reconcile_workspaces(
             continue;
         }
 
-        // A failed build has no trustworthy head to probe, so `is_dirty` would read it as dirty
-        // and `fetch_local` would then hand it back as-is. Leave it to `fetch_local` to rebuild.
+        // Leave a failed build to `fetch_local` to rebuild.
         if ws.status == Status::ApplyFailed {
             continue;
         }
@@ -437,19 +433,6 @@ async fn reconcile_workspaces(
             continue;
         }
 
-        let vcs = vcs_for(ws.vcs);
-        if vcs
-            .is_dirty(&ws.workspace_path, &ws.head_id)
-            .unwrap_or(true)
-        {
-            ws.status = Status::Dirty;
-            state.insert_workspace(id, ws);
-            report.flagged.push((
-                tip.key.clone(),
-                "local changes; not updated to the new version".into(),
-            ));
-            continue;
-        }
         if dry_run {
             report.updated.push(tip.key.clone());
             continue;
@@ -462,6 +445,7 @@ async fn reconcile_workspaces(
         let Some(source) = sources.iter().find(|s| s.name() == tip.key.source) else {
             continue;
         };
+        let vcs = vcs_for(ws.vcs);
         let review = review_from_entry(&tip);
         let checkout = match source.checkout_spec(&review, &ws.repo_path).await {
             Ok(checkout) => checkout,
@@ -521,7 +505,7 @@ async fn reconcile_workspaces(
 }
 
 /// Every review in this workspace has resolved (or none remain): remove the workspace and its
-/// reviews, discarding any local changes.
+/// reviews.
 fn remove_finished_workspace(
     id: &str,
     ws: &Workspace,
@@ -533,8 +517,8 @@ fn remove_finished_workspace(
     let vcs = vcs_for(ws.vcs);
     if !dry_run {
         // Even when the directory is already gone, the parent repo still has the workspace
-        // registered; the backend forgets it.
-        // The backend assumes a clean worktree, so finish a dirty one off with a raw removal.
+        // registered; the backend forgets it. Whatever it can't clean up is finished off with a
+        // raw removal.
         if vcs
             .remove_workspace(&ws.repo_path, &ws.workspace_path, id)
             .is_err()
@@ -645,7 +629,7 @@ fn orphan_slug(paths: &Paths, path: &Path) -> String {
 }
 
 /// Remove one leftover workspace (or, if `ws` doesn't exist, whatever's still registered or
-/// pinned for it in `repo`) unless it has local changes. Returns whether it was removed.
+/// pinned for it in `repo`). Returns whether it was removed.
 fn remove_orphan(
     vcs: &dyn Vcs,
     repo: &Path,
@@ -655,12 +639,6 @@ fn remove_orphan(
     dry_run: bool,
     report: &mut SyncReport,
 ) -> bool {
-    if ws.exists() && vcs.has_local_changes(ws).unwrap_or(true) {
-        report
-            .prune_flagged
-            .push((label, "local changes; not removed".into()));
-        return false;
-    }
     if !dry_run
         && let Err(e) = vcs.remove_workspace(repo, ws, slug)
         // e.g. a git worktree whose registration is already gone, which `worktree remove`
@@ -797,10 +775,9 @@ fn prune_orphans(
 /// Resolve a canonical repo (asking before cloning one, unless `on_missing` says otherwise) and
 /// make sure `key`, a review already tracked by a prior `sync()`, has a workspace - the one for
 /// its whole stack - then move that workspace to `key`'s own patch. If the stack is already
-/// checked out this is just the move (skipped when the workspace has local changes, which are
-/// never disturbed); an `ApplyFailed` (or deleted) workspace is instead cleaned up and rebuilt,
-/// since handing back a broken/empty path again would just repeat the failure silently. This is
-/// the on-demand counterpart to `sync()`'s deliberate refusal to create workspaces on its own -
+/// checked out this is just the move; an `ApplyFailed` (or deleted) workspace is instead cleaned
+/// up and rebuilt, since handing back a broken/empty path again would just repeat the failure
+/// silently. This is the on-demand counterpart to `sync()`'s deliberate refusal to create workspaces on its own -
 /// see the module docs.
 ///
 /// Under `OnMissing::Ask`, a repo with no local checkout surfaces as a `repo::NeedsClone` error
@@ -956,18 +933,11 @@ fn partial_note_for(ws: &Workspace) -> String {
     )
 }
 
-/// Best-effort: move a stack's workspace to `key`'s patch. Never disturbs a workspace with local
-/// changes, and does nothing if `key`'s commit can't be found (e.g. a patch added to the stack
-/// since the workspace was built, which the next sync will pick up) - the caller still gets the
-/// workspace either way.
+/// Best-effort: move a stack's workspace to `key`'s patch. Does nothing if `key`'s commit can't
+/// be found (e.g. a patch added to the stack since the workspace was built, which the next sync
+/// will pick up) - the caller still gets the workspace either way.
 fn position_at(source: &dyn ReviewSource, ws: &Workspace, key: &ReviewKey) {
     let vcs = vcs_for(ws.vcs);
-    if vcs
-        .is_dirty(&ws.workspace_path, &ws.head_id)
-        .unwrap_or(true)
-    {
-        return;
-    }
     let target = vcs
         .commits(&ws.workspace_path, &ws.head_id, STACK_SCAN_DEPTH)
         .ok()
@@ -983,23 +953,11 @@ fn position_at(source: &dyn ReviewSource, ws: &Workspace, key: &ReviewKey) {
     }
 }
 
-/// Returned by `remove_workspace` when the workspace has local changes and `force` wasn't set.
-/// Callers should confirm with the user and retry with `force: true` if they agree to discard
-/// them.
-#[derive(Debug, thiserror::Error)]
-#[error("workspace at {} has local changes", path.display())]
-pub struct WorkspaceDirty {
-    pub path: PathBuf,
-}
-
 /// Delete the local workspace of a review's stack on demand - the `d` hotkey in `rq show`'s TUI.
 /// Acts regardless of `resolved`/`in_queue`, unlike `sync()`'s own resolved-and-clean removal
-/// path, and on every review in the stack, since they share the one workspace.
-///
-/// A dirty workspace is left untouched and surfaces as `WorkspaceDirty` (`downcast_ref` it)
-/// unless `force` is set, in which case whatever the backend's own `remove_workspace` can't clean
-/// up on a dirty worktree (it assumes a clean one) is finished off with a raw directory removal.
-pub fn remove_workspace(paths: &Paths, key: &ReviewKey, force: bool) -> Result<()> {
+/// path, and on every review in the stack, since they share the one workspace. Whatever the
+/// backend's own `remove_workspace` can't clean up is finished off with a raw directory removal.
+pub fn remove_workspace(paths: &Paths, key: &ReviewKey) -> Result<()> {
     let mut state = State::load(&paths.state_file())?;
     let entry = state
         .get(key)
@@ -1011,34 +969,15 @@ pub fn remove_workspace(paths: &Paths, key: &ReviewKey, force: bool) -> Result<(
     };
 
     let vcs = vcs_for(ws.vcs);
-    let exists = ws.workspace_path.exists();
-    if exists
-        && !force
-        && vcs
-            .is_dirty(&ws.workspace_path, &ws.head_id)
-            .unwrap_or(true)
-    {
-        return Err(WorkspaceDirty {
-            path: ws.workspace_path.clone(),
-        }
-        .into());
-    }
     // Even when the directory is already gone, the parent repo still has the workspace
     // registered; the backend forgets it.
     if vcs
         .remove_workspace(&ws.repo_path, &ws.workspace_path, &stack_id)
         .is_err()
+        && ws.workspace_path.exists()
     {
-        if !force {
-            bail!(
-                "failed to remove workspace at {}",
-                ws.workspace_path.display()
-            );
-        }
-        if exists {
-            std::fs::remove_dir_all(&ws.workspace_path)
-                .with_context(|| format!("removing {}", ws.workspace_path.display()))?;
-        }
+        std::fs::remove_dir_all(&ws.workspace_path)
+            .with_context(|| format!("removing {}", ws.workspace_path.display()))?;
     }
 
     remove_empty_parents(&ws.workspace_path, &paths.workspaces_dir());
@@ -1573,7 +1512,7 @@ mod tests {
             "fetch_local must rebuild a deleted workspace"
         );
 
-        // Deleted again, then a sync runs: it must forget the workspace, not flag it dirty.
+        // Deleted again, then a sync runs: it must forget the workspace.
         std::fs::remove_dir_all(&ws_path).unwrap();
         let report = sync(&sources, &paths, None, false).await.unwrap();
         assert!(report.flagged.is_empty());
@@ -1633,7 +1572,7 @@ mod tests {
         let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
 
         let report = sync(&sources, &paths, None, false).await.unwrap();
-        assert!(report.flagged.is_empty(), "must not be flagged dirty");
+        assert!(report.flagged.is_empty());
         let state = State::load(&paths.state_file()).unwrap();
         assert_eq!(
             state.workspace_for(&key).unwrap().status,
@@ -1651,7 +1590,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dirty_workspace_is_flagged_not_updated() {
+    async fn local_changes_are_discarded_on_update() {
         let repos = make_repos();
         let sha1 = git_rev_parse(&repos.fork, "HEAD");
         let server = MockServer::start().await;
@@ -1695,19 +1634,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(report.updated.is_empty());
-        assert_eq!(report.flagged.len(), 1);
+        assert_eq!(report.updated, vec![key.clone()]);
+        assert!(report.flagged.is_empty());
         let state = State::load(&paths.state_file()).unwrap();
         let ws = state.workspace_for(&key).unwrap();
-        assert_eq!(ws.status, Status::Dirty);
-        assert_eq!(
-            ws.version, sha1,
-            "dirty workspace must not be moved to the new version"
-        );
-        assert!(
-            ws_path.join("untracked.txt").exists(),
-            "local edit must survive untouched"
-        );
+        assert_eq!(ws.status, Status::Ready);
+        assert_eq!(ws.version, sha2);
+        assert!(ws_path.join("pr2.txt").exists());
+        assert!(!ws_path.join("untracked.txt").exists());
     }
 
     #[tokio::test]
@@ -1732,7 +1666,7 @@ mod tests {
             .await
             .unwrap();
 
-        remove_workspace(&paths, &key, false).unwrap();
+        remove_workspace(&paths, &key).unwrap();
 
         assert!(!ws_path.exists());
         let state = State::load(&paths.state_file()).unwrap();
@@ -1744,7 +1678,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_workspace_refuses_a_dirty_one_without_force() {
+    async fn remove_workspace_discards_local_changes() {
         let repos = make_repos();
         let sha = git_rev_parse(&repos.fork, "HEAD");
         let server = MockServer::start().await;
@@ -1766,38 +1700,7 @@ mod tests {
             .unwrap();
         std::fs::write(ws_path.join("untracked.txt"), "local edit\n").unwrap();
 
-        let err = remove_workspace(&paths, &key, false).unwrap_err();
-
-        assert!(err.downcast_ref::<WorkspaceDirty>().is_some());
-        assert!(ws_path.exists(), "must not touch a dirty workspace");
-        let state = State::load(&paths.state_file()).unwrap();
-        assert!(state.workspace_for(&key).is_some());
-    }
-
-    #[tokio::test]
-    async fn remove_workspace_with_force_discards_local_changes() {
-        let repos = make_repos();
-        let sha = git_rev_parse(&repos.fork, "HEAD");
-        let server = MockServer::start().await;
-        mount_search(&server, true).await;
-        mount_pull(
-            &server,
-            pull_json("moz", "proj", &repos.upstream, &repos.fork, &sha, "open"),
-        )
-        .await;
-
-        let work_tmp = TempDir::new().unwrap();
-        let paths = paths_in(work_tmp.path());
-        let config = Config::default();
-        let key = ReviewKey::new("gh", "moz/proj/1");
-        let sources: Vec<Box<dyn ReviewSource>> = vec![github_source(&server)];
-        sync(&sources, &paths, None, false).await.unwrap();
-        let ws_path = fetch_local(&sources, &paths, &config, &key, OnMissing::Clone)
-            .await
-            .unwrap();
-        std::fs::write(ws_path.join("untracked.txt"), "local edit\n").unwrap();
-
-        remove_workspace(&paths, &key, true).unwrap();
+        remove_workspace(&paths, &key).unwrap();
 
         assert!(!ws_path.exists());
         let state = State::load(&paths.state_file()).unwrap();
@@ -1831,9 +1734,8 @@ mod tests {
         });
         state.save(&paths.state_file()).unwrap();
 
-        let err = remove_workspace(&paths, &key, false).unwrap_err();
+        let err = remove_workspace(&paths, &key).unwrap_err();
 
-        assert!(err.downcast_ref::<WorkspaceDirty>().is_none());
         assert!(format!("{err:#}").contains("no local workspace"));
     }
 
@@ -2103,7 +2005,7 @@ mod tests {
         assert!(report.fetched.is_empty());
         assert_eq!(calls.load(Ordering::Relaxed), 1);
 
-        remove_workspace(&paths, &stk(1), false).unwrap();
+        remove_workspace(&paths, &stk(1)).unwrap();
         let mut report = sync(&sources, &paths, None, false).await.unwrap();
         auto_workspace(&sources, &paths, &config, &mut report, false)
             .await
@@ -2326,7 +2228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_changes_stop_fetch_local_from_moving_the_workspace() {
+    async fn fetch_local_moves_the_workspace_despite_local_changes() {
         let (_repos, _tmp, paths, sources) = stack_fixture();
         let config = Config::default();
         sync(&sources, &paths, None, false).await.unwrap();
@@ -2339,8 +2241,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(ws_path.join("D2.txt").exists(), "must stay on the tip");
-        assert!(ws_path.join("scratch.txt").exists());
+        assert!(ws_path.join("D1.txt").exists());
+        assert!(!ws_path.join("D2.txt").exists(), "must move to D1");
+        assert!(!ws_path.join("scratch.txt").exists());
     }
 
     #[tokio::test]
@@ -2532,7 +2435,7 @@ mod tests {
             .await
             .unwrap();
 
-        remove_workspace(&paths, &stk(1), false).unwrap();
+        remove_workspace(&paths, &stk(1)).unwrap();
 
         assert!(!ws_path.exists());
         let state = State::load(&paths.state_file()).unwrap();
@@ -2629,7 +2532,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orphaned_workspace_with_local_changes_is_flagged_not_removed() {
+    async fn orphaned_workspace_with_local_changes_is_removed() {
         let repos = make_repos();
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(tmp.path());
@@ -2641,12 +2544,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(report.pruned.is_empty(), "{report:?}");
-        assert_eq!(report.prune_flagged.len(), 1, "{report:?}");
-        assert!(ws_path.join("notes.txt").exists());
-        let (worktrees, pins) = worktrees_and_pins(&canon);
-        assert_eq!(worktrees, 2);
-        assert!(!pins.is_empty());
+        assert_eq!(report.pruned.len(), 1, "{report:?}");
+        assert!(report.prune_flagged.is_empty(), "{report:?}");
+        assert!(!ws_path.exists());
+        assert_eq!(worktrees_and_pins(&canon), (1, String::new()));
     }
 
     #[tokio::test]

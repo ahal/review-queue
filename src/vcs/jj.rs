@@ -31,8 +31,6 @@
 //!   causes `jj git fetch` to abandon the old head on re-fetch (`git.abandon-unreachable-commits`
 //!   defaults to `true`), breaking interdiffing. The pin keeps it reachable regardless of what
 //!   the remote branch does next.
-//! - `is_dirty`: `@` isn't empty, or `@-` isn't the expected id (the stack tip) or one of its
-//!   ancestors.
 //! - `position`: `jj new <commit>` (never `edit`, which would rewrite the stack).
 //! - `remove_workspace`: `jj workspace forget`, `rm -rf`, `jj abandon` every version of the stack
 //!   (anything else still depends on stays), and delete every `review-queue/<name>/*` bookmark.
@@ -469,43 +467,8 @@ impl Vcs for JjVcs {
         Ok(head)
     }
 
-    fn is_dirty(&self, ws: &Path, expected_head: &str) -> Result<bool> {
-        let at_state = self.run(
-            ws,
-            &[
-                "log",
-                "-r",
-                "@",
-                "--no-graph",
-                "-T",
-                "if(empty, \"clean\", \"dirty\")",
-            ],
-        )?;
-        if at_state != "clean" {
-            return Ok(true);
-        }
-        let parent = self.run(ws, &["log", "-r", "@-", "--no-graph", "-T", "commit_id"])?;
-        if parent == expected_head {
-            return Ok(false);
-        }
-        // Positioned on an earlier patch of the stack is fine; anything else isn't.
-        let in_stack = self.run(
-            ws,
-            &[
-                "log",
-                "-r",
-                &format!("@- & ::{expected_head}"),
-                "--no-graph",
-                "-T",
-                "commit_id",
-            ],
-        )?;
-        Ok(in_stack.is_empty())
-    }
-
     fn position(&self, ws: &Path, commit: &str) -> Result<()> {
-        // `new`, not `edit`: editing a mid-stack commit would rewrite it and everything above,
-        // moving the tip out from under `is_dirty`.
+        // `new`, not `edit`: editing a mid-stack commit would rewrite it and everything above.
         self.run(ws, &["new", commit])
             .with_context(|| format!("moving to {commit} in {}", ws.display()))?;
         Ok(())
@@ -602,11 +565,6 @@ impl Vcs for JjVcs {
             .and_then(Path::parent)
             .map(Path::to_path_buf)
             .with_context(|| format!("{} isn't inside a repo", store.display()))
-    }
-
-    fn has_local_changes(&self, ws: &Path) -> Result<bool> {
-        let diff = self.run(ws, &["diff", "--summary", "-r", "@"])?;
-        Ok(!diff.is_empty())
     }
 }
 
@@ -959,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn position_moves_within_a_stack_without_counting_as_dirty() {
+    fn position_moves_within_a_stack() {
         require_jj!();
         let f = fixture();
         let checkout = Checkout::Patches {
@@ -982,38 +940,9 @@ mod tests {
 
         vcs.position(&ws, &commits[1].0).unwrap();
         assert!(!ws.join("b.txt").exists());
-        assert!(!vcs.is_dirty(&ws, &tip).unwrap());
 
         vcs.position(&ws, &tip).unwrap();
         assert!(ws.join("b.txt").exists());
-        assert!(!vcs.is_dirty(&ws, &tip).unwrap());
-    }
-
-    #[test]
-    fn a_commit_outside_the_stack_is_dirty() {
-        require_jj!();
-        let f = fixture();
-        let checkout = Checkout::Patches {
-            base: Some(f.base.clone()),
-            patches: vec![add_file_patch(
-                "add a",
-                "a.txt",
-                "aaa\n",
-                "Author <a@example.com>",
-            )],
-        };
-        let vcs = JjVcs;
-        let ws = f._tmp.path().join("ws");
-        let tip = vcs
-            .add_workspace(&f.canon, &ws, &checkout, "moz/D1", "1")
-            .unwrap();
-
-        // Build on top of the base instead of the stack.
-        vcs.position(&ws, &f.base).unwrap();
-        fs::write(ws.join("mine.txt"), "x\n").unwrap();
-        assert!(vcs.is_dirty(&ws, &tip).unwrap(), "uncommitted edit");
-        jj_out(&ws, &["commit", "-m", "local"]);
-        assert!(vcs.is_dirty(&ws, &tip).unwrap(), "commit outside the stack");
     }
 
     #[test]
@@ -1075,7 +1004,7 @@ mod tests {
             !ws.join("partial.txt").exists() && !ws.join("README.md.rej").exists(),
             "the failed patch's leftovers must be discarded"
         );
-        assert!(!vcs.is_dirty(&ws, &partial.head).unwrap());
+        assert_eq!(jj_out(&ws, &["diff", "--summary", "-r", "@"]), "");
         assert_eq!(commit_id(&f.canon, "review-queue/moz/D1/1"), partial.head);
     }
 
@@ -1182,33 +1111,6 @@ mod tests {
     }
 
     #[test]
-    fn is_dirty_detects_local_changes_and_head_mismatch() {
-        require_jj!();
-        let f = fixture();
-        let vcs = JjVcs;
-        let ws = f._tmp.path().join("ws");
-        let checkout = Checkout::Patches {
-            base: Some(f.base.clone()),
-            patches: vec![],
-        };
-        let head = vcs
-            .add_workspace(&f.canon, &ws, &checkout, "moz/D6", "1")
-            .unwrap();
-
-        assert!(!vcs.is_dirty(&ws, &head).unwrap());
-
-        fs::write(ws.join("untracked.txt"), "oops\n").unwrap();
-        assert!(vcs.is_dirty(&ws, &head).unwrap());
-
-        fs::remove_file(ws.join("untracked.txt")).unwrap();
-        assert!(!vcs.is_dirty(&ws, &head).unwrap());
-        assert!(
-            vcs.is_dirty(&ws, "0000000000000000000000000000000000000000")
-                .unwrap()
-        );
-    }
-
-    #[test]
     fn remove_workspace_cleans_up_workspace_and_bookmarks_without_touching_canon() {
         require_jj!();
         let f = fixture();
@@ -1263,9 +1165,6 @@ mod tests {
             vcs.canonical_repo(&ws).unwrap(),
             f.canon.canonicalize().unwrap()
         );
-        assert!(!vcs.has_local_changes(&ws).unwrap());
-        fs::write(ws.join("scratch.txt"), "local\n").unwrap();
-        assert!(vcs.has_local_changes(&ws).unwrap());
     }
 
     #[test]

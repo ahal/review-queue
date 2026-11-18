@@ -44,12 +44,12 @@ impl std::fmt::Display for ReviewKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
-    /// Checked out cleanly and matches the latest version from the source.
+    /// Checked out cleanly and matches the latest version from the source. `dirty` is a status
+    /// older versions recorded; it's read as this.
+    #[serde(alias = "dirty")]
     Ready,
     /// A patch in the stack failed to apply; the workspace is left as-is for inspection.
     ApplyFailed,
-    /// Local modifications (or a HEAD that doesn't match state) prevented an update or removal.
-    Dirty,
     /// The stack applied only up to some patch: `head_id` is the last one that did, and
     /// `Workspace::unapplied` lists the reviews that are missing. Usable as-is, and only rebuilt
     /// once the stack changes, since retrying the same patches would just fail the same way.
@@ -68,7 +68,7 @@ pub struct Workspace {
     pub vcs: VcsKind,
     pub workspace_path: PathBuf,
     /// The stack tip's commit id, i.e. what the workspace was built to. The user may have moved
-    /// to an earlier patch in the stack since (see `Vcs::position`) - that isn't "dirty".
+    /// to an earlier patch in the stack since (see `Vcs::position`).
     pub head_id: String,
     pub status: Status,
     /// The stack's top-most review as of the last build. A different tip (a new patch landed on
@@ -99,7 +99,7 @@ pub struct ReviewEntry {
     pub in_queue: bool,
     /// The review itself landed/closed/merged/abandoned (as opposed to just dropping out of your
     /// queue). A resolved review with no workspace is dropped on the next sync; one with a
-    /// workspace has that workspace removed too, even if it has local changes.
+    /// workspace has that workspace removed too.
     pub resolved: bool,
     pub last_synced: chrono::DateTime<chrono::Utc>,
     /// Id of the `State::workspaces` entry this review's checked out in, if it's been fetched.
