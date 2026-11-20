@@ -24,9 +24,10 @@ rq shell-init <bash|zsh|fish>
 Ids look like `moz/D12345` or `gh/owner/repo/42`. A unique prefix (`D123`) is enough.
 
 `rq show` opens a TUI on a terminal and prints a table otherwise. Use `j`/`k` or arrows to
-move, Enter to choose an open target, `o` to open the browser, and `w` to fetch and open a
-workspace in `$SHELL`. Use `h`/`l` or left/right to expand/collapse details, `f` to fetch,
-`d` to delete a workspace (or cancel a fetch), `r` to reload, `?` for help, and `q`/Esc to quit.
+move, Enter to choose an open target, and `o` to open the browser. There is no built-in shell
+target; see [Opening a workspace](#opening-a-workspace) to bind one. Use `h`/`l` or
+left/right to expand/collapse details, `f` to fetch, `d` to delete a workspace (or cancel a
+fetch), `r` to reload, `?` for help, and `q`/Esc to quit.
 In the target picker, arrows or `j`/`k` move the selection, Enter or `l` runs it, and Esc
 closes the picker. Other character keys are ignored; target shortcuts only work in the main list.
 
@@ -34,7 +35,7 @@ closes the picker. Other character keys are ignored; target shortcuts only work 
 With `auto_workspace = true`, every sync also creates a workspace for each queued stack that
 doesn't have one, and rebuilds one that failed to apply once its stack changes. Failed fetches are
 retried on the next sync. A workspace you delete with `d` stays deleted, even if its stack gets a
-new revision, until you fetch it again with `rq fetch` or a workspace target in the TUI, which is
+new revision, until you fetch it again with `rq fetch`, `f`, or a workspace target in the TUI, which is
 also how you create one manually. Sync never prompts; enable `auto_clone` to clone missing
 repositories automatically. Choosing a target starts fetching without a workspace confirmation;
 rq still asks before cloning a missing repository unless `auto_clone` is enabled.
@@ -73,18 +74,14 @@ url = "https://phabricator.services.mozilla.com"
 # include_groups = true
 ```
 
-Open targets are configured by id. Browser and workspace are built in and only allow
-`description` and `key` overrides. Their default keys are `o` and `w`; set `key = ""` to unbind either.
-Custom targets require a command and may have a single character shortcut. The keys
-`j k h l q d f r ?` are reserved; shortcuts must be unique. Enter always opens the picker,
-ordered browser, workspace, then custom targets by id.
+Open targets are configured by id. Browser is built in and only allows `description` and `key`
+overrides. Its default key is `o`; set `key = ""` to unbind it. Custom targets require a command
+and may have a single character shortcut. The keys `j k h l q d f r ?` are reserved; shortcuts
+must be unique. Enter always opens the picker, ordered browser, then custom targets by id.
 
 ```toml
 [targets.browser]
 key = "o"
-
-[targets.workspace]
-key = "w"
 
 [targets.diffview]
 description = "Diffview"         # shown in the picker; defaults to the table id
@@ -100,7 +97,7 @@ workspace = false                # run immediately in rq's cwd, without fetching
 
 Commands receive `RQ_REVIEW` (`source/id`), `RQ_SOURCE`, `RQ_ID`, and `RQ_URL`.
 `RQ_WORKSPACE` is set only for targets running in a workspace. Detached commands have null
-stdin/stdout/stderr. The workspace built-in always waits for `$SHELL` to exit.
+stdin/stdout/stderr.
 The old `open_command` and `open_command_wait` settings have been replaced by
 `[targets.<id>]`; move the command and wait setting into a custom target.
 

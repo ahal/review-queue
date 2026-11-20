@@ -4,8 +4,9 @@
 //! intercepted via an `OnEventView` since `SelectView`'s own built-in handling would otherwise
 //! land on those lines like any other row. Left/right (and `h`/`l`) expand/collapse the selected
 //! review's diffstat (fetched by `rq sync` and read straight out of `state.json` - no network
-//! calls here). Enter opens a picker of named targets; `o` opens the browser and `w` fetches
-//! and opens a workspace in `$SHELL`. In the picker, arrows or `j`/`k` navigate, Enter or `l`
+//! calls here). Enter opens a picker of named targets; `o` opens the browser. rq never starts an
+//! interactive shell itself (EDR flags that as a reverse shell), so opening a workspace is a
+//! configured target such as a tmux popup. In the picker, arrows or `j`/`k` navigate, Enter or `l`
 //! runs the selection, and Esc closes it; other characters are ignored. Configured targets run
 //! commands, optionally fetching first
 //! and suspending the TUI until they exit. See `run_event_loop` for why suspension tears down
@@ -68,7 +69,7 @@ struct Ctx {
     syncing: Option<usize>,
     /// Reviews currently expanded to show their diffstat - any number at once, independently.
     expanded: BTreeSet<ReviewKey>,
-    /// Waiting target command (or `$SHELL`) queued by `launch`, drained by `run_event_loop`,
+    /// Waiting target command queued by `launch`, drained by `run_event_loop`,
     /// which is the only place allowed to suspend the terminal.
     pending_run: Option<PendingRun>,
     /// Resolved built-in and configured targets, indexed by the picker and global shortcuts.
@@ -213,7 +214,7 @@ pub fn run(
 fn run_event_loop(mut siv: Cursive) -> Result<()> {
     enum Outcome {
         Quit,
-        OpenShell(PendingRun),
+        RunTarget(PendingRun),
     }
 
     loop {
@@ -227,7 +228,7 @@ fn run_event_loop(mut siv: Cursive) -> Result<()> {
                     .user_data::<Ctx>()
                     .and_then(|ctx| ctx.pending_run.take())
                 {
-                    break Outcome::OpenShell(run);
+                    break Outcome::RunTarget(run);
                 }
                 if !runner.is_running() {
                     break Outcome::Quit;
@@ -239,7 +240,7 @@ fn run_event_loop(mut siv: Cursive) -> Result<()> {
 
         match outcome {
             Outcome::Quit => return Ok(()),
-            Outcome::OpenShell(run) => {
+            Outcome::RunTarget(run) => {
                 let (label, mut cmd) = build_command(&run);
                 let result = cmd.status();
                 let key = &run.key;
@@ -263,13 +264,13 @@ fn run_event_loop(mut siv: Cursive) -> Result<()> {
     }
 }
 
-/// A target command (or `$SHELL`) and review context waiting for the terminal to suspend.
+/// A target command and review context waiting for the terminal to suspend.
 struct PendingRun {
     key: ReviewKey,
     cwd: PathBuf,
     workspace: Option<PathBuf>,
     url: String,
-    command: Option<String>,
+    command: String,
     /// Appended to the status line, e.g. that the stack only partially applied.
     note: Option<String>,
 }
@@ -281,19 +282,10 @@ fn with_note(msg: String, note: &Option<String>) -> String {
     }
 }
 
-/// Builds a target command or an interactive `$SHELL` with the review's environment.
+/// Builds a target command with the review's environment.
 fn build_command(run: &PendingRun) -> (String, std::process::Command) {
-    let mut cmd = match &run.command {
-        Some(script) => {
-            let mut cmd = std::process::Command::new("sh");
-            cmd.args(["-c", script]);
-            cmd
-        }
-        None => {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            std::process::Command::new(shell)
-        }
-    };
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", &run.command]);
     cmd.current_dir(&run.cwd)
         .env("RQ_REVIEW", run.key.slug())
         .env("RQ_SOURCE", &run.key.source)
@@ -304,11 +296,7 @@ fn build_command(run: &PendingRun) -> (String, std::process::Command) {
     } else {
         cmd.env_remove("RQ_WORKSPACE");
     }
-    let label = run
-        .command
-        .clone()
-        .unwrap_or_else(|| cmd.get_program().to_string_lossy().into_owned());
-    (label, cmd)
+    (run.command.clone(), cmd)
 }
 
 /// Queues a target for terminal suspension, or starts it detached and reaps it in a thread.
@@ -326,8 +314,7 @@ fn launch(s: &mut Cursive, key: ReviewKey, workspace: Option<PathBuf>, idx: usiz
         return;
     };
     let (command, wait) = match &ctx.targets[idx].action {
-        Action::Workspace => (None, true),
-        Action::Command { command, wait, .. } => (Some(command.clone()), *wait),
+        Action::Command { command, wait, .. } => (command.clone(), *wait),
         Action::Browser => return,
     };
     let cwd = match workspace
@@ -1487,7 +1474,7 @@ key = "u"
         reviews.add_item("D1", Row::Entry(key.clone()));
         reviews.set_on_submit(|s, row: &Row| show_targets(s, row.key().clone()));
         siv.add_layer(reviews.with_name("reviews"));
-        siv.add_global_callback('u', |s| run_target_selected(s, 2));
+        siv.add_global_callback('u', |s| run_target_selected(s, 1));
         siv.add_global_callback('q', |s| s.quit());
         for ch in ['d', 'f', 'r', '?', 'o', 'w', 'h', 'x', 'λ'] {
             siv.add_global_callback(ch, |_| {
@@ -1504,10 +1491,7 @@ key = "u"
                     .collect::<Vec<_>>()
             })
             .unwrap();
-        assert_eq!(
-            labels,
-            ["Open in browser", "Open in workspace", "Write URL"]
-        );
+        assert_eq!(labels, ["Open in browser", "Write URL"]);
         siv.runner().refresh();
         for ch in ['u', 'q', 'd', 'f', 'r', '?', 'o', 'w', 'h', 'x', 'λ'] {
             siv.on_event(Event::Char(ch));
@@ -1531,7 +1515,7 @@ key = "u"
         assert!(ctx.fetching.is_empty());
         let run = ctx.pending_run.as_ref().unwrap();
         assert_eq!(run.key, key);
-        assert_eq!(run.command.as_deref(), Some("echo $RQ_URL"));
+        assert_eq!(run.command, "echo $RQ_URL");
         assert_eq!(run.url, "https://example.com/D1");
         assert_eq!(run.cwd, std::env::current_dir().unwrap());
         assert!(run.workspace.is_none());
@@ -1553,10 +1537,10 @@ key = "u"
         show_targets(&mut siv, key.clone());
         siv.runner().refresh();
         siv.on_event(Event::Char('j'));
-        siv.on_event(Event::Key(Key::Down));
         siv.on_event(Event::Key(Key::Up));
-        siv.on_event(Event::Char('j'));
+        siv.on_event(Event::Key(Key::Down));
         siv.on_event(Event::Char('k'));
+        siv.on_event(Event::Char('j'));
         assert_eq!(
             siv.call_on_name("targets", |v: &mut SelectView<usize>| v.selected_id())
                 .unwrap(),
@@ -1570,7 +1554,6 @@ key = "u"
             show_targets(&mut siv, key.clone());
             siv.runner().refresh();
             siv.on_event(Event::Char('j'));
-            siv.on_event(Event::Char('j'));
             siv.on_event(submit);
             assert_eq!(siv.screen().len(), 1);
             assert!(siv.is_running());
@@ -1578,18 +1561,18 @@ key = "u"
             assert!(ctx.fetching.is_empty());
             let run = ctx.pending_run.take().unwrap();
             assert_eq!(run.key, key);
-            assert_eq!(run.command.as_deref(), Some("echo $RQ_URL"));
+            assert_eq!(run.command, "echo $RQ_URL");
         }
     }
 
     #[test]
-    fn command_environment_and_shell_fallback() {
+    fn command_environment() {
         let mut run = PendingRun {
             key: ReviewKey::new("moz", "D1"),
             cwd: PathBuf::from("/tmp"),
             workspace: Some(PathBuf::from("/tmp")),
             url: "https://example.com/D1".into(),
-            command: Some("echo hello".into()),
+            command: "echo hello".into(),
             note: None,
         };
         let (_, cmd) = build_command(&run);
@@ -1605,14 +1588,8 @@ key = "u"
         assert_eq!(vars["RQ_ID"], Some("D1"));
         assert_eq!(vars["RQ_URL"], Some("https://example.com/D1"));
         assert_eq!(vars["RQ_WORKSPACE"], Some("/tmp"));
-        run.command = None;
         run.workspace = None;
         let (_, cmd) = build_command(&run);
-        assert_eq!(
-            cmd.get_program(),
-            std::ffi::OsStr::new(&std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()))
-        );
-        assert!(cmd.get_args().next().is_none());
         assert!(
             cmd.get_envs()
                 .any(|(k, v)| k == "RQ_WORKSPACE" && v.is_none())
